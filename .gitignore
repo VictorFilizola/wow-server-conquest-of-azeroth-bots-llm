@@ -6,21 +6,22 @@
 /conf/*
 !/conf/dist
 /modules/*
-!/modules/mod-coa-change-potions/
-!/modules/mod-coa-mythic-plus/
 !/modules/*.md
 !/modules/*.sh
 !/modules/CMakeLists.txt
 !/modules/*.h
 !/modules/*.cmake
+!/modules/mod-*/
 /build*/
 /var/*
 !/var/build/.gitkeep
 !/var/ccache/.gitkeep
 /env/dist/*
 !/env/dist/.gitkeep
+!/env/dist/etc/
 /env/user/*
 /.env*
+!/.env
 /apps/joiner
 /deps/deno
 /data/sql/custom/*
@@ -28,6 +29,7 @@
 !/src/server/scripts/Custom/README.md
 
 /*.override.yml
+!/docker-compose.override.yml
 /*.override.yaml
 
 !.gitkeep

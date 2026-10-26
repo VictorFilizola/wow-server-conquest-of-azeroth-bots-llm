@@ -1,0 +1,44 @@
+services:
+  ac-database:
+    container_name: coa-bots-database
+
+  ac-worldserver:
+    container_name: coa-bots-worldserver
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./env/dist/data:/azerothcore/env/dist/data:ro
+    depends_on:
+      ac-database:
+        condition: service_healthy
+
+  ac-authserver:
+    container_name: coa-bots-authserver
+    depends_on:
+      ac-database:
+        condition: service_healthy
+
+  ac-client-data-init:
+    image: alpine:latest
+    entrypoint: ["true"]
+
+  ac-db-import:
+    image: alpine:latest
+    entrypoint: ["true"]
+
+  ac-llm-chatter-bridge:
+    container_name: coa-bots-llm-chatter-bridge
+    image: python:3.11-slim
+    networks:
+      - ac-network
+    working_dir: /app
+    volumes:
+      - ./modules/mod-llm-chatter/tools:/app/tools:ro
+      - ./env/dist/etc/modules/mod_llm_chatter.conf:/etc/llm_chatter.conf:ro
+    command: >
+      sh -c "pip install -q anthropic openai mysql-connector-python &&
+             cd /app/tools && python llm_chatter_bridge.py --config /etc/llm_chatter.conf"
+    depends_on:
+      ac-database:
+        condition: service_healthy
+    restart: unless-stopped
