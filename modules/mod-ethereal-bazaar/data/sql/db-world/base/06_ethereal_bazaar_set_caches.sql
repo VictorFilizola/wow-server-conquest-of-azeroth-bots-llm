@@ -20,6 +20,7 @@ DROP TABLE IF EXISTS `ethereal_bazaar_set_cache`;
 CREATE TABLE `ethereal_bazaar_set_cache` (
   `cache_item`  INT UNSIGNED NOT NULL,
   `member_item` INT UNSIGNED NOT NULL,
+  `count`       TINYINT UNSIGNED NOT NULL DEFAULT 1,
   `idx`         TINYINT UNSIGNED NOT NULL COMMENT 'position in the client row, kept for reading',
   PRIMARY KEY (`cache_item`, `member_item`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Contents of the set caches, from VanityCollection';

@@ -582,19 +582,25 @@ void LoadDBCStores(std::string const& dataPath)
         }
     }
 
-    for (uint32 i = 1; i < sTaxiPathStore.GetNumRows(); ++i)
-        if (TaxiPathEntry const* entry = sTaxiPathStore.LookupEntry(i))
-            sTaxiPathSetBySource[entry->from][entry->to] = entry;
+    for (TaxiPathEntry const* entry : sTaxiPathStore)
+        sTaxiPathSetBySource[entry->from][entry->to] = entry;
 
     // Calculate path nodes count
-    uint32 pathCount = sTaxiPathStore.GetNumRows();
-    std::vector<uint32> pathLength;
-    pathLength.resize(pathCount);                           // 0 and some other indexes not used
+    uint32 maxPathId = 0;
+    for (TaxiPathEntry const* entry : sTaxiPathStore)
+        if (entry->ID > maxPathId)
+            maxPathId = entry->ID;
 
-    for (uint32 i = 1; i < sTaxiPathNodeStore.GetNumRows(); ++i)
-        if (TaxiPathNodeEntry const* entry = sTaxiPathNodeStore.LookupEntry(i))
-            if (pathLength[entry->path] < entry->index + 1)
-                pathLength[entry->path] = entry->index + 1;
+    for (TaxiPathNodeEntry const* entry : sTaxiPathNodeStore)
+        if (entry->path > maxPathId)
+            maxPathId = entry->path;
+
+    uint32 pathCount = maxPathId + 1;
+    std::vector<uint32> pathLength(pathCount, 0);
+
+    for (TaxiPathNodeEntry const* entry : sTaxiPathNodeStore)
+        if (pathLength[entry->path] < entry->index + 1)
+            pathLength[entry->path] = entry->index + 1;
 
     // Set path length
     sTaxiPathNodesByPath.resize(pathCount);                 // 0 and some other indexes not used
@@ -712,7 +718,7 @@ void LoadDBCStores(std::string const& dataPath)
 
     // Rows only the CoA client set has. World content references them, and the SQL overlays no longer
     // backfill any, so a stock or partially copied set would silently drop that content.
-    if (!sCurrencyTypesStore.LookupEntry(375250)          ||       // Rune of Ascension
+    if (!sItemStore.LookupEntry(375250)                   ||       // Rune of Ascension (item 375250 / currency 364)
             !sCreatureDisplayInfoStore.LookupEntry(236827)  ||       // Blood Parasite
             !sGameObjectDisplayInfoStore.LookupEntry(87226) ||       // Worldforged pickup
             !sItemLimitCategoryStore.LookupEntry(2414)      ||

@@ -279,7 +279,7 @@ class MpqCli:
         return [line.strip() for line in self.run("list", archive).splitlines() if line.strip()]
 
     def extract(self, archive, member, directory):
-        self.run("extract", "-f", member, "-o", directory, archive)
+        self.run("extract", "-j", "-o", directory, archive, member)
         return Path(directory) / member.replace("/", "\\").rsplit("\\", 1)[-1]
 
 
