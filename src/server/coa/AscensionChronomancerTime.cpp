@@ -57,6 +57,7 @@ enum TimeSpells : uint32
     RapidAcceleration = 570149,
     RapidAccelerationHeal = 804500,
     SingularityCoreTrigger = 804437,
+    SingularityCore = 804438,
     SpellRangeThirtyYards = 4
 };
 
@@ -89,10 +90,11 @@ std::list<Unit*> Nearby(Player* player, Unit* center, uint32 helper, bool friend
     Acore::AnyUnitInObjectRangeCheck check(center, radius);
     Acore::UnitListSearcher<Acore::AnyUnitInObjectRangeCheck> search(center, targets, check);
     Cell::VisitObjects(center, search, radius);
-    targets.remove_if([player, center, friendly](Unit* target)
+    bool playersOnly = info->HasAttribute(SPELL_ATTR3_ONLY_ON_PLAYER);
+    targets.remove_if([player, center, friendly, playersOnly](Unit* target)
     {
-        return target == center || !target->IsAlive() || !target->InSamePhase(player) ||
-            !center->IsWithinLOSInMap(target) || !player->IsWithinLOSInMap(target) ||
+        return target == center || (playersOnly && !target->IsPlayer()) || !target->IsAlive() ||
+            !target->InSamePhase(player) || !center->IsWithinLOSInMap(target) || !player->IsWithinLOSInMap(target) ||
             !(friendly ? player->IsValidAssistTarget(target) : player->IsValidAttackTarget(target));
     });
     targets.sort([center](Unit* first, Unit* second)
@@ -391,7 +393,10 @@ void ApplyTimeContracts(SpellInfo* info)
     if (info->SpellFamilyName != 28)
         return;
     if (info->Id == SingularityCoreTrigger && info->Effects[EFFECT_0].Effect == SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+    {
         info->RangeEntry = sSpellRangeStore.LookupEntry(SpellRangeThirtyYards);
+        info->AscensionFlatAfterWeaponPercent = true;
+    }
     if (IsRank(info->Id, Fortify))
         info->Effects[EFFECT_1].Effect = 0;
     if (info->Id == Sands)
@@ -442,6 +447,46 @@ void ApplyTimeContracts(SpellInfo* info)
     }
 }
 
+class spell_ascension_time_is_a_circle : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_time_is_a_circle);
+
+    void ExtendSingularityCore(SpellEffIndex)
+    {
+        Unit* caster = GetCaster();
+        if (!Chronomancer(caster))
+            return;
+        if (Aura* core = caster->GetAuraOfRankedSpell(SingularityCore, caster->GetGUID()))
+            core->SetDuration(core->GetDuration() + GetEffectValue());
+    }
+
+    void Register() override
+    {
+        OnEffectHitTarget += SpellEffectFn(spell_ascension_time_is_a_circle::ExtendSingularityCore,
+            EFFECT_0, SPELL_EFFECT_ASCENSION_MODIFY_AURA_DURATION);
+    }
+};
+
+class chronomancer_time_scaling : public UnitScript
+{
+public:
+    chronomancer_time_scaling() : UnitScript("chronomancer_time_scaling", true,
+        {UNITHOOK_MODIFY_SPELL_EFFECT_BASE_VALUE}) { }
+
+    void ModifySpellEffectBaseValue(Unit const* caster, SpellInfo const* info, uint8 index, float& value) override
+    {
+        Player* player = caster && caster->IsPlayer() ? caster->GetSpellModOwner() : nullptr;
+        if (!player || player->getClass() != CLASS_CHRONOMANCER || !info ||
+            info->Id != SingularityCoreTrigger || index != EFFECT_0 ||
+            info->Effects[EFFECT_0].Effect != SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+            return;
+        float const sp = float(std::max(0, player->SpellBaseDamageBonusDone(info->GetSchoolMask())));
+        float const rap = std::max(0.0f, player->GetTotalAttackPowerValue(RANGED_ATTACK));
+        value += sp * 0.25f + rap * 0.12f;
+        value = std::clamp(value, 0.0f, float(std::numeric_limits<int32>::max() / 2));
+    }
+};
+
 class chronomancer_time_contracts : public GlobalScript
 {
 public:
@@ -458,7 +503,9 @@ public:
 void AddSC_AscensionChronomancerTime()
 {
     new chronomancer_time_casts();
+    new chronomancer_time_scaling();
     new chronomancer_time_contracts();
     RegisterSpellScript(aura_ascension_timeline_tether);
     RegisterSpellScript(aura_ascension_borrowed_time);
+    RegisterSpellScript(spell_ascension_time_is_a_circle);
 }

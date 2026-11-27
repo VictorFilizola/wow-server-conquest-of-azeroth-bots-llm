@@ -28,6 +28,7 @@ bool ReleaseSpiritAction::Execute(Event event)
             // -follow in bg is overwriten each tick with +follow
             // +stay in bg causes stuttering effect as bot is cycled between +stay and +follow each tick
             botAI->ChangeStrategy("-follow,+stay", BOT_STATE_NON_COMBAT);
+            botAI->WaitForMasterRevive();
         }
 
         return false;
@@ -138,11 +139,9 @@ bool AutoReleaseSpiritAction::HandleBattlegroundSpiritHealer()
     for (auto const& guid : npcs)
     {
         Unit* unit = botAI->GetUnit(guid);
-        if (unit && unit->IsFriendlyTo(bot) && unit->IsSpiritService())
-        {
-            spiritHealer = unit;
-            break;
-        }
+        if (unit && unit->IsFriendlyTo(bot) && unit->IsSpiritService() &&
+            (!spiritHealer || bot->GetDistance(unit) < bot->GetDistance(spiritHealer)))
+            spiritHealer = unit;  // nearest: the list is not sorted
     }
 
     if (!spiritHealer)
@@ -171,7 +170,7 @@ bool AutoReleaseSpiritAction::HandleBattlegroundSpiritHealer()
 }
 
 // In a dungeon a bot waits for a resurrection, but not for ever (#37): once the fight is over, it releases when no
-// living healer of its group is on the map, or after two minutes dead if nobody raised it.
+// living healer of its group is on the map, or after AiPlayerbot.CoaReleaseDelay seconds dead (120) if nobody raised it.
 bool AutoReleaseSpiritAction::CanStillBeRaised() const
 {
     time_t const now = time(nullptr);
@@ -192,7 +191,7 @@ bool AutoReleaseSpiritAction::CanStillBeRaised() const
             healer = true;
     }
 
-    if (!healer || now - m_deadSince > 120)
+    if (!healer || now - m_deadSince > time_t(sPlayerbotAIConfig.coaReleaseDelay))
     {
         m_deadSince = 0;
         return false;

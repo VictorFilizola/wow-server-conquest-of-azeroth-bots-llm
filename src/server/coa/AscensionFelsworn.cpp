@@ -73,8 +73,9 @@ bool SpenderImpact(SpellInfo const* info)
     return Spender(info) ||
            (info && (info->Id == 520262 || info->Id == 572585 || info->Id == 803715 || info->Id == 712399));
 }
-bool ResistDebuff(Player* player, SpellInfo const* info)
+bool ResistDebuff(Player* player, Unit* caster, Spell const* spell)
 {
+    SpellInfo const* info = spell->GetSpellInfo();
     if (!Owner(player) || !player->IsAlive() || !player->IsFullHealth() || !player->HasAura(804613) ||
         player->HasAura(706818) || !info || info->IsPositive() || info->HasAttribute(SPELL_ATTR4_NO_CAST_LOG) ||
         (info->Dispel != DISPEL_MAGIC && info->Dispel != DISPEL_CURSE))
@@ -89,6 +90,9 @@ bool ResistDebuff(Player* player, SpellInfo const* info)
         }
     if (!aura)
         return false;
+    SpellMissInfo const roll = caster->SpellHitResult(player, spell, false);
+    if (roll != SPELL_MISS_MISS && roll != SPELL_MISS_RESIST)
+        return false;
     Cast(player, player, 706818);
     return true;
 }
@@ -99,7 +103,7 @@ void SettleDebt(Player* player)
     for (auto const& debt : state.debt)
         amount += debt.remaining;
     state.debt.clear();
-    state.timers.CancelEvent(807727);
+    state.timers.CancelEvent(StaggerTick);
     if (player->IsAlive() && amount)
         Unit::DealDamage(player, player, uint32(std::min<uint64>(amount, UINT32_MAX)), nullptr, NODAMAGE,
                          SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
@@ -350,7 +354,7 @@ class felsworn_player : public PlayerScript
         state.timers.Update(diff);
         state.scheduler.Update(diff);
         while (uint32 event = state.timers.ExecuteEvent())
-            if (event == 807727)
+            if (event == StaggerTick)
             {
                 uint64 amount = 0;
                 for (auto& debt : state.debt)
@@ -367,21 +371,21 @@ class felsworn_player : public PlayerScript
                     Unit::DealDamage(player, player, uint32(std::min<uint64>(amount, UINT32_MAX)), nullptr, NODAMAGE,
                                      SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
                 if (!state.debt.empty())
-                    state.timers.ScheduleEvent(807727, 1s);
+                    state.timers.ScheduleEvent(StaggerTick, 1s);
             }
         if (!player->IsAlive())
         {
             state.debt.clear();
             player->RemoveAurasDueToSpell(804216);
         }
-        if (!state.timers.HasTimeUntilEvent(1))
+        if (!state.timers.HasTimeUntilEvent(RefreshEvent))
         {
             Refresh(player);
             state.infernals.erase(
                 std::remove_if(state.infernals.begin(), state.infernals.end(),
                                [player](ObjectGuid guid) { return !ObjectAccessor::GetCreature(*player, guid); }),
                 state.infernals.end());
-            state.timers.ScheduleEvent(1, 250ms);
+            state.timers.ScheduleEvent(RefreshEvent, 250ms);
         }
     }
     void OnPlayerBeforeLogout(Player* player) override

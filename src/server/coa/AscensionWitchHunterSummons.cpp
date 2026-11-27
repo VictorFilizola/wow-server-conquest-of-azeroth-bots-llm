@@ -21,6 +21,7 @@
 #include "SpellScript.h"
 #include "TemporarySummon.h"
 #include <algorithm>
+#include <cmath>
 
 namespace AscensionWitchHunter
 {
@@ -37,6 +38,11 @@ enum HoundActionsAndPoints
     ACTION_CALLED_LEAP = 1,
     GUID_LEAP_TARGET = 1,
     POINT_LEAP_LANDING = 701
+};
+
+enum HoundStrikeSpells : uint32
+{
+    SPELL_SHADOWHOUND_STRIKE = 706332
 };
 
 bool InSmoke(Unit const* attacker, Unit const* target)
@@ -59,6 +65,13 @@ bool InSmoke(Unit const* attacker, Unit const* target)
     return false;
 }
 
+bool HoundMayHunt(Creature const* hound, Unit const* target)
+{
+    Unit const* owner = hound->GetCharmerOrOwner();
+    return owner && target && hound->IsValidAttackTarget(target) &&
+           (!target->HasStealthAura() || owner->CanSeeOrDetect(target));
+}
+
 void SummonHounds(Player* player, uint32 count, uint32 duration, uint32 spellId, Unit* target)
 {
     if (!player || !player->IsInWorld() || !player->IsAlive())
@@ -74,7 +87,7 @@ void SummonHounds(Player* player, uint32 count, uint32 duration, uint32 spellId,
         if (!pet)
             continue;
         pet->SetTempSummonType(TEMPSUMMON_TIMED_DESPAWN);
-        if (target && player->IsValidAttackTarget(target))
+        if (target && HoundMayHunt(pet, target))
             pet->AI()->AttackStart(target);
     }
 }
@@ -103,6 +116,8 @@ class HoundActions
   public:
     explicit HoundActions(Creature* creature) : _me(creature)
     {
+        Player* owner = Owner(creature->GetOwner());
+        _restoredFromSave = owner && owner->GetTemporaryUnsummonedPetNumber() != 0;
         _events.ScheduleEvent(EVENT_REFRESH_OWNER, 1ms);
         _events.ScheduleEvent(EVENT_AUTO_LEAP, 20s);
     }
@@ -112,7 +127,7 @@ class HoundActions
     {
         Player* owner = Owner(_me->GetOwner());
         Unit* target = ObjectAccessor::GetUnit(*_me, victim);
-        if (!owner || !target || !owner->IsValidAttackTarget(target) || !_me->IsWithinDistInMap(target, 40.0f) ||
+        if (!owner || !target || !HoundMayHunt(_me, target) || !_me->IsWithinDistInMap(target, 40.0f) ||
             !_me->IsWithinLOSInMap(target) || _me->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED))
         {
             _events.RescheduleEvent(EVENT_AUTO_LEAP, 1s);
@@ -150,15 +165,26 @@ class HoundActions
                     if (_me->GetDisplayId() != display)
                         _me->SetDisplayId(display, _me->GetObjectScale());
                 }
-                float healthFraction = _me->GetHealthPct() / 100.0f;
                 uint32 maximum = std::max(1u, owner->CountPctFromMaxHealth(_me->GetEntry() == 50124 ? 40 : 20));
                 if (maximum != _me->GetMaxHealth())
                 {
+                    uint32 health = (!_ownerRefreshed && _restoredFromSave)
+                        ? std::min(_me->GetHealth(), maximum)
+                        : std::max(1u, uint32(maximum * (_me->GetHealthPct() / 100.0f)));
                     _me->SetMaxHealth(maximum);
-                    _me->SetHealth(std::max(1u, uint32(maximum * healthFraction)));
+                    _me->SetHealth(std::max(1u, health));
                 }
+                _ownerRefreshed = true;
                 _me->SetLevel(owner->GetLevel());
-                float damage = owner->GetLevel() + owner->GetTotalAttackPowerValue(RANGED_ATTACK) * 0.04f;
+                bool const permanent = _me->GetEntry() == 50124;
+                float const spellPower = float(std::max({0, owner->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_SHADOW),
+                                                         owner->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_HOLY)}));
+                float const hit = owner->GetLevel() * (permanent ? 3.0f : 0.6f) +
+                                  owner->GetTotalAttackPowerValue(RANGED_ATTACK) * (permanent ? 0.22f : 0.046f) +
+                                  spellPower * (permanent ? 0.39f : 0.08f);
+                float const strength = _me->GetTotalAttackPowerValue(BASE_ATTACK) / 14.0f *
+                                       _me->GetAttackTime(BASE_ATTACK) / 1000.0f;
+                float damage = std::max(1.0f, hit - strength);
                 _me->SetBaseWeaponDamage(BASE_ATTACK, MINDAMAGE, damage * 0.9f);
                 _me->SetBaseWeaponDamage(BASE_ATTACK, MAXDAMAGE, damage * 1.1f);
                 _me->UpdateDamagePhysical(BASE_ATTACK);
@@ -175,7 +201,7 @@ class HoundActions
                         if (Unit* selected = owner->GetSelectedUnit())
                             if (selected->IsInCombatWith(owner))
                                 target = selected;
-                    if (target && owner->IsValidAttackTarget(target))
+                    if (target && HoundMayHunt(_me, target))
                         _me->AI()->AttackStart(target);
                     else if (_me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
                         _me->GetMotionMaster()->MoveFollow(owner, 2.0f, PET_FOLLOW_ANGLE);
@@ -185,7 +211,7 @@ class HoundActions
             else if (event == EVENT_CHECK_LANDING)
             {
                 Unit* target = ObjectAccessor::GetUnit(*_me, victim);
-                if (!target || !owner->IsValidAttackTarget(target))
+                if (!target || !HoundMayHunt(_me, target))
                     continue;
                 if (!_me->IsWithinMeleeRange(target))
                 {
@@ -194,12 +220,20 @@ class HoundActions
                     continue;
                 }
                 _landingChecks = 0;
-                int32 value = sSpellMgr->GetSpellInfo(706332)->Effects[EFFECT_1].CalcValue(owner) +
-                              int32(owner->GetTotalAttackPowerValue(RANGED_ATTACK) * 0.35f);
+                SpellInfo const* strike = sSpellMgr->GetSpellInfo(SPELL_SHADOWHOUND_STRIKE);
+                int32 value = strike->Effects[EFFECT_1].CalcValue(owner) * 315 / 225 +
+                              int32(owner->GetTotalAttackPowerValue(RANGED_ATTACK) * 0.55f);
                 if (owner->HasAura(705450))
                     value += owner->GetLevel() * 2;
-                _me->CastCustomSpell(706332, SPELLVALUE_BASE_POINT1, value, target, TRIGGERED_FULL_MASK);
-                _me->CastCustomSpell(706332, SPELLVALUE_BASE_POINT1, value, target, TRIGGERED_FULL_MASK);
+                if (_me->GetEntry() == 50224)
+                    value = int32(value * 0.3f);
+                float strikeScale = 1.0f;
+                sScriptMgr->ModifySpellEffectBaseValue(_me, strike, EFFECT_1, strikeScale);
+                int32 const basePoints = int32(std::ceil(value / strikeScale));
+                _me->CastCustomSpell(SPELL_SHADOWHOUND_STRIKE, SPELLVALUE_BASE_POINT1, basePoints, target,
+                                     TRIGGERED_FULL_MASK);
+                _me->CastCustomSpell(SPELL_SHADOWHOUND_STRIKE, SPELLVALUE_BASE_POINT1, basePoints, target,
+                                     TRIGGERED_FULL_MASK);
                 if (_called && owner->HasAura(500056))
                     for (Unit* enemy : Nearby(target, 6.0f))
                         if (owner->IsValidAttackTarget(enemy))
@@ -225,6 +259,8 @@ class HoundActions
     EventMap _events;
     uint8 _landingChecks = 0;
     bool _called = false;
+    bool _ownerRefreshed = false;
+    bool _restoredFromSave = false;
 };
 
 struct npc_ascension_witch_hunter_pet : PetAI
@@ -241,6 +277,7 @@ struct npc_ascension_witch_hunter_pet : PetAI
         if (action == ACTION_CALLED_LEAP)
             actions.Leap(true);
     }
+    bool CanAIAttack(Unit const* target) const override { return HoundMayHunt(me, target); }
     void UpdateAI(uint32 diff) override
     {
         actions.Update(diff);
@@ -280,9 +317,16 @@ struct npc_ascension_witch_hunter_hound : ScriptedAI
         if (action == ACTION_CALLED_LEAP)
             actions.Leap(true);
     }
+    bool CanAIAttack(Unit const* target) const override { return HoundMayHunt(me, target); }
     void UpdateAI(uint32 diff) override
     {
         actions.Update(diff);
+        if (Unit* victim = me->GetVictim(); victim && !HoundMayHunt(me, victim))
+        {
+            me->AttackStop();
+            if (Unit* owner = me->GetOwner())
+                me->GetMotionMaster()->MoveFollow(owner, 2.0f, PET_FOLLOW_ANGLE);
+        }
         if (me->GetVictim())
             DoMeleeAttackIfReady();
     }
@@ -314,6 +358,11 @@ struct npc_ascension_witch_hunter_field : ScriptedAI
         me->SetLevel(owner->GetLevel());
         me->SetReactState(REACT_PASSIVE);
         me->SetImmuneToNPC(true);
+        if (me->GetEntry() >= 506250 && me->GetEntry() <= 506253)
+        {
+            me->SetImmuneToPC(true);
+            me->SetUnitFlag(UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_SELECTABLE);
+        }
         me->GetMotionMaster()->Clear();
         me->GetMotionMaster()->MoveIdle();
         if (me->GetEntry() == 50519)

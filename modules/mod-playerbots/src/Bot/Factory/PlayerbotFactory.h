@@ -73,6 +73,9 @@ public:
     static void InitTalentsBySpecNo(Player* bot, int specNo, bool reset);
     static void InitTalentsByParsedSpecLink(Player* bot, std::vector<std::vector<uint32>> parsedSpecLink, bool reset);
     void InitAvailableSpells();
+    // The trainer spells InitAvailableSpells would still teach this bot now, without teaching them (the check of
+    // AiPlayerbot.CoaLive.TrainerDedup, ".bot trainercheck"). 0 when the class's trainers are not cached yet.
+    static uint32 CountTeachableSpells(Player* bot);
     static bool IsTrainerSpellAllowedForBot(Player* bot, Trainer::Trainer const* trainer,
                                              Trainer::Spell const* trainerSpell);
     void InitClassSpells();
@@ -83,6 +86,16 @@ public:
     // at random): every bot of a class and specialization gets the same items, for the test benches.
     void SetDeterministic(bool on) { deterministic = on; }
     bool IsDeterministic() const { return deterministic; }
+    // Gives an equipped item its random property or suffix (the item mods follow). A direct creation (starter kit,
+    // quest item, BiS command) gets none from the core: RollRandomProperty rolls it as the core does at a vendor.
+    static void SetRandomProperty(Player* bot, Item* item, int32 randomPropertyId);
+    static void RollRandomProperty(Player* bot, Item* item);
+    // The main hand weapon of the bot's starting outfit (CoA kit for a CoA class, CharStartOutfit otherwise), 0 if
+    // none (CoaStarterWeapon).
+    static uint32 StarterWeaponOf(Player* bot);
+    // A random bot whose level went down after it got its gear loses the equipped items whose required level is
+    // above its own (alts are players' characters: never touched). Returns how many.
+    static uint32 UnequipAboveLevel(Player* bot);
     // A CoA bot under level 5 left naked by an older version gets its class starter kit back.
     static void DressNakedCoaStarter(Player* bot);
     // Takes off the CoA spell ranks above `level`: the core grants them on the way up only, so a bot
@@ -104,6 +117,14 @@ public:
     void InitPet();
     void InitAmmo();
     static uint32 CalcMixedGearScore(uint32 gs, uint32 quality);
+    static bool MayGearItself(Player* bot);
+    // AiPlayerbot.CoaSelfFound applies at this level (no gear made, no level given).
+    static bool SelfFoundAt(uint32 level);
+    // AiPlayerbot.CoaSelfFoundBotsPercent (0-100): a random bot of that share, from level 10, wears only what it finds.
+    // The share is fixed by the guid, so a bot stays in it or out of it across restarts.
+    static bool IsSelfFoundBot(Player* bot);
+    static bool IsSelfFoundGuid(ObjectGuid::LowType guid);
+    static constexpr uint32 SELF_FOUND_BOTS_MIN_LEVEL = 10;
     // An item of the honor quartermasters or with resilience.
     static bool IsCoaPvpItem(ItemTemplate const* proto);
     static void DestroyEquippedGear(Player* bot);
@@ -227,6 +248,7 @@ private:
     void InitTalentsByTemplate(uint32 specNo);
     void InitQuests(std::list<uint32>& questMap, bool withRewardItem = true);
     void ClearInventory();
+    void ClearEquippedItems();  // the worn gear only, the bags kept (KeepsBags)
     void ClearAllItems();
     void ResetQuests();
 
@@ -257,6 +279,12 @@ private:
     void IterateItemsInBank(IterateItemsVisitor* visitor);
     EnchantContainer::const_iterator GetEnchantContainerBegin() { return m_EnchantContainer.begin(); }
     EnchantContainer::const_iterator GetEnchantContainerEnd() { return m_EnchantContainer.end(); }
+    // Self-found by the realm's level range or as one of the self-found random bots.
+    bool SelfFound() const { return SelfFoundAt(level) || IsSelfFoundBot(bot); }
+    // The bags are never emptied on a self-found realm (AiPlayerbot.CoaSelfFound = 1, any level) nor for a
+    // self-found bot: it sells what it has too much of at vendors and makes do (user, 19/11).
+    bool KeepsBags() const;
+
     uint32 level;
     uint32 itemQuality;
     uint32 gearScoreLimit;

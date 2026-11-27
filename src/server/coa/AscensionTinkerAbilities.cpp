@@ -264,17 +264,15 @@ public:
         if (Nanobots(player,target) && player->HasAura(560734) &&
             Any(info,{801809,801709,502537,801808,803552}))
             Cast(player,target,560736);
-        if (healing && Named(info,680196))
-        {
-            if (critical && player->HasAura(805306))
-                for (Unit* ally : Allies(player,target,Radius(706255),sSpellMgr->GetSpellInfo(706255)->MaxAffectedTargets))
-                    Copy(player,ally,706255,CalculatePct(healing,15));
-            if (player->HasAura(560787))
-                for (Creature* device : Devices(player))
-                    for (Unit* ally : Allies(player,device,Radius(681513),1))
-                        Cast(device,ally,681513);
-        }
-        if (healing && Named(info,801707) && player->HasAura(524834))
+        if (uint32 shotHealing = spell->GetScriptHealingIncludingOverheal(); shotHealing && critical &&
+            Named(info,680196) && player->HasAura(805306))
+            for (Unit* ally : Allies(player,target,Radius(706255),sSpellMgr->GetSpellInfo(706255)->MaxAffectedTargets))
+                Copy(player,ally,706255,CalculatePct(shotHealing,15));
+        if (healing && Named(info,680196) && player->HasAura(560787))
+            for (Creature* device : Devices(player))
+                for (Unit* ally : Allies(player,device,Radius(681513),1))
+                    Cast(device,ally,681513);
+        if (Named(info,801707) && player->HasAura(524834))
             if (Creature* device = target->ToCreature(); device && Owned(player,device))
                 Overcharge(player,device);
         bool brilliance = spell->GetScriptValue(653273) != 0;
@@ -377,7 +375,21 @@ class spell_ascension_tinker_ability : public SpellScript
         }
         if ((id == 802176 || id == 802236) && GetCaster()->IsCreature())
             if (Creature* device = GetCaster()->ToCreature(); Owned(player,device) && device->GetEntry() == 50300)
-                device->DespawnOrUnsummon(100ms);
+            {
+                ObjectGuid const guid = device->GetGUID();
+                player->m_Events.AddEventAtOffset([player, guid]()
+                {
+                    if (!player)
+                        return;
+                    player->RemoveAurasDueToSpell(804673);
+                    Creature* bot = ObjectAccessor::GetCreature(*player, guid);
+                    if (!bot)
+                        return;
+                    if (bot->GetCharmerGUID() == player->GetGUID())
+                        bot->RemoveCharmedBy(player);
+                    bot->DespawnOrUnsummon();
+                }, 100ms);
+            }
     }
     void Hit()
     {
@@ -414,50 +426,9 @@ class spell_ascension_tinker_ability : public SpellScript
         OnHit += SpellHitFn(spell_ascension_tinker_ability::Hit);
     }
 };
-class spell_ascension_tinker_rocket_boots : public SpellScript
-{
-    PrepareSpellScript(spell_ascension_tinker_rocket_boots);
-    bool Validate(SpellInfo const* spellInfo) override
-    {
-        return spellInfo && spellInfo->Effects[EFFECT_0].Effect == SPELL_EFFECT_LEAP_BACK;
-    }
-    void LaunchTarget(SpellEffIndex index)
-    {
-        Player* player = Owner(GetCaster());
-        if (!player || player != GetCaster())
-            return;
-        float forward = player->HasUnitMovementFlag(MOVEMENTFLAG_BACKWARD) ? -1
-            : player->HasUnitMovementFlag(MOVEMENTFLAG_FORWARD) ? 1 : 0;
-        float strafe = player->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_LEFT) ? 1
-            : player->HasUnitMovementFlag(MOVEMENTFLAG_STRAFE_RIGHT) ? -1 : 0;
-        if (!forward && !strafe)
-            return;
-        PreventHitDefaultEffect(index);
-        float leapSpeed = float(GetSpellInfo()->Effects[index].MiscValue) / 10.0f;
-        if (leapSpeed <= 0.0f)
-            leapSpeed = 15.0f;
-        float rate = player->GetSpeedRate(MOVE_RUN);
-        float speed = player->GetSpeed(MOVE_RUN);
-        if (speed > 0.0f && speed < leapSpeed)
-        {
-            float surge = rate * leapSpeed / speed;
-            player->SetSpeed(MOVE_RUN, surge, true);
-            State(player).scheduler.Schedule(Milliseconds(1000), [player, rate, surge](TaskContext)
-            {
-                if (player->IsInWorld() && player->GetSpeedRate(MOVE_RUN) == surge)
-                    player->SetSpeed(MOVE_RUN, rate, true);
-            });
-        }
-    }
-    void Register() override
-    {
-        OnEffectLaunchTarget += SpellEffectFn(spell_ascension_tinker_rocket_boots::LaunchTarget,EFFECT_0,SPELL_EFFECT_LEAP_BACK);
-    }
-};
 }
 void AddSC_AscensionTinkerAbilities()
 {
     new tinker_spells();
     RegisterSpellScript(spell_ascension_tinker_ability);
-    RegisterSpellScript(spell_ascension_tinker_rocket_boots);
 }

@@ -1,0 +1,496 @@
+/*
+ * Copyright (C) 2008-2010 Trinity <http://www.trinitycore.org/>
+ * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * Copyright (C) 2023+ Nathan Handley <https://github.com/NathanHandley>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+#ifndef COA_ECONOMY_AUCTION_HOUSE_BOT_H
+#define COA_ECONOMY_AUCTION_HOUSE_BOT_H
+
+#include "CoaRealPrices.h"
+#include "Common.h"
+#include "ObjectGuid.h"
+#include "Random.h"
+
+#include <map>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+struct AuctionEntry;
+struct AuctionHouseEntry;
+class AuctionHouseObject;
+class Player;
+class WorldSession;
+
+#include "ItemTemplate.h"
+#include "SharedDefines.h"
+
+namespace CoaEconomy
+{
+
+struct ListProportionNode
+{
+    uint32 ItemClassID = 0;
+    uint32 ItemQualityID = 0;
+    uint32 Proportion = 0;
+};
+
+class FactionSpecificAuctionHouseConfig
+{
+private:
+    uint32 AHID;
+    uint32 AHFID;
+    uint32 minItems;
+    uint32 maxItems;
+
+public:
+    FactionSpecificAuctionHouseConfig(uint32 ahid)
+    {
+        AHID = ahid;
+        switch(ahid)
+        {
+        case 2:
+            AHFID = 55;
+            break;
+        case 6:
+            AHFID = 29;
+            break;
+        case 7:
+            AHFID = 120;
+            break;
+        default:
+            AHFID = 120;
+            break;
+        }
+    }
+    FactionSpecificAuctionHouseConfig()
+    {
+    }
+    uint32 GetAHID()
+    {
+        return AHID;
+    }
+    uint32 GetAHFID()
+    {
+        return AHFID;
+    }
+    void SetMinItems(uint32 value)
+    {
+        minItems = value;
+    }
+    uint32 GetMinItems()
+    {
+        if ((minItems == 0) && (maxItems))
+            return maxItems;
+        else if ((maxItems) && (minItems > maxItems))
+            return maxItems;
+        else
+            return minItems;
+    }
+    void SetMaxItems(uint32 value)
+    {
+        maxItems = value;
+    }
+    uint32 GetMaxItems()
+    {
+        return maxItems;
+    }
+    ~FactionSpecificAuctionHouseConfig()
+    {
+    }
+};
+
+class AuctionHouseBotCharacter
+{
+public:
+    AuctionHouseBotCharacter(uint32 accountID, uint32 characterGUID) :
+        AccountID(accountID),
+        CharacterGUID(characterGUID) { }
+    uint32 AccountID;
+    ObjectGuid::LowType CharacterGUID;
+};
+
+class AuctionHouseBot
+{
+public:
+    std::vector<AuctionHouseBotCharacter> AHCharacters;
+    uint32 CurrentBotCharGUID;
+
+private:
+    bool debug_Out;
+    bool debug_Out_Filters;
+
+    bool SellingBotEnabled;
+    bool BuyingBotEnabled;
+    bool ReturnExpiredAuctionItemsToBot;
+    uint32 CyclesBetweenBuyActionMin;
+    uint32 CyclesBetweenBuyAction;
+    uint32 CyclesBetweenBuyActionMax;
+    uint32 CyclesBetweenSellActionMin;
+    uint32 CyclesBetweenSellAction;
+    uint32 CyclesBetweenSellActionMax;
+    uint32 MaxBuyoutPriceInCopper;
+    bool CompleteItemValueOverrideEnabled;
+    std::unordered_map<uint32, uint64> CompleteItemValueOverrideItemListByItemID;
+    bool CompleteItemValueOverrideDoApplyBidVariations;
+    bool CompleteItemValueOverrideDoApplyBuyoutVariations;
+    float BuyoutVariationReducePercent;
+    bool CoaRealHousePrices = false; // AuctionHouseBot.CoA.RealHousePrices
+    CoaEconomy::RealPrices::Multipliers CoaRealPriceMultipliers; // AuctionHouseBot.CoA.RealPriceMultiplier.*
+    float BuyoutVariationAddPercent;
+    float BidVariationHighReducePercent;
+    float BidVariationLowReducePercent;
+    bool BuyoutBelowVendorVariationAddPercentEnabled;
+    float BuyoutBelowVendorVariationAddPercent;
+    uint32 BuyingBotBuyCandidatesPerBuyCycleMin;
+    uint32 BuyingBotBuyCandidatesPerBuyCycleMax;
+    uint32 ListingExpireTimeInSecondsMin;
+    uint32 ListingExpireTimeInSecondsMax;
+    float BuyingBotAcceptablePriceModifier;
+    bool BuyingBotAlwaysBidMaxCalculatedPrice;
+    bool BuyingBotWillBidAgainstPlayers;
+    bool BuyingBotOnlyBuyListableItems;
+    uint32 BuyingBotMaxPurchasesPerSellerPerDay;
+    bool BuyingBotInstantBids;
+    std::unordered_map<uint32, std::pair<uint32, uint32>> BuyingBotPurchasesBySellerToday;
+    std::vector<uint32> vendorItemsPrices;
+    std::string AHCharactersGUIDsForQuery;
+    uint32 ItemsPerCycle;
+    bool DisabledItemTextFilter;
+    bool DisabledRecipeProducedItemFilterEnabled;
+    std::unordered_set<uint32> ItemIDsProducedByRecipes;
+    std::map<uint32, std::unordered_set<uint32>> DisabledRecipeProducedItemClassSubClasses;
+    std::set<uint32> DisabledItems;
+    bool ListedItemLevelRestrictedEnabled;
+    bool ListedItemLevelRestrictedUseCraftedItemForCalculation;
+    uint32 ListedItemLevelMin;
+    uint32 ListedItemLevelMax;
+    std::set<uint32> ListedItemLevelExceptionItems;
+    bool ListedItemUseOrEquipRestrictedEnabled;
+    uint32 ListedItemUseOrEquipRestrictMinLevel;
+    uint32 ListedItemUseOrEquipRestrictMaxLevel;
+    std::set<uint32> ListedItemUseOrEquipExceptionItems;
+    uint32 RandomStackRatioConsumable;
+    uint32 RandomStackRatioContainer;
+    uint32 RandomStackRatioWeapon;
+    uint32 RandomStackRatioGem;
+    uint32 RandomStackRatioArmor;
+    uint32 RandomStackRatioReagent;
+    uint32 RandomStackRatioProjectile;
+    uint32 RandomStackRatioTradeGood;
+    uint32 RandomStackRatioGeneric;
+    uint32 RandomStackRatioRecipe;
+    uint32 RandomStackRatioQuiver;
+    uint32 RandomStackRatioQuest;
+    uint32 RandomStackRatioKey;
+    uint32 RandomStackRatioMisc;
+    uint32 RandomStackRatioGlyph;
+    uint32 RandomStackIncrementConsumable;
+    uint32 RandomStackIncrementContainer;
+    uint32 RandomStackIncrementWeapon;
+    uint32 RandomStackIncrementGem;
+    uint32 RandomStackIncrementArmor;
+    uint32 RandomStackIncrementReagent;
+    uint32 RandomStackIncrementProjectile;
+    uint32 RandomStackIncrementTradeGood;
+    uint32 RandomStackIncrementGeneric;
+    uint32 RandomStackIncrementRecipe;
+    uint32 RandomStackIncrementQuiver;
+    uint32 RandomStackIncrementQuest;
+    uint32 RandomStackIncrementKey;
+    uint32 RandomStackIncrementMisc;
+    uint32 RandomStackIncrementGlyph;
+    uint32 MaximumStackSizeConsumable;
+    uint32 MaximumStackSizeContainer;
+    uint32 MaximumStackSizeWeapon;
+    uint32 MaximumStackSizeGem;
+    uint32 MaximumStackSizeArmor;
+    uint32 MaximumStackSizeReagent;
+    uint32 MaximumStackSizeProjectile;
+    uint32 MaximumStackSizeTradeGood;
+    uint32 MaximumStackSizeGeneric;
+    uint32 MaximumStackSizeRecipe;
+    uint32 MaximumStackSizeQuiver;
+    uint32 MaximumStackSizeQuest;
+    uint32 MaximumStackSizeKey;
+    uint32 MaximumStackSizeMisc;
+    uint32 MaximumStackSizeGlyph;
+    std::vector<ListProportionNode> ItemListProportionNodesSeed;
+    std::vector<ListProportionNode> ItemListProportionNodesLookup;
+    std::unordered_map<uint32, uint64> ItemListProportionMultipliedItemIDs;
+    std::map<uint32, std::map<uint32, std::vector<uint32>>> ItemCandidatesByItemClassAndQuality;
+    float PriceMultiplierCategoryConsumable;
+    float PriceMultiplierCategoryContainer;
+    float PriceMultiplierCategoryWeapon;
+    float PriceMultiplierCategoryGem;
+    float PriceMultiplierCategoryArmor;
+    float PriceMultiplierCategoryReagent;
+    float PriceMultiplierCategoryProjectile;
+    float PriceMultiplierCategoryTradeGood;
+    float PriceMultiplierCategoryGeneric;
+    float PriceMultiplierCategoryRecipe;
+    float PriceMultiplierCategoryQuiver;
+    float PriceMultiplierCategoryQuest;
+    float PriceMultiplierCategoryKey;
+    float PriceMultiplierCategoryMisc;
+    float PriceMultiplierCategoryGlyph;
+    float PriceMultiplierItemLevelCategoryConsumable;
+    float PriceMultiplierItemLevelCategoryContainer;
+    float PriceMultiplierItemLevelCategoryWeapon;
+    float PriceMultiplierItemLevelCategoryGem;
+    float PriceMultiplierItemLevelCategoryArmor;
+    float PriceMultiplierItemLevelCategoryReagent;
+    float PriceMultiplierItemLevelCategoryProjectile;
+    float PriceMultiplierItemLevelCategoryTradeGood;
+    float PriceMultiplierItemLevelCategoryGeneric;
+    float PriceMultiplierItemLevelCategoryRecipe;
+    float PriceMultiplierItemLevelCategoryQuiver;
+    float PriceMultiplierItemLevelCategoryQuest;
+    float PriceMultiplierItemLevelCategoryKey;
+    float PriceMultiplierItemLevelCategoryMisc;
+    float PriceMultiplierItemLevelCategoryGlyph;
+    float PriceMultiplierQualityPoor;
+    float PriceMultiplierQualityNormal;
+    float PriceMultiplierQualityUncommon;
+    float PriceMultiplierQualityRare;
+    float PriceMultiplierQualityEpic;
+    float PriceMultiplierQualityLegendary;
+    float PriceMultiplierQualityArtifact;
+    float PriceMultiplierQualityHeirloom;
+    float PriceMultiplierCategoryQuality[MAX_ITEM_CLASS][MAX_ITEM_QUALITY];
+    float PriceMultiplierCategoryMountQualityPoor;
+    float PriceMultiplierCategoryMountQualityNormal;
+    float PriceMultiplierCategoryMountQualityUncommon;
+    float PriceMultiplierCategoryMountQualityRare;
+    float PriceMultiplierCategoryMountQualityEpic;
+    float PriceMultiplierCategoryMountQualityLegendary;
+    float PriceMultiplierCategoryMountQualityArtifact;
+    float PriceMultiplierCategoryMountQualityHeirloom;
+    float PriceMultiplierCategoryPetQualityPoor;
+    float PriceMultiplierCategoryPetQualityNormal;
+    float PriceMultiplierCategoryPetQualityUncommon;
+    float PriceMultiplierCategoryPetQualityRare;
+    float PriceMultiplierCategoryPetQualityEpic;
+    float PriceMultiplierCategoryPetQualityLegendary;
+    float PriceMultiplierCategoryPetQualityArtifact;
+    float PriceMultiplierCategoryPetQualityHeirloom;
+    bool AdvancedPricingConsumablePotionEnabled;
+    bool AdvancedPricingConsumableElixirEnabled;
+    bool AdvancedPricingConsumableFlaskEnabled;
+    bool AdvancedPricingGemEnabled;
+    bool AdvancedPricingTradeGoodClothEnabled;
+    bool AdvancedPricingTradeGoodHerbEnabled;
+    bool AdvancedPricingTradeGoodMetalStoneEnabled;
+    bool AdvancedPricingTradeGoodLeatherEnabled;
+    bool AdvancedPricingTradeGoodEnchantingEnabled;
+    bool AdvancedPricingTradeGoodElementalEnabled;
+    bool AdvancedPricingTradeGoodMeatEnabled;
+    bool AdvancedPricingMiscJunkEnabled;
+    bool AdvancedPricingMiscMountEnabled;
+    bool AdvancedPricingMiscPetEnabled;
+    bool UseItemSellPriceIfHigherThanPriceMinimumCenterBase;
+    uint32 PriceMinimumCenterBaseConsumable;
+    uint32 PriceMinimumCenterBaseContainer;
+    uint32 PriceMinimumCenterBaseWeapon;
+    uint32 PriceMinimumCenterBaseGem;
+    uint32 PriceMinimumCenterBaseArmor;
+    uint32 PriceMinimumCenterBaseReagent;
+    uint32 PriceMinimumCenterBaseProjectile;
+    uint32 PriceMinimumCenterBaseTradeGood;
+    uint32 PriceMinimumCenterBaseGeneric;
+    uint32 PriceMinimumCenterBaseRecipe;
+    uint32 PriceMinimumCenterBaseQuiver;
+    uint32 PriceMinimumCenterBaseQuest;
+    uint32 PriceMinimumCenterBaseKey;
+    uint32 PriceMinimumCenterBaseMisc;
+    uint32 PriceMinimumCenterBaseGlyph;
+    std::unordered_map<uint32, uint64> PriceMinimumCenterBaseOverridesByItemID;
+    bool ListedItemIDRestrictedEnabled;
+    uint32 ListedItemIDMin;
+    uint32 ListedItemIDMax;
+    std::set<uint32> ListedItemIDExceptionItems;
+    bool PreventOverpayingForVendorItems;
+    std::unordered_map<uint32, double> CachedItemDropRates;
+    std::vector<std::vector<std::vector<std::vector<uint32>>>> ItemTiersByClassAndQuality;  // [Classes][Qualities][Tiers] .. [17][7][configurable]
+    std::map<double, int, std::greater<double>> DropRatesToTierMap;
+    std::set<uint32> AdvancedListingRuleUseDropRatesExceptionItems;
+    bool AdvancedListingRuleUseDropRatesEnabled;
+    bool AdvancedListingRuleUseDropRatesWeaponEnabled;
+    bool AdvancedListingRuleUseDropRatesArmorEnabled;
+    bool AdvancedListingRuleUseDropRatesRecipeEnabled;
+    std::set<uint32> AdvancedListingRuleUseDropRatesWeaponAffectedQualities;
+    std::set<uint32> AdvancedListingRuleUseDropRatesArmorAffectedQualities;
+    std::set<uint32> AdvancedListingRuleUseDropRatesRecipeAffectedQualities;
+    float AdvancedListingRuleUseDropRatesMinDropRate;
+    std::unordered_set<uint32> QuestRewardItemIDs;
+
+    FactionSpecificAuctionHouseConfig AllianceConfig;
+    FactionSpecificAuctionHouseConfig HordeConfig;
+    FactionSpecificAuctionHouseConfig NeutralConfig;
+
+    uint32 LastBuyCycleCount;
+    uint32 LastSellCycleCount;
+    int ActiveListMultipleItemID;
+    int RemainingListMultipleCount;
+
+    // CoA Economy: a buyer that acts like people (AiPlayerbot.CoaEconomy.Buyer.*, off by default).
+    struct HumanBuyerSettings
+    {
+        bool Enabled = false;
+        uint32 DelayMinSeconds = 60;
+        uint32 DelayMaxSeconds = 900;
+        uint32 BaseChancePercent = 35;
+        uint32 RivalPercent = 25;
+        uint32 ArbitrageMarginPercent = 90;
+    };
+    HumanBuyerSettings HumanBuyer;
+    // Per auction house: auction id -> game time (seconds) from which the buyer may look at it.
+    std::map<uint32, std::unordered_map<uint32, uint32>> HumanBuyerEligibleAt;
+    // While true, CalculateItemValue takes the low end of every random range (the house's lowest asking price).
+    // Per thread: the guild stock asks the house's lowest price from the bots' map threads (3.1.7 race review).
+    static thread_local bool PriceRollLowest;
+    uint32 PriceRoll(uint32 low, uint32 high) const { return PriceRollLowest ? low : urand(low, high); }
+    uint64 GetHouseLowestBuyoutPerItem(ItemTemplate const* itemProto);
+    void LoadHumanBuyerSettings();
+
+    // CoA Economy: rarity premium from the drop rates (AiPlayerbot.CoaEconomy.Rarity.*, off by default).
+    bool RarityEnabled = false;
+    double RarityPremium = 1.0;
+    double RarityCommonRate = 5.0;
+    double RarityRareRate = 0.01;
+    void LoadRaritySettings();
+    double GetRarityPriceFactor(uint32 itemId) const;
+
+    // CoA Economy: the floor of common crafting materials (AiPlayerbot.CoaEconomy.AHBot.MaterialFloor.*).
+    bool MaterialFloorEnabled = true;
+    uint32 MaterialFloorStacks = 2;
+    // 3.1.4: the house buyer takes the common crafting materials other sellers list (MaterialBuyer.*).
+    bool MaterialBuyerEnabled = true;
+    uint32 MaterialBuyerPricePercent = 90;
+    uint32 MaterialBuyerPerAccountPerDay = 10;
+    uint32 MaterialBuyerGoldPerAccountPerDay = 50;
+    bool MaterialBuyerPlayerMatchesHouse = true;
+    bool MaterialBuyerBuyFromBots = false;  // 3.1.4: a random bot's material auction is not the house's to buy  // a player's stack at or under the house's cheapest ask sells
+    // (account << 32 | item) -> when that account last bought that item from the house (BoughtFromHouseRecently)
+    std::unordered_map<uint64, uint32> BoughtFromHouse;
+    // account -> (day, auctions bought, copper paid)
+    std::unordered_map<uint32, std::tuple<uint32, uint32, uint64>> MaterialBuyerSoldToday;
+    // 3.1.4 guard: item -> what NPC vendors sell of it (no extended cost): lowest price, unlimited stock anywhere,
+    // items a day of all limited stocks (maxcount x a day / incrtime).
+    struct VendorStock
+    {
+        uint32 price = 0;
+        bool unlimited = false;
+        uint64 perDay = 0;
+    };
+    std::unordered_map<uint32, VendorStock> vendorBuyPrices;
+    void LoadVendorBuyPrices();
+    void LoadMaterialFloorSettings();
+    uint32 ListMaterialFloor(std::vector<Player*> const& AHBPlayers, FactionSpecificAuctionHouseConfig* config,
+        AuctionHouseObject* auctionHouse, AuctionHouseEntry const* ahEntry, std::unordered_set<uint32> const& sellers,
+        uint32 room);
+    void FilterHumanBuyerCandidates(uint32 houseId, std::vector<uint32>& possibleBids, AuctionHouseObject* auctionHouse);
+
+    AuctionHouseBot();
+
+public:
+    static AuctionHouseBot* instance()
+    {
+        static AuctionHouseBot instance;
+        return &instance;
+    }
+
+    ~AuctionHouseBot();
+
+    void Update();
+    bool IsModuleEnabled();
+    bool UsesAutoCharacter();
+    uint32 FindAutoCharacter();
+    bool EnsureAutoCharacter();
+    void InitializeConfiguration();
+    void EmptyAuctionHouses();
+    // CoA Economy: the house's lowest asking price for one item (0 while the house bot is off). SquidBots that
+    // sell at the auction house price from it, so the house and the bots share one price model.
+    uint64 GetReferencePricePerItem(ItemTemplate const* itemProto);
+    // 3.1.4: the lowest price an NPC vendor sells this item for (0 = no vendor sells it).
+    uint64 GetVendorBuyPrice(uint32 itemId) const;
+    // 3.1.4: an account bought an item from the house (CoaAhBotAuctionHooks): the house does not buy it back from
+    // that account for 24 hours.
+    void RecordHouseSale(uint32 buyerAccount, uint32 itemId);
+    // 3.1.4: that account bought this item from the house or a random bot in the last 24 hours.
+    bool BoughtFromBotsRecently(uint32 account, uint32 itemId) const;
+    // 3.1.4: the seller is the house (its characters) or a random bot account.
+    bool IsHouseCharacter(uint32 guidLow) const;
+    bool SoldByBots(ObjectGuid owner) const;
+    // 3.1.4: the house's cheapest price per item of this item in that house right now (0 = none listed).
+    uint64 HouseCheapestNow(AuctionHouseObject* house, uint32 itemId) const;
+    // 3.1.4 guard: what a buyer pays per item at most, payPerItem or under the vendor price when the guard holds for
+    // the item (CoaEconomyRules::VendorGuardApplies: unlimited stock, or a limited stock worth over 10 gold a day).
+    uint64 VendorGuardCap(uint32 itemId, uint64 payPerItem) const;
+    uint32 GetRandomStackValue(std::string configKeyString, uint32 defaultValue);
+    uint32 GetRandomStackIncrementValue(std::string configKeyString, uint32 defaultValue);
+    void SetCyclesBetweenBuyOrSell();
+    void SetBuyingBotBuyCandidatesPerBuyCycle();
+    void GetConfigMinAndMax(std::string config, uint32& min, uint32& max);
+    void AddCharacters(std::string characterGUIDString);
+    void ParseNumberListToSet(std::set<uint32>& workingItemIDSet, std::string itemString, const char* parentOperationName);
+    void AddToNumberListSet(std::set<uint32>& workingItemIDSet, uint32 itemID, const char* parentOperationName);
+    const char* GetQualityName(ItemQualities quality);
+    const char* GetCategoryName(ItemClass category);
+    uint32 GetStackSizeForItem(ItemTemplate const* itemProto) const;
+    // 3.2: the largest stack listed for the item: its class cap (MaxStackSize.*), at most the item's own.
+    uint32 ListingStackCap(ItemTemplate const* itemProto) const;
+    // 3.2: its own auctions of a stack above that cap (listed before the cap) are taken off the house: the item is
+    // deleted (it is the house bot's), a bidder gets its bid back. Never another seller's auction. Returns the count.
+    uint32 RemoveOversizedStacks(AuctionHouseObject* auctionHouse, uint32 houseId);
+    std::unordered_set<uint32> PriceSweptHouses;  // 3.2.1: houses swept of overpriced listings since the start
+    void CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice);
+    void PopulateItemDropChances();
+    void PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities);
+    void InitializeAdvancedListingRuleUseDropRatesTiers();
+    void PopulateQuestRewardItemIDs();
+    bool IsItemQuestReward(uint32 itemID);
+    bool IsItemCrafted(uint32 itemID);
+    bool IsItemListableBySeller(ItemTemplate const* itemProto);
+    bool IsItemCategoryQualityInDBDropRatesConfig(ItemTemplate const* proto);
+    bool IsItemEligibleForDBDropRates(ItemTemplate const* proto);
+    bool HandleAdvancedListingRuleUseDropRates(ItemTemplate const*& proto);
+    int GetItemDropChanceTier(double dropRate);
+    float GetAdvancedPricingMultiplier(ItemTemplate const* itemProto);
+    ItemTemplate const* GetProducedItemFromRecipe(ItemTemplate const* recipeItemTemplate);
+    std::unordered_set<uint32> GetItemIDsProducedByRecipes();
+    bool IsItemADisabledRecipeProducedClassSubclass(ItemTemplate const* itemTemplate);
+    void PopulateItemCandidatesAndProportions();
+    uint32 GetRandomItemIDForListing();
+    void AddNewAuctions(std::vector<Player*> AHBPlayers, FactionSpecificAuctionHouseConfig* config);
+    void AddNewAuctionBuyerBotBid(std::vector<Player*> AHBPlayers, FactionSpecificAuctionHouseConfig* config);
+    void PopulateVendorItemsPrices();
+    void CleanupExpiredAuctionItems();
+
+    template <typename ValueType>
+    void AddItemValuePairsToItemIDMap(std::unordered_map<uint32, ValueType>& workingValueToItemIDMap, std::string valueToItemIDMap);
+    void AddValuesToSetByKeyMap(std::map<uint32, std::unordered_set<uint32>>& workingSetByKeyMap, std::string valuesToKeyMapString,
+        uint32 wildcardLowValue, uint32 wildcardHighValue);
+};
+
+} // namespace CoaEconomy
+
+#define auctionbot CoaEconomy::AuctionHouseBot::instance()
+
+#endif

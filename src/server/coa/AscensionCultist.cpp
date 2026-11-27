@@ -4,6 +4,7 @@
 #include "CellImpl.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Random.h"
@@ -11,6 +12,8 @@
 #include "SpellAuraEffects.h"
 #include "SpellAuras.h"
 #include "SpellMgr.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -76,6 +79,19 @@ void Cast(Unit* caster, Unit* target, uint32 id)
     if (caster && target && target->IsAlive() && caster->IsInWorld())
         caster->CastSpell(target, id, true);
 }
+void OverrideSpellVisual(Unit* unit, uint32 spell, uint32 visual)
+{
+    if (!unit || !unit->IsInWorld())
+        return;
+    WorldPacket packet(0x662, 16);
+    packet << unit->GetGUID().GetRawValue() << spell << visual;
+    Map* map = unit->GetMap();
+    for (auto itr = map->GetPlayers().begin(); itr != map->GetPlayers().end(); ++itr)
+        if (Player* observer = itr->GetSource();
+            observer == unit || (observer->IsInMap(unit) &&
+                observer->IsWithinDistInMap(unit, map->GetVisibilityRange())))
+            observer->GetSession()->SendPacket(&packet);
+}
 void Copy(Unit* caster, Unit* target, uint32 id, uint32 amount)
 {
     if (caster && target && target->IsAlive() && amount)
@@ -89,11 +105,13 @@ void Mana(Player* player, uint32 amount)
 bool Chance(Player* player, uint32 id, uint32 cooldown)
 {
     SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
-    float chance = info ? float(info->ProcChance) : 0;
+    if (!player || !info || !player->HasAura(id) || State(player).timers.HasTimeUntilEvent(id))
+        return false;
+    float chance = float(info->ProcChance);
+    player->ApplySpellMod(id, SPELLMOD_CHANCE_OF_SUCCESS, chance);
     if ((id == 300313 || id == 706245) && Count(player, Insanity) > 40 && player->HasAura(707753))
         chance += Amount(707753);
-    if (!info || !player->HasAura(id) || State(player).timers.HasTimeUntilEvent(id) ||
-        !roll_chance_f(std::clamp(chance, 0.0f, 100.0f)))
+    if (!roll_chance_f(std::clamp(chance, 0.0f, 100.0f)))
         return false;
     if (cooldown)
         State(player).timers.ScheduleEvent(id, Milliseconds(cooldown));
@@ -123,6 +141,11 @@ void RestoreBlade(Player* player)
 {
     player->RestoreSpellCharge(Highest(player, 500720));
 }
+void MarkVoidTouched(Player* player, Unit* healed)
+{
+    if (player->HasAura(300286))
+        Cast(player, healed, 301982);
+}
 void SetHelper(Player* player, uint32 id, bool enabled)
 {
     if (enabled && !player->HasAura(id))
@@ -135,6 +158,47 @@ void SetAmount(Player* player, uint32 id, uint8 slot, int32 amount)
     if (AuraEffect* effect = player->GetAuraEffect(id, slot))
         if (effect->GetAmount() != amount)
             effect->ChangeAmount(amount);
+}
+namespace
+{
+constexpr uint32 EmbodimentPower = 681067;
+int32 EmbodimentTotal(std::vector<std::pair<int32, uint32>> const& grants)
+{
+    uint64 total = 0;
+    for (auto const& grant : grants)
+        total += grant.second;
+    return int32(std::min<uint64>(total, INT32_MAX));
+}
+}
+void GrantEmbodiment(Player* player, uint32 amount)
+{
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(EmbodimentPower);
+    if (!info || !amount)
+        return;
+    auto& grants = State(player).embodimentGrants;
+    if (!player->HasAura(EmbodimentPower))
+        grants.clear();
+    grants.emplace_back(info->GetMaxDuration(), amount);
+    Copy(player, player, EmbodimentPower, uint32(EmbodimentTotal(grants)));
+}
+void ExpireEmbodiment(Player* player, uint32 diff)
+{
+    auto& grants = State(player).embodimentGrants;
+    if (grants.empty())
+        return;
+    if (!player->HasAura(EmbodimentPower))
+    {
+        grants.clear();
+        return;
+    }
+    for (auto& grant : grants)
+        grant.first -= int32(diff);
+    if (!std::erase_if(grants, [](auto const& grant) { return grant.first <= 0; }))
+        return;
+    if (grants.empty())
+        player->RemoveAurasDueToSpell(EmbodimentPower);
+    else
+        SetAmount(player, EmbodimentPower, EFFECT_0, EmbodimentTotal(grants));
 }
 bool Resource(Player* player, uint32 id, int32 delta, bool force)
 {
@@ -287,7 +351,36 @@ namespace
 class cultist_player : public PlayerScript
 {
 public:
-    cultist_player() : PlayerScript("cultist_player", {PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_LOGOUT}) { }
+    cultist_player() : PlayerScript("cultist_player",
+        {PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_LOGOUT,
+         PLAYERHOOK_ON_AFTER_UPDATE_MAX_HEALTH, PLAYERHOOK_ON_AFTER_UPDATE_MAX_POWER}) { }
+    void OnPlayerAfterUpdateMaxHealth(Player* player, float& value) override
+    {
+        using namespace AscensionCultist;
+        if (Owner(player) != player)
+            return;
+        float totalPct = player->GetPctModifierValue(UNIT_MOD_HEALTH, TOTAL_PCT);
+        float intellect = player->GetStat(STAT_INTELLECT);
+        for (AuraEffect const* effect : player->GetAuraEffectsByType(SPELL_AURA_ASCENSION_MOD_MAX_MANA_FROM_STAT))
+            if ((effect->GetId() == 560080 || effect->GetId() == 561335) &&
+                effect->GetMiscValue() == POWER_HEALTH && effect->GetMiscValueB() == STAT_INTELLECT)
+                value += (intellect * 0.25f * (1.0f + effect->GetAmount() / 100.0f) -
+                    CalculatePct(intellect, effect->GetAmount())) * totalPct;
+    }
+    void OnPlayerAfterUpdateMaxPower(Player* player, Powers& power, float& value) override
+    {
+        using namespace AscensionCultist;
+        if (power != POWER_MANA || Owner(player) != player)
+            return;
+        float totalPct = player->GetPctModifierValue(UNIT_MOD_MANA, TOTAL_PCT);
+        float intellect = player->GetStat(STAT_INTELLECT);
+        float manaFromInt = player->GetCreatePowers(POWER_MANA) > 0 ? player->GetManaBonusFromIntellect() : 0.0f;
+        for (AuraEffect const* effect : player->GetAuraEffectsByType(SPELL_AURA_ASCENSION_MOD_MAX_MANA_FROM_STAT))
+            if ((effect->GetId() == 560080 || effect->GetId() == 561335) &&
+                effect->GetMiscValue() == POWER_MANA && effect->GetMiscValueB() == STAT_INTELLECT)
+                value += (CalculatePct(manaFromInt, effect->GetAmount()) -
+                    CalculatePct(intellect, effect->GetAmount())) * totalPct;
+    }
     void OnPlayerUpdate(Player* player, uint32 diff) override
     {
         using namespace AscensionCultist;
@@ -298,6 +391,7 @@ public:
         while (state.timers.ExecuteEvent()) { }
         state.scheduler.Update(diff);
         UpdateDash(player, diff);
+        ExpireEmbodiment(player, diff);
         if (!state.timers.HasTimeUntilEvent(Insanity))
         {
             state.timers.ScheduleEvent(Insanity, 500ms);

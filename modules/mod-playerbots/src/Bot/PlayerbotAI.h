@@ -7,6 +7,8 @@
 #ifndef PLAYERBOTS_PLAYERBOTAI_H
 #define PLAYERBOTS_PLAYERBOTAI_H
 
+#include "CoaAltAddon.h"
+#include "CoaBotWhy.h"
 #include "Chat.h"
 #include "ChatFilter.h"
 #include "ChatHelper.h"
@@ -398,10 +400,17 @@ public:
     void ClearStaleFall();
     void TakeSharedQuest(WorldPacket const& packet);
     void RejoinLfgDungeon();
+    void WaitForMasterRevive() { waitingForMasterRevive = true; }
+    void ResumeFollowAfterMasterRevive();
     void UpdateAIInternal(uint32 elapsed, bool minimal = false) override;
 
     std::string const HandleRemoteCommand(std::string const command);
     void HandleCommand(uint32 type, std::string const text, Player* fromPlayer);
+    // A whispered command run again later, once the bot has walked where it can carry it out.
+    void QueueCommandAt(std::string const& command, Player* owner, time_t at)
+    {
+        chatCommands.push_back(ChatCommandHolder(command, owner, CHAT_MSG_WHISPER, at));
+    }
     void QueueChatResponse(const ChatQueuedReply reply);
     void HandleBotOutgoingPacket(WorldPacket const& packet);
     void HearChat(WorldPacket const& packet);
@@ -438,6 +447,13 @@ public:
     static bool WouldBeReflected(Unit* caster, SpellInfo const* spellInfo, Unit* target);
     // AiPlayerbot.CoaGearByContent: look at the bot's gear within the next two seconds (it just queued).
     void CoaCheckGearSoon() { coaGearCheckedAt = getMSTime() - 8000; }
+    // The addon's "alt cmp|bags|sell|destroy" requests, answered in order on the bot's update (CoaAltBags::Drain).
+    std::mutex coaAltBagsLock;
+    std::vector<std::string> coaAltBagsQueue;
+    // The addon's key spells bar (CoaKeySpells): the first ranks of the spells the player keeps (the AI never
+    // casts them by itself), and true while a "cast" whisper of the player casts. The bot's own update only.
+    std::set<uint32> coaKeptSpells;
+    bool coaCastOrdered = false;
     // Last time the bot was seen in a battleground, an arena or their queue (RandomPlayerbotMgr::CoaUpdateGear).
     uint32 coaGearPvpSeenAt = 0;
     static bool IsHeal(Player* player, bool bySpec = false);
@@ -631,6 +647,8 @@ public:
     static SpellFamilyNames Class2SpellFamilyName(uint8 cls);
     NewRpgInfo rpgInfo;
     NewRpgStatistic rpgStatistic;
+    // CoA 3.2: what ".squidbots why" tells of the bot (its last move, where it stands still since when).
+    CoaBotWhy::Trace coaWhy;
     std::unordered_set<uint32> lowPriorityQuest;
     time_t bgReleaseAttemptTime = 0;
     ForceRebuffState forceRebuff;
@@ -638,8 +656,12 @@ public:
     // Schedules a callback to run once after <delayMs> milliseconds.
     void AddTimedEvent(std::function<void()> callback, uint32 delayMs);
 
+    // What the team bar of SquidBots Lite last got from this alt (CoaAltAddon::TickTeam).
+    CoaAltAddon::TeamCache coaTeamCache;
+
 private:
     time_t lfgRejoinAt = 0;
+    bool waitingForMasterRevive = false;
     static void _fillGearScoreData(Player* player, Item* item, std::vector<uint32>* gearScore, uint32& twoHandScore,
                                    bool mixed = false);
     bool IsTellAllowed(PlayerbotSecurityLevel securityLevel = PLAYERBOT_SECURITY_ALLOW_ALL);
@@ -681,6 +703,8 @@ protected:
     // giver it reacts to - and whether a greeting is being sent: what MasterWantsThis lets through
     // to a master who turned bot whispers off.
     time_t lastCommandAt = 0;
+    time_t lastMasterWakeAt = 0;
+    void OnMasterCommand(std::string const& filtered, Player* fromPlayer);
     bool greeting = false;
     bool MasterWantsThis();
     static std::set<std::string> unsecuredCommands;
@@ -692,7 +716,21 @@ protected:
     uint32 nextTransportCheck = 0;
     bool spellInterruptRequested = false;
     uint32 coaAncestralCombatCheckedAt = 0;
+    uint32 coaCursedFormCheckedAt = 0;
     uint32 coaGearCheckedAt = 0;
+    uint32 coaTeamTimer = 0;
+public:
+    // CoA World (BotOnlyBgPace, Playerbots.cpp OnPlayerAfterUpdate): a bot-only battleground or arena, last checked
+    // coaBgCheckMs ago, and the time its AI has waited.
+    bool coaBgBotOnly = false;
+    uint32 coaBgCheckMs = 0;
+    uint32 coaBgWaitMs = 0;
+    // CoA World (SlowIdleTriggers): the last AllowActive(ALL_ACTIVITY) kept the bot active for a reason of its own (real
+    // player near, group, queue, instance...), not by the rotation.
+    bool coaForcedActive = true;
+    // CoA World (AiBudgetMs, CoaWorldAiBudget): skipped its AI last tick, and the time it has waited.
+    bool coaBudgetSkipped = false;
+    uint32 coaBudgetWaitMs = 0;
 };
 
 #endif

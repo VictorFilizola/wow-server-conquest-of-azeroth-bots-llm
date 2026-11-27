@@ -14,6 +14,30 @@ enum BattleClericSpells : uint32
     SPELL_PARAGON = 680639
 };
 
+class spell_ascension_battle_cleric_paragon : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_battle_cleric_paragon);
+
+    bool Load() override
+    {
+        return GetSpellInfo()->Id == SPELL_PARAGON && GetCaster()->IsPlayer() &&
+            GetCaster()->getClass() == CLASS_SUN_CLERIC;
+    }
+
+    void ShortenCooldown()
+    {
+        Player* player = GetCaster()->ToPlayer();
+        if (!GetSpell()->HasTriggeredCastFlag(TRIGGERED_IGNORE_SPELL_AND_CATEGORY_CD) &&
+            player->HasAura(SPELL_BATTLE_CLERIC, player->GetGUID()))
+            player->ModifySpellCooldown(SPELL_PARAGON, -240000);
+    }
+
+    void Register() override
+    {
+        AfterCast += SpellCastFn(spell_ascension_battle_cleric_paragon::ShortenCooldown);
+    }
+};
+
 class aura_ascension_battle_cleric : public AuraScript
 {
     PrepareAuraScript(aura_ascension_battle_cleric);
@@ -68,14 +92,12 @@ public:
             return;
         if (info->Id == SPELL_BATTLE_CLERIC)
         {
-            SpellEffectInfo& cooldown = info->Effects[EFFECT_0];
-            cooldown.Effect = SPELL_EFFECT_APPLY_AURA;
-            cooldown.ApplyAuraName = SPELL_AURA_ADD_FLAT_MODIFIER;
-            cooldown.BasePoints = -240000;
-            cooldown.DieSides = 0;
-            cooldown.MiscValue = SPELLMOD_COOLDOWN;
-            cooldown.SpellClassMask = flag96(0, 0, 8388608);
-            cooldown.TargetA = SpellImplicitTargetInfo(TARGET_UNIT_CASTER);
+            SpellEffectInfo& marker = info->Effects[EFFECT_0];
+            marker.Effect = SPELL_EFFECT_APPLY_AURA;
+            marker.ApplyAuraName = SPELL_AURA_DUMMY;
+            marker.BasePoints = 0;
+            marker.DieSides = 0;
+            marker.TargetA = SpellImplicitTargetInfo(TARGET_UNIT_CASTER);
             info->_InitializeExplicitTargetMask();
         }
         if (info->Id == SPELL_BATTLE_CLERIC_EFFECTS)
@@ -90,5 +112,6 @@ public:
 void AddSC_AscensionSunClericBattleCleric()
 {
     new sun_cleric_battle_cleric_metadata();
-    RegisterSpellScript(aura_ascension_battle_cleric);
+    RegisterSpellAndAuraScriptPairWithArgs(spell_ascension_battle_cleric_paragon, aura_ascension_battle_cleric,
+        "aura_ascension_battle_cleric");
 }

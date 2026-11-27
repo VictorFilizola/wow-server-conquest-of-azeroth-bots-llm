@@ -21,6 +21,9 @@ struct MountData
     bool swiftMount = false;
     // Outer map: index (0 for ground, 1 for flight), inner map: effect speed -> vector of spell IDs.
     std::map<uint32, std::map<int32, std::vector<uint32>>> allSpells;
+    // Flying mounts that also carry a ground speed (SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED): the core lets them ride
+    // where nobody can fly, so they stand in for ground mounts when the bot has none. Ground speed -> spell IDs.
+    std::map<int32, std::vector<uint32>> flyersThatRun;
     // Default mount speed.
     int32 maxSpeed = 59;
 };
@@ -57,6 +60,7 @@ private:
     static bool preferredMountTableChecked;
     static std::mutex mountCacheLock;
     static void LoadPreferredMounts();
+    bool FollowsMountedMasterBelowMinLevel();
     float CalculateDismountDistance() const;
     float CalculateMountDistance() const;
     void Dismount();
@@ -69,6 +73,7 @@ private:
     bool TryForms(Player* master, int32 masterMountType, int32 masterSpeed) const;
     bool TryPreferredMount(Player* master) const;
     uint32 GetMountType(Player* master) const;
+    uint32 MountTypeFor(Player* master, MountData const& data) const;
     bool TryRandomMountFiltered(std::map<int32, std::vector<uint32>> const& spells, int32 masterSpeed) const;
 };
 

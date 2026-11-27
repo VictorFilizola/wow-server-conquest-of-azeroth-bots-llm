@@ -10,6 +10,7 @@
 #include "AddLootAction.h"
 #include "AttackAction.h"
 #include "AutoMaintenanceOnLevelupAction.h"
+#include "CoaTankAction.h"
 #include "BattleGroundJoinAction.h"
 #include "BattleGroundTactics.h"
 #include "BuyAction.h"
@@ -44,6 +45,9 @@
 #include "MoveToTravelTargetAction.h"
 #include "MovementActions.h"
 #include "NewRpgAction.h"
+#include "CoaMissionAction.h"
+#include "CoaEnchanterAction.h"
+#include "CoaGuildBankDepositAction.h"
 #include "NewRpgOutdoorPvP.h"
 #include "NonCombatActions.h"
 #include "OutfitAction.h"
@@ -94,6 +98,7 @@ public:
         creators["switch to ranged"] = &ActionContext::switch_to_ranged;
         creators["reach spell"] = &ActionContext::ReachSpell;
         creators["reach line of sight"] = &ActionContext::reach_line_of_sight;
+        creators["regain group sight"] = &ActionContext::regain_group_sight;
         creators["reach melee"] = &ActionContext::ReachMelee;
         creators["reach party member to heal"] = &ActionContext::reach_party_member_to_heal;
         creators["reach party member to resurrect"] = &ActionContext::reach_party_member_to_resurrect;
@@ -151,6 +156,7 @@ public:
         creators["open loot"] = &ActionContext::open_loot;
         creators["guard"] = &ActionContext::guard;
         creators["return to stay position"] = &ActionContext::return_to_stay_position;
+        creators["coa placement move"] = &ActionContext::coa_placement_move;
         creators["move out of enemy contact"] = &ActionContext::move_out_of_enemy_contact;
         creators["set facing"] = &ActionContext::set_facing;
         creators["set behind"] = &ActionContext::set_behind;
@@ -272,6 +278,9 @@ public:
         creators["pet attack"] = &ActionContext::pet_attack;
         creators["set pet stance"] = &ActionContext::set_pet_stance;
 
+        creators["mission update"] = &ActionContext::mission_update;
+        creators["guild bank deposit"] = &ActionContext::guild_bank_deposit;
+        creators["coa enchanter"] = &ActionContext::coa_enchanter;
         creators["new rpg status update"] = &ActionContext::new_rpg_status_update;
         creators["new rpg go grind"] = &ActionContext::new_rpg_go_grind;
         creators["new rpg go camp"] = &ActionContext::new_rpg_go_camp;
@@ -306,6 +315,7 @@ private:
     static Action* attack_duel_opponent(PlayerbotAI* botAI) { return new AttackDuelOpponentAction(botAI); }
     static Action* guard(PlayerbotAI* botAI) { return new GuardAction(botAI); }
     static Action* return_to_stay_position(PlayerbotAI* botAI) { return new ReturnToStayPositionAction(botAI); }
+    static Action* coa_placement_move(PlayerbotAI* botAI) { return new CoaPlacementMoveAction(botAI); }
     static Action* open_loot(PlayerbotAI* botAI) { return new OpenLootAction(botAI); }
     static Action* move_to_loot(PlayerbotAI* botAI) { return new MoveToLootAction(botAI); }
     static Action* _return(PlayerbotAI* botAI) { return new ReturnAction(botAI); }
@@ -315,6 +325,7 @@ private:
     static Action* switch_to_ranged(PlayerbotAI* botAI) { return new SwitchToRangedAction(botAI); }
     static Action* ReachSpell(PlayerbotAI* botAI) { return new ReachSpellAction(botAI); }
     static Action* reach_line_of_sight(PlayerbotAI* botAI) { return new ReachLineOfSightAction(botAI); }
+    static Action* regain_group_sight(PlayerbotAI* botAI) { return new RegainGroupSightAction(botAI); }
     static Action* ReachMelee(PlayerbotAI* botAI) { return new ReachMeleeAction(botAI); }
     static Action* reach_party_member_to_heal(PlayerbotAI* botAI) { return new ReachPartyMemberToHealAction(botAI); }
     static Action* reach_party_member_to_resurrect(PlayerbotAI* botAI) { return new ReachPartyMemberToResurrectAction(botAI); }
@@ -481,6 +492,9 @@ private:
     static Action* pet_attack(PlayerbotAI* ai) { return new PetAttackAction(ai); }
     static Action* set_pet_stance(PlayerbotAI* ai) { return new SetPetStanceAction(ai); }
 
+    static Action* mission_update(PlayerbotAI* ai) { return new CoaMissionUpdateAction(ai); }
+    static Action* guild_bank_deposit(PlayerbotAI* ai) { return new CoaGuildBankDepositAction(ai); }
+    static Action* coa_enchanter(PlayerbotAI* ai) { return new CoaEnchanterAction(ai); }
     static Action* new_rpg_status_update(PlayerbotAI* ai) { return new NewRpgStatusUpdateAction(ai); }
     static Action* new_rpg_go_grind(PlayerbotAI* ai) { return new NewRpgGoGrindAction(ai); }
     static Action* new_rpg_go_camp(PlayerbotAI* ai) { return new NewRpgGoCampAction(ai); }

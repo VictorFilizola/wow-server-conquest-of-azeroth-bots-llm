@@ -109,12 +109,10 @@ struct ResourceGainRule
     std::uint8_t ChancePercent = 100;
 };
 
-inline constexpr std::array<ResourceGainRule, 189> ResourceGainRules =
+inline constexpr std::array<ResourceGainRule, 190> ResourceGainRules =
 {{
     {14, 524706, 524706, 800058, 1, ResourceMutation::AuraStacks,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
-    {14, 805240, 805240, 800058, 1, ResourceMutation::AuraStacks,
-        ResourceGainEvent::EachSuccessfulDamagingHit},
     {14, 704368, 704368, 800058, 1, ResourceMutation::AuraStacks,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {14, 706415, 706420, 800058, 1, ResourceMutation::AuraStacks,
@@ -124,12 +122,9 @@ inline constexpr std::array<ResourceGainRule, 189> ResourceGainRules =
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {14, 803484, 803487, 800058, 1, ResourceMutation::AuraStacks,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
-    {14, 563268, 563268, 800058, 1, ResourceMutation::AuraStacks,
-        ResourceGainEvent::FirstSuccessfulHostileTarget},
-    {14, 800210, 800210, 800058, 1, ResourceMutation::AuraStacks,
-        ResourceGainEvent::FirstSuccessfulHostileTarget},
-    {14, 802405, 802409, 800058, 1, ResourceMutation::AuraStacks,
-        ResourceGainEvent::FirstSuccessfulHostileTarget},
+    {14, 563268, 563268, 800058, 1, ResourceMutation::AuraStacks},
+    {14, 800210, 800210, 800058, 1, ResourceMutation::AuraStacks},
+    {14, 802405, 802409, 800058, 1, ResourceMutation::AuraStacks},
     {14, 560759, 560762, 800058, 2, ResourceMutation::AuraStacks,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {14, 572803, 572804, 800058, 2, ResourceMutation::AuraStacks,
@@ -379,6 +374,10 @@ inline constexpr std::array<ResourceGainRule, 189> ResourceGainRules =
         ResourceGainEvent::FirstSuccessfulDamagingHit},
     {30, 505326, 505326, 355461, 1, ResourceMutation::TriggerSpell,
         ResourceGainEvent::FirstSuccessfulDamagingHit},
+    {30, 500523, 500523, 805077, 1, ResourceMutation::AuraStacks,
+        ResourceGainEvent::FirstSuccessfulDamagingHit},
+    {30, 500523, 500523, 359019, 1, ResourceMutation::TriggerSpell,
+        ResourceGainEvent::EachSuccessfulDamagingHit},
     {30, 801328, 801328, 355461, 1, ResourceMutation::TriggerSpell,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {30, 803834, 803839, 355461, 1, ResourceMutation::TriggerSpell,
@@ -469,7 +468,7 @@ struct NativePowerGainRule
     std::uint32_t AmountSpellId = 0;
 };
 
-inline constexpr std::array<NativePowerGainRule, 16> NativePowerGainRules =
+inline constexpr std::array<NativePowerGainRule, 18> NativePowerGainRules =
 {{
     {19, 0, 0, 3, 10, ResourceGainEvent::PeriodicDamageTick, 301253},
     {23, 704355, 704355, 6, 200,
@@ -489,6 +488,10 @@ inline constexpr std::array<NativePowerGainRule, 16> NativePowerGainRules =
     {30, 502668, 502671, 6, 150,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {30, 567531, 567532, 6, 150,
+        ResourceGainEvent::FirstSuccessfulHostileTarget},
+    {30, 805717, 805717, 6, 150,
+        ResourceGainEvent::FirstSuccessfulHostileTarget},
+    {30, 806840, 806845, 6, 150,
         ResourceGainEvent::FirstSuccessfulHostileTarget},
     {30, 801624, 801624, 6, 200,
         ResourceGainEvent::FirstSuccessfulHostileTarget, 0, 0, 359504},
@@ -512,7 +515,7 @@ struct ResourceCostRule
     std::uint8_t PreserveCostChancePercent = 0;
 };
 
-inline constexpr std::array<ResourceCostRule, 71> ResourceCostRules =
+inline constexpr std::array<ResourceCostRule, 75> ResourceCostRules =
 {{
     {14, 801904, 801904, 800058, 2, ResourceConsumption::Fixed,
         705137, 30},
@@ -592,7 +595,11 @@ inline constexpr std::array<ResourceCostRule, 71> ResourceCostRules =
     {22, 804438, 804438, 804455, 1, ResourceConsumption::All},
     {22, 806203, 806203, 804455, 1, ResourceConsumption::All},
     {22, 572417, 572417, 804455, 1, ResourceConsumption::All},
-    {22, 804503, 804503, 804455, 1, ResourceConsumption::All}
+    {22, 804503, 804503, 804455, 1, ResourceConsumption::All},
+    {22, 807950, 807950, 804455, 1, ResourceConsumption::All},
+    {22, 807951, 807951, 804455, 1, ResourceConsumption::All},
+    {22, 807952, 807952, 804455, 1, ResourceConsumption::All},
+    {22, 807953, 807953, 804455, 1, ResourceConsumption::All}
 }};
 }
 

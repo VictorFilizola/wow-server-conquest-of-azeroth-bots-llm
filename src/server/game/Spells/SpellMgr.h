@@ -509,6 +509,16 @@ public:
         return damage;
     }
 
+    /// the same pet auras for a Warcraft Reborn twin: each aura replaced by its own twin
+    template <typename Resolve>
+    [[nodiscard]] PetAura ForTwin(Resolve&& resolve) const
+    {
+        PetAura copy = *this;
+        for (auto& [petEntry, aura] : copy.auras)
+            aura = resolve(aura);
+        return copy;
+    }
+
 private:
     PetAuraMap auras;
     bool removeOnChangePet{false};
@@ -629,7 +639,8 @@ bool IsPrimaryProfessionSkill(uint32 skill);
 
 inline bool IsProfessionSkill(uint32 skill)
 {
-    return  IsPrimaryProfessionSkill(skill) || skill == SKILL_FISHING || skill == SKILL_COOKING || skill == SKILL_FIRST_AID;
+    return  IsPrimaryProfessionSkill(skill) || skill == SKILL_FISHING || skill == SKILL_COOKING || skill == SKILL_FIRST_AID
+        || skill == SKILL_WOODCUTTING || skill == SKILL_WOODWORKING;
 }
 
 inline bool IsProfessionOrRidingSkill(uint32 skill)
@@ -681,6 +692,19 @@ inline uint16 GetMaxProfessionSkillStep(uint8 expansion)
     return 4 + expansion;
 }
 
+inline uint8 GetProfessionExpansion(uint32 skill)
+{
+    switch (skill)
+    {
+        case SKILL_JEWELCRAFTING:
+            return EXPANSION_THE_BURNING_CRUSADE;
+        case SKILL_INSCRIPTION:
+            return EXPANSION_WRATH_OF_THE_LICH_KING;
+        default:
+            return EXPANSION_CLASSIC;
+    }
+}
+
 bool IsPartOfSkillLine(uint32 skillId, uint32 spellId);
 
 // spell diminishing returns
@@ -726,6 +750,9 @@ public:
     [[nodiscard]] uint8 GetSpellRank(uint32 spell_id) const;
     // not strict check returns provided spell if rank not avalible
     [[nodiscard]] uint32 GetSpellWithRank(uint32 spell_id, uint32 rank, bool strict = false) const;
+    /// The spell of relatedSpellId's rank in the chain of stockFirstRank, or of its twin when relatedSpellId is a twin:
+    /// twin chains keep their own rank numbers, which can differ from the stock chain's
+    [[nodiscard]] uint32 GetSpellWithRankFor(uint32 stockFirstRank, uint32 relatedSpellId, bool strict = false) const;
 
     // Spell Required table
     [[nodiscard]] Acore::IteratorPair<SpellRequiredMap::const_iterator>GetSpellsRequiredForSpellBounds(uint32 spell_id) const;
@@ -832,6 +859,7 @@ public:
     void UnloadSpellInfoChains();
     void LoadSpellTalentRanks();
     void LoadSpellRanks();
+    [[nodiscard]] std::vector<std::vector<uint32>> LoadClientSpellRankChains() const;
     /// rank chains a module adds after `spell_ranks`; a chain touching an already ranked spell is skipped
     using AddedSpellRanks = std::vector<std::vector<uint32>> (*)();
     void SetAddedSpellRanks(AddedSpellRanks ranks) { _addedSpellRanks = ranks; }
@@ -851,6 +879,11 @@ public:
     [[nodiscard]] uint32 GetSpellTwinSource(uint32 spellId) const;
     /// the twin or namesake of a stock spell that belongs with a related spell's own twin, or the stock spell
     [[nodiscard]] uint32 GetSpellTwinFor(uint32 stockSpellId, uint32 relatedSpellId) const;
+    /// the twin whose script is running on this thread (a stock script bound to it through its stock spell), or 0
+    static void PushScriptTwin(uint32 spellId, uint32 triggeringSpellId = 0);
+    static void PopScriptTwin(uint32 spellId);
+    [[nodiscard]] static uint32 GetRunningScriptTwin();
+    [[nodiscard]] static uint32 GetScriptTwinOf(uint32 spellId);
     void LoadSpellRequired();
     void LoadSpellLearnSkills();
     void LoadSpellTargetPositions();

@@ -184,12 +184,28 @@ void BuffArmy(Player* player, uint32 spell, bool owner)
     for (Creature* unit : Minions(player))
         Cast(player, unit, spell);
 }
+void Evict(Player* player, int32 needed)
+{
+    auto& minions = State(player).minions;
+    while (int32(Capacity(player)) - Used(player) < needed)
+    {
+        auto oldest = std::find_if(minions.begin(), minions.end(),
+                                   [](MinionRecord const& row) { return row.cost != 0; });
+        if (oldest == minions.end())
+            return;
+        ObjectGuid guid = oldest->guid;
+        minions.erase(oldest);
+        if (Creature* unit = player->FindMap() ? ObjectAccessor::GetCreature(*player, guid) : nullptr)
+            unit->DespawnOrUnsummon();
+    }
+}
 void Sync(Player* player)
 {
     if (!player || !player->IsInWorld() || !player->IsAlive() || State(player).syncing)
         return;
     auto& state = State(player);
     state.syncing = true;
+    Evict(player, 0);
     uint8 capacity = Capacity(player);
     int32 free = std::max(0, int32(capacity) - Used(player));
     if (Aura* total = player->GetAura(805011) ? player->GetAura(805011) : player->AddAura(805011, player))
@@ -226,6 +242,20 @@ bool Chance(Player* player, uint32 talent, float multiplier, uint32 cooldown)
 {
     SpellInfo const* info = sSpellMgr->GetSpellInfo(talent);
     if (!info || !player->HasAura(talent) || State(player).cooldowns.HasTimeUntilEvent(talent))
+        return false;
+    float chance = info->ProcChance * multiplier;
+    player->ApplySpellMod(talent, SPELLMOD_CHANCE_OF_SUCCESS, chance);
+    if (!roll_chance_f(std::clamp(chance, 0.0f, 100.0f)))
+        return false;
+    if (cooldown)
+        State(player).cooldowns.ScheduleEvent(talent, Milliseconds(cooldown));
+    return true;
+}
+bool MinionChance(Player* player, Unit* holder, uint32 talent, float multiplier, uint32 cooldown)
+{
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(talent);
+    if (!info || !holder || !holder->HasAura(talent, player->GetGUID()) ||
+        State(player).cooldowns.HasTimeUntilEvent(talent))
         return false;
     float chance = info->ProcChance * multiplier;
     player->ApplySpellMod(talent, SPELLMOD_CHANCE_OF_SUCCESS, chance);
@@ -321,6 +351,12 @@ void Spread(Player* player, Unit* source, bool refresh, bool allDiseases, uint32
 namespace
 {
 using namespace AscensionNecromancer;
+void Reward(Player* player, Unit* killed)
+{
+    if (player && Owner(player) == player && killed && killed->GetCharmerOrOwnerPlayerOrPlayerItself() != player &&
+        player->isHonorOrXPTarget(killed) && player->HasAura(707562))
+        Cast(player, player, 712434);
+}
 class necromancer_sessions : public PlayerScript
 {
   public:
@@ -337,12 +373,6 @@ class necromancer_sessions : public PlayerScript
     void OnPlayerLogout(Player* player) override
     {
         Forget(player);
-    }
-    void Reward(Player* player, Unit* killed)
-    {
-        if (player && Owner(player) == player && killed && killed->GetCharmerOrOwnerPlayerOrPlayerItself() != player &&
-            player->isHonorOrXPTarget(killed) && player->HasAura(707562))
-            Cast(player, player, 712434);
     }
     void OnPlayerPVPKill(Player* player, Player* killed) override
     {
@@ -364,8 +394,10 @@ class necromancer_lifecycle : public UnitScript
         : UnitScript("necromancer_lifecycle", true, {UNITHOOK_ON_UNIT_UPDATE, UNITHOOK_ON_UNIT_DEATH})
     {
     }
-    void OnUnitDeath(Unit* unit, Unit*) override
+    void OnUnitDeath(Unit* unit, Unit* killer) override
     {
+        if (killer && !killer->IsPlayer() && !killer->IsPet() && !killer->IsTotem())
+            Reward(Owner(killer), unit);
         Player* player = Owner(unit);
         if (player == unit)
             Prune(player, true);
@@ -391,7 +423,7 @@ class necromancer_lifecycle : public UnitScript
             {
                 Sync(player);
                 for (uint32 id : {572638, 706472, 531126, 560012, 500982, 500985, 301207})
-                    if (Aura* aura = player->GetAura(id))
+                    if (Aura* aura = player->GetOwnedAura(id))
                         aura->RecalculateAmountOfEffects();
                 state.events.ScheduleEvent(1, 500ms);
             }

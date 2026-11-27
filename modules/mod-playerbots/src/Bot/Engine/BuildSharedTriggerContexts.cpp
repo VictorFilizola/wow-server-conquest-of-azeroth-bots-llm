@@ -5,7 +5,11 @@
  */
 
 #include "AiObjectContext.h"
+#include "CoaCombatContext.h"
+#include "STContexts.h"
+#include "CoaGardesContext.h"
 #include "Aq20TriggerContext.h"
+#include "Aq40TriggerContext.h"
 #include "BTTriggerContext.h"
 #include "BWLTriggerContext.h"
 #include "ChatTriggerContext.h"
@@ -21,6 +25,7 @@
 #include "OnyTriggerContext.h"
 #include "RSTriggerContext.h"
 #include "SSCTriggerContext.h"
+#include "SunwellTriggerContext.h"
 #include "TKTriggerContext.h"
 #include "TbcDungeonTriggerContext.h"
 #include "VanillaDungeonTriggerContext.h"
@@ -30,6 +35,7 @@
 #include "WorldPacketTriggerContext.h"
 #include "WotlkDungeonTriggerContext.h"
 #include "ZATriggerContext.h"
+#include "ZGTriggerContext.h"
 #include "CoaGenericContext.h"
 
 void AiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList<Trigger>& triggerContexts)
@@ -38,8 +44,10 @@ void AiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList<Tr
     triggerContexts.Add(new ChatTriggerContext());
     triggerContexts.Add(new WorldPacketTriggerContext());
     triggerContexts.Add(new RaidAq20TriggerContext());
+    triggerContexts.Add(new RaidAq40TriggerContext());
     triggerContexts.Add(new RaidMcTriggerContext());
     triggerContexts.Add(new RaidBwlTriggerContext());
+    triggerContexts.Add(new RaidZulGurubTriggerContext());
     triggerContexts.Add(new RaidKarazhanTriggerContext());
     triggerContexts.Add(new RaidGruulsLairTriggerContext());
     triggerContexts.Add(new RaidMagtheridonTriggerContext());
@@ -49,6 +57,7 @@ void AiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList<Tr
     triggerContexts.Add(new RaidHyjalSummitTriggerContext());
     triggerContexts.Add(new RaidBlackTempleTriggerContext());
     triggerContexts.Add(new RaidZulAmanTriggerContext());
+    triggerContexts.Add(new RaidSunwellPlateauTriggerContext());
     triggerContexts.Add(new RaidOsTriggerContext());
     triggerContexts.Add(new RaidEoETriggerContext());
     triggerContexts.Add(new RaidVoATriggerContext());
@@ -59,6 +68,20 @@ void AiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList<Tr
     triggerContexts.Add(new VanillaDungeonRFCTriggerContext());
     triggerContexts.Add(new VanillaDungeonSFKTriggerContext());
     triggerContexts.Add(new VanillaDungeonSMTriggerContext());
+    triggerContexts.Add(new VanillaDungeonBFDTriggerContext());
+    triggerContexts.Add(new VanillaDungeonUldaTriggerContext());
+    triggerContexts.Add(new VanillaDungeonWCTriggerContext());
+    triggerContexts.Add(new VanillaDungeonRFKTriggerContext());
+    triggerContexts.Add(new VanillaDungeonRFDTriggerContext());
+    triggerContexts.Add(new VanillaDungeonBRSTriggerContext());
+    triggerContexts.Add(new VanillaDungeonBRDTriggerContext());
+    triggerContexts.Add(new VanillaDungeonSTTriggerContext());
+    triggerContexts.Add(new VanillaDungeonScholoTriggerContext());
+    triggerContexts.Add(new VanillaDungeonStratTriggerContext());
+    triggerContexts.Add(new VanillaDungeonMaraTriggerContext());
+    triggerContexts.Add(new CoaDungeonOtherSideTriggerContext());
+    triggerContexts.Add(new CoaDungeonVaultsTriggerContext());
+    triggerContexts.Add(new VanillaDungeonDMTriggerContext());
     triggerContexts.Add(new TbcDungeonAuchenaiCryptsTriggerContext());
     triggerContexts.Add(new TbcDungeonSethekkHallsTriggerContext());
     triggerContexts.Add(new TbcDungeonMechanarTriggerContext());
@@ -83,4 +106,7 @@ void AiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList<Tr
     // CoA: generische, parametrisierbare Bausteine (GenericTrigger)
     // machen Kampfverhalten zu Daten - siehe Ai/Coa/CoaGenericContext.h
     triggerContexts.Add(new CoaGenericTriggerContext());
+    triggerContexts.Add(new CoaGardesTriggerContext());
+    // CoA Combat
+    triggerContexts.Add(new CoaCombatTriggerContext());
 }

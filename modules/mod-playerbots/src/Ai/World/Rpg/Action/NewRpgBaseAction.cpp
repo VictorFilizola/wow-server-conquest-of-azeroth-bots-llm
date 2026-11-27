@@ -5,6 +5,16 @@
  */
 
 #include "CoaQuestMenu.h"
+#include "CoaSoul.h"
+
+#include "CoaWorldBots.h"  // CoA World: CoaWorldQuestQuarantined, CoaWorldAreaTooHigh
+#include "CoaRpgTrade.h"
+#include "CoaBotAuctions.h"
+#include "CoaCityLife.h"
+#include "CoaSafeMove.h"
+#include "CoaPathProbe.h"
+#include "CoaSafeMoveRules.h"
+#include "CoaQuestLogRules.h"
 #include "NewRpgBaseAction.h"
 #include "BroadcastHelper.h"
 #include "ChatHelper.h"
@@ -40,8 +50,16 @@
 #include "Timer.h"
 #include "TravelMgr.h"
 #include "G3D/Vector2.h"
+#include "CoaRealPlayerSight.h"
 #include <atomic>
 #include <ctime>
+
+QuestStatusData const* NewRpgBaseAction::GetQuestStatusData(uint32 questId) const
+{
+    QuestStatusMap const& statusMap = bot->getQuestStatusMap();
+    auto const itr = statusMap.find(questId);
+    return itr != statusMap.end() ? &itr->second : nullptr;
+}
 
 bool NewRpgBaseAction::MoveFarTo(WorldPosition dest)
 {
@@ -59,6 +77,21 @@ bool NewRpgBaseAction::MoveFarTo(WorldPosition dest)
     {
         // clear stuck information if it's a new dest
         botAI->rpgInfo.SetMoveFarTo(dest);
+    }
+    // CoA 3.2.2: the time the bot spent fighting (or doing anything but this walk) does not count as time stuck:
+    // after a long fight on the way, it teleported to its target at once. A gap of more than MOVE_FAR_GAP_MS between
+    // two calls moves the progress mark forward by that gap.
+    {
+        constexpr uint32 MOVE_FAR_GAP_MS = 5000;
+        uint32 const now = getMSTime();
+        uint32& last = botAI->rpgInfo.moveFarLastMs;
+        if (last && botAI->rpgInfo.stuckTs)
+        {
+            uint32 const gap = getMSTimeDiff(last, now);
+            if (gap > MOVE_FAR_GAP_MS)
+                botAI->rpgInfo.stuckTs += gap;
+        }
+        last = now;
     }
 
     // performance optimization
@@ -112,6 +145,21 @@ bool NewRpgBaseAction::MoveFarTo(WorldPosition dest)
         // No meaningful progress toward dest for `stuckTime`: fall
         // back to teleporting directly so the bot can get on with
         // its RPG objective instead of oscillating indefinitely.
+        if (sPlayerbotAIConfig.teleportOnlyOutOfSight && CoaRealPlayerSight::SeenByRealPlayer(bot))
+        {
+            // Seen: wait without walking, still counted as stuck, so it teleports the moment nobody watches. Seen
+            // for 2 more minutes: give the target up. The progress mark is reset too, so a target picked again
+            // starts a fresh 90 s count instead of a give-up at once.
+            if (GetMSTimeDiffToNow(botAI->rpgInfo.stuckTs) < stuckTime + 2 * MINUTE * IN_MILLISECONDS)
+                return true;
+            LOG_DEBUG("playerbots.coa", "[New RPG] {} gives up a target it cannot reach while a player watches",
+                      bot->GetName());
+            botAI->rpgInfo.nearestMoveFarDis = FLT_MAX;
+            botAI->rpgInfo.stuckTs = getMSTime();
+            botAI->rpgInfo.stuckAttempts = 0;
+            botAI->rpgInfo.ChangeToIdle();
+            return false;
+        }
         botAI->rpgInfo.stuckTs = getMSTime();
         botAI->rpgInfo.stuckAttempts = 0;
         AreaTableEntry const* entry = sAreaTableStore.LookupEntry(bot->GetZoneId());
@@ -208,6 +256,20 @@ bool NewRpgBaseAction::MoveFarTo(WorldPosition dest)
     return false;
 }
 
+namespace
+{
+// CoA 3.2.3: a player (a real session) shares the bot's group.
+bool InGroupWithRealPlayer(Player* bot)
+{
+    if (Group* group = bot->GetGroup())
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            if (Player* member = ref->GetSource())
+                if (member != bot && member->GetSession() && !member->GetSession()->IsBot())
+                    return true;
+    return false;
+}
+}  // namespace
+
 bool NewRpgBaseAction::MoveWorldObjectTo(ObjectGuid guid, float distance)
 {
     if (IsWaitingForLastMove(MovementPriority::MOVEMENT_NORMAL))
@@ -231,14 +293,58 @@ bool NewRpgBaseAction::MoveWorldObjectTo(ObjectGuid guid, float distance)
                 (M_PI * irand(-25, 25) / 100.0);  // 45 degrees infront of target (leading it's movement)
 
     float rnd = rand_norm();
-    x += cos(angle) * distance * rnd;
-    y += sin(angle) * distance * rnd;
+    if (sPlayerbotAIConfig.standOffObjects)
+    {
+        // Stop at talking distance instead of anywhere up to it: 0 yards walked bots into the NPC.
+        float const reach = bot->GetCombatReach() + (object->ToUnit() ? object->ToUnit()->GetCombatReach() : 0.0f);
+        rnd = distance > 0.0f ? std::max(0.5f + 0.5f * rnd, std::min(1.0f, reach / distance)) : rnd;
+    }
+    float stop = distance * rnd;
+    // CoA 3.2.3 (AiPlayerbot.CoaLive.NpcStopAside): by a still NPC or object, off its axis, not on its face
+    // (CoaSafeMove::AsideOffset, AsideDistance), when that stop is on walkable ground (CoaSafeMove::AsideStopOk: the
+    // server's floor, not in a booth, no avoided spot, a path to it, in the NPC's sight); else as before.
+    // Never in a dungeon, a raid, a battleground or an arena, in a player's group nor in a fight: there nothing
+    // changes from 3.2.2.
+    if (sPlayerbotAIConfig.standOffObjects && CoaPathProbe::NpcStopAside() &&
+        (!object->ToUnit() || !object->ToUnit()->isMoving()) && !bot->GetMap()->Instanceable() &&
+        !bot->IsInCombat() && !botAI->HasGameClientMaster() && !InGroupWithRealPlayer(bot))
+    {
+        // A square of the city first: its slot, not the anchor NPC (as below).
+        float qx = x, qy = y, qz = z;
+        if (CoaCityLife::SquareSpot(botAI, guid, qx, qy, qz))
+            return MoveTo(mapId, qx, qy, qz, false, false, false, true);
+        Creature const* creature = object->ToCreature();
+        float const facing = creature ? creature->GetHomePosition().GetOrientation() : object->GetOrientation();
+        float const offset = CoaSafeMove::AsideOffset(bot->GetGUID().GetCounter());
+        float const asideStop = CoaSafeMove::AsideDistance(object->ToUnit() ? object->ToUnit()->GetCombatReach() : 0.0f,
+                                                           bot->GetObjectSize(), offset, distance);
+        float ax = x + cos(facing + offset) * asideStop;
+        float ay = y + sin(facing + offset) * asideStop;
+        float az = z;
+        if (CoaSafeMove::AsideStopOk(bot, object, ax, ay, az))
+            return MoveTo(mapId, ax, ay, az, false, false, false, true);
+    }
+    x += cos(angle) * stop;
+    y += sin(angle) * stop;
     if (!object->GetMap()->CheckCollisionAndGetValidCoords(object, object->GetPositionX(), object->GetPositionY(),
                                                            object->GetPositionZ(), x, y, z))
     {
         x = object->GetPositionX();
         y = object->GetPositionY();
         z = object->GetPositionZ();
+    }
+    // CoA (3.2.2): a square of the city: its slot, not the anchor NPC.
+    if (CoaCityLife::SquareSpot(botAI, guid, x, y, z))
+        return MoveTo(mapId, x, y, z, false, false, false, true);
+    // CoA (3.2): in a capital, the city guard refuses a stop off the navmesh (a banker or an auctioneer behind its
+    // counter) and the NPC was given up while the bot stood still: the walkable point nearest the NPC is taken.
+    if (sRandomPlayerbotMgr.IsRandomBot(bot) && !botAI->HasGameClientMaster() && !bot->IsInCombat())
+    {
+        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId());
+        // 3.2.2: no stop found, the raw point by the NPC is not taken when it lies in a booth (InNpcBooth).
+        if (zone && (zone->flags & AREA_FLAG_CAPITAL) && !CoaSafeMove::StandByNpc(bot, object, x, y, z) &&
+            CoaSafeMove::InNpcBooth(bot, x, y, z))
+            return false;
     }
     return MoveTo(mapId, x, y, z, false, false, false, true);
 }
@@ -252,12 +358,11 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
     const float x = bot->GetPositionX();
     const float y = bot->GetPositionY();
     const float z = bot->GetPositionZ();
-    // Previously: attempts = 1. A single random sample often landed in
-    // water / blocked geometry / unreachable poly, the function returned
-    // false, and the caller had no fallback — bot stood still. Retry a
-    // handful of times with a fresh distance each loop so a bad roll
-    // doesn't lock the bot in place.
-    for (int attempt = 0; attempt < 8; ++attempt)
+    AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId());
+    bool const inCapital = zone && (zone->flags & AREA_FLAG_CAPITAL);
+    // A few fresh samples so a bad roll (water, blocked poly) does not freeze the bot.
+    // Each one is a full path query; the caller retries next tick.
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
         float distance = (0.4f + rand_norm() * 0.6f) * moveStep;
         float angle = (float)rand_norm() * 2 * static_cast<float>(M_PI);
@@ -274,10 +379,28 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
         if (!canReach)
             continue;
 
+        // CoA 3.2.2 (the user: a bot in the Stormwind inn's floor after a step aimed at 97.9, the server's floor at
+        // 96.1): in a capital, the step's end where the navmesh's floor and the server's agree (CityFloorAgrees).
+        if (inCapital)
+        {
+            G3D::Vector3 const& end = path.GetEndPosition();
+            float const ground = map->GetHeight(bot->GetPhaseMask(), end.x, end.y, end.z + 0.5f);
+            if (ground <= INVALID_HEIGHT || !CoaSafeMove::CityFloorAgrees(end.z, ground))
+                continue;
+        }
+
         if (!map->CanReachPositionAndGetValidCoords(bot, dx, dy, dz))
             continue;
 
         if (map->IsInWater(bot->GetPhaseMask(), dx, dy, dz, bot->GetCollisionHeight()))
+            continue;
+
+        // CoA 3.2.2 (Pilote, bench of 96b4114c: a bot behind Ironforge's bankers): in a capital, no random step ends
+        // in a banker's or an auctioneer's booth.
+        if (inCapital && CoaSafeMove::InNpcBooth(bot, dx, dy, dz))
+            continue;
+        // 3.2.2 (the user's eye): nor on a spot the players see otherwise (a pole, a planter, a platform).
+        if (CoaSafeMove::Avoided(bot->GetMapId(), dx, dy, dz))
             continue;
 
         bool moved = MoveTo(bot->GetMapId(), dx, dy, dz, false, false, false, true, priority);
@@ -312,7 +435,7 @@ bool NewRpgBaseAction::InteractWithNpcOrGameObjectForQuest(ObjectGuid guid)
     //     bot->GetSession()->HandleGossipHelloOpcode(packet);
     // }
 
-    if (!CoaQuestMenuFits(guid))
+    if (!CoaQuestMenuFits(bot, guid))
         return true;
     bot->PrepareQuestMenu(guid);
     QuestMenu const& menu = bot->PlayerTalkClass->GetQuestMenu();
@@ -613,21 +736,18 @@ bool NewRpgBaseAction::OrganizeQuestLog()
     if (Player* master = botAI->GetMaster(); master && !GET_PLAYERBOT_AI(master))
         return false;
 
-    int32 freeSlotNum = 0;
-
+    uint32 freeSlotNum = 0;
     for (uint16 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
-    {
-        uint32 questId = bot->GetQuestSlotQuestId(i);
-        if (!questId)
+        if (!bot->GetQuestSlotQuestId(i))
             freeSlotNum++;
-    }
 
     // it's ok if we have two more free slots
     if (freeSlotNum >= 2)
         return false;
 
-    int32 dropped = 0;
-    // remove quests that not worth doing or not capable of doing
+    // Score every logged quest and drop only the worst few (no zone pass, no wipe of the whole log).
+    std::vector<CoaQuestLogEntry> entries;
+    entries.reserve(MAX_QUEST_LOG_SIZE);
     for (uint16 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
     {
         uint32 questId = bot->GetQuestSlotQuestId(i);
@@ -635,85 +755,70 @@ bool NewRpgBaseAction::OrganizeQuestLog()
             continue;
 
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        if (!IsQuestWorthDoing(quest) || !IsQuestCapableDoing(quest) ||
-            bot->GetQuestStatus(questId) == QUEST_STATUS_FAILED)
+        QuestStatus const status = bot->GetQuestStatus(questId);
+        CoaQuestKeepInfo info;
+        info.templateMissing = !quest;
+        info.failed = status == QUEST_STATUS_FAILED;
+        info.complete = status == QUEST_STATUS_COMPLETE;
+        if (quest)
         {
-            LOG_DEBUG("playerbots", "[New RPG] {} drop quest {}", bot->GetName(), questId);
-            WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST);
-            packet << (uint8)i;
-            WorldPackets::Quest::QuestLogRemoveQuest removeQuest(std::move(packet));
-            removeQuest.Read();
-            bot->GetSession()->HandleQuestLogRemoveQuest(removeQuest);
-            if (botAI->GetMaster())
-                botAI->TellMasterNoFacing(PlayerbotTextMgr::instance().GetBotTextOrDefault(
-                    "new_rpg_quest_dropped",
-                    "Quest dropped %quest",
-                    {{"%quest", ChatHelper::FormatQuest(quest)}}));
-            botAI->rpgStatistic.questDropped++;
-            botAI->lowPriorityQuest.insert(questId);
-            dropped++;
+            info.worthDoing = IsQuestWorthDoing(quest);
+            info.capableDoing = IsQuestCapableDoing(quest);
+            if (QuestStatusData const* statusData = GetQuestStatusData(questId))
+            {
+                uint32 required = 0;
+                uint32 done = 0;
+                for (uint8 j = 0; j < QUEST_OBJECTIVES_COUNT; ++j)
+                    if (uint32 const need = quest->RequiredNpcOrGoCount[j])
+                    {
+                        required += need;
+                        done += std::min<uint32>(statusData->CreatureOrGOCount[j], need);
+                    }
+                for (uint8 j = 0; j < QUEST_ITEM_OBJECTIVES_COUNT; ++j)
+                    if (uint32 const need = quest->RequiredItemCount[j])
+                    {
+                        required += need;
+                        done += std::min<uint32>(statusData->ItemCount[j], need);
+                    }
+                if (required)
+                    info.progress = static_cast<float>(done) / static_cast<float>(required);
+            }
+            int32 const zoneOrSort = quest->GetZoneOrSort();
+            info.inBotZone = zoneOrSort > 0 && static_cast<uint32>(zoneOrSort) == bot->GetZoneId();
+            info.sortBucket = zoneOrSort < 0;
+            info.hasPoi = sObjectMgr->GetQuestPOIVector(questId) != nullptr;
+            info.levelGap = static_cast<int32>(bot->GetLevel()) - static_cast<int32>(bot->GetQuestLevel(quest));
         }
+        info.lowPriority = botAI->lowPriorityQuest.find(questId) != botAI->lowPriorityQuest.end();
+        entries.push_back({i, CoaQuestKeepScore(info), info.complete});
     }
 
-    // drop more than 8 quests at once to avoid repeated accept and drop
-    if (dropped >= 8)
-        return true;
-
-    // remove festival/class quests and quests in different zone
-    for (uint16 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
+    bool dropped = false;
+    // Clearing a slot does not compact the log, so the slots stay valid while dropping.
+    for (uint16 const slot : CoaQuestSlotsToDrop(entries, sPlayerbotAIConfig.questMaxDropsPerPass))
     {
-        uint32 questId = bot->GetQuestSlotQuestId(i);
-        if (!questId)
-            continue;
-
-        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        const int64_t botZoneId = this->bot->GetZoneId();
-
-        if (quest->GetZoneOrSort() < 0 || (quest->GetZoneOrSort() > 0 && quest->GetZoneOrSort() != botZoneId))
-        {
-            LOG_DEBUG("playerbots", "[New RPG] {} drop quest {}", bot->GetName(), questId);
-            WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST);
-            packet << (uint8)i;
-            WorldPackets::Quest::QuestLogRemoveQuest removeQuest(std::move(packet));
-            removeQuest.Read();
-            bot->GetSession()->HandleQuestLogRemoveQuest(removeQuest);
-            if (botAI->GetMaster())
-                botAI->TellMasterNoFacing(PlayerbotTextMgr::instance().GetBotTextOrDefault(
-                    "new_rpg_quest_dropped",
-                    "Quest dropped %quest",
-                    {{"%quest", ChatHelper::FormatQuest(quest)}}));
-            botAI->rpgStatistic.questDropped++;
-            botAI->lowPriorityQuest.insert(questId);
-            dropped++;
-        }
-    }
-
-    if (dropped >= 8)
-        return true;
-
-    // clear quests log
-    for (uint16 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
-    {
-        uint32 questId = bot->GetQuestSlotQuestId(i);
+        uint32 const questId = bot->GetQuestSlotQuestId(slot);
         if (!questId)
             continue;
 
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
         LOG_DEBUG("playerbots", "[New RPG] {} drop quest {}", bot->GetName(), questId);
         WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST);
-        packet << (uint8)i;
+        packet << (uint8)slot;
         WorldPackets::Quest::QuestLogRemoveQuest removeQuest(std::move(packet));
         removeQuest.Read();
         bot->GetSession()->HandleQuestLogRemoveQuest(removeQuest);
-        if (botAI->GetMaster())
+        if (quest && botAI->GetMaster())
             botAI->TellMasterNoFacing(PlayerbotTextMgr::instance().GetBotTextOrDefault(
                 "new_rpg_quest_dropped",
                 "Quest dropped %quest",
                 {{"%quest", ChatHelper::FormatQuest(quest)}}));
         botAI->rpgStatistic.questDropped++;
+        botAI->lowPriorityQuest.insert(questId);
+        dropped = true;
     }
 
-    return true;
+    return dropped;
 }
 
 bool NewRpgBaseAction::SearchQuestGiverAndAcceptOrReward()
@@ -722,6 +827,9 @@ bool NewRpgBaseAction::SearchQuestGiverAndAcceptOrReward()
     if (ObjectGuid npcOrGo = ChooseNpcOrGameObjectToInteract(true, 80.0f))
     {
         WorldObject* object = ObjectAccessor::GetWorldObject(*bot, npcOrGo);
+        if (!object)
+            return false;
+
         if (bot->CanInteractWithQuestGiver(object))
         {
             InteractWithNpcOrGameObjectForQuest(npcOrGo);
@@ -785,6 +893,20 @@ ObjectGuid NewRpgBaseAction::ChooseNpcOrGameObjectToInteract(bool questgiverOnly
     if (questgiverOnly)
         return ObjectGuid();
 
+    // CoA Economy: a vendor or an auctioneer the bot has business with, before a random NPC
+    if (CoaEconomy::RpgTrade::WantsTrade(botAI))
+    {
+        ObjectGuid const tradeNpc = CoaEconomy::RpgTrade::ChooseTradeNpc(botAI, possibleTargets, distanceLimit);
+        if (!tradeNpc.IsEmpty())
+        {
+            // 3.2 (BuyLog): an auctioneer its business picked.
+            if (Creature* npc = ObjectAccessor::GetCreature(*bot, tradeNpc))
+                if (npc->HasNpcFlag(UNIT_NPC_FLAG_AUCTIONEER))
+                    CoaEconomy::BotAuctions::NoteWay(CoaEconomy::BotAuctions::Way::Sought);
+            return tradeNpc;
+        }
+    }
+
     if (possibleTargets.empty())
         return ObjectGuid();
 
@@ -804,7 +926,7 @@ ObjectGuid NewRpgBaseAction::ChooseNpcOrGameObjectToInteract(bool questgiverOnly
 bool NewRpgBaseAction::HasQuestToAcceptOrReward(WorldObject* object)
 {
     ObjectGuid guid = object->GetGUID();
-    if (!CoaQuestMenuFits(guid))
+    if (!CoaQuestMenuFits(bot, guid))
         return false;
     bot->PrepareQuestMenu(guid);
     QuestMenu const& menu = bot->PlayerTalkClass->GetQuestMenu();
@@ -872,7 +994,10 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
         return false;
     }
 
-    QuestStatusData const& q_status = bot->getQuestStatusMap().at(questId);
+    QuestStatusData const* statusData = GetQuestStatusData(questId);
+    if (!statusData)
+        return false;
+    QuestStatusData const& q_status = *statusData;
 
     if (toComplete && q_status.Status == QUEST_STATUS_COMPLETE)
     {
@@ -1022,6 +1147,12 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
         if (!inCity && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(),
                                                 loc.GetPositionZ()) != bot->GetZoneId())
             continue;
+
+        // --- CoA World (CoA Monde session) ---
+        // Not a subzone for levels well above the bot's (CoaWorldLeveling's AreaGuard).
+        if (CoaWorldAreaTooHigh(bot, loc.GetMapId(), loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ()))
+            continue;
+        // --- end CoA World ---
 
         if (bot->GetExactDist(loc) < hiRange)
         {
@@ -1195,6 +1326,12 @@ WorldPosition NewRpgBaseAction::SelectRandomCampPos(Player* bot)
                                                 loc.GetPositionZ()) != bot->GetZoneId())
             continue;
 
+        // --- CoA World (CoA Monde session) ---
+        // Not a subzone for levels well above the bot's (CoaWorldLeveling's AreaGuard).
+        if (CoaWorldAreaTooHigh(bot, loc.GetMapId(), loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ()))
+            continue;
+        // --- end CoA World ---
+
         prepared_locs.push_back(loc);
     }
     WorldPosition dest{};
@@ -1231,15 +1368,18 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
 {
     std::vector<NewRpgStatus> availableStatus;
     uint32 probSum = 0;
+    // CoA souls: the configured weight tilted by the bot's soul (the configured one when off).
+    auto weight = [this](NewRpgStatus status)
+    { return CoaSoul::RpgWeight(bot, status, sPlayerbotAIConfig.RpgStatusProbWeight[status]); };
     for (NewRpgStatus status : candidateStatus)
     {
-        if (sPlayerbotAIConfig.RpgStatusProbWeight[status] == 0)
+        if (weight(status) == 0)
             continue;
 
         if (CheckRpgStatusAvailable(status))
         {
             availableStatus.push_back(status);
-            probSum += sPlayerbotAIConfig.RpgStatusProbWeight[status];
+            probSum += weight(status);
         }
     }
     // Safety check. Default to "rest" if all RPG weights = 0
@@ -1254,7 +1394,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
     NewRpgStatus chosenStatus = RPG_STATUS_END;
     for (NewRpgStatus status : availableStatus)
     {
-        accumulate += sPlayerbotAIConfig.RpgStatusProbWeight[status];
+        accumulate += weight(status);
         if (accumulate >= rand)
         {
             chosenStatus = status;
@@ -1303,6 +1443,12 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
                 if (botAI->lowPriorityQuest.find(questId) != botAI->lowPriorityQuest.end())
                     continue;
 
+                // --- CoA World (CoA Monde session) ---
+                // A quest the bot got stuck on is left aside a while (CoaWorldRecovery).
+                if (CoaWorldQuestQuarantined(bot->GetGUID().GetCounter(), questId))
+                    continue;
+                // --- end CoA World ---
+
                 // An elite, group or too high quest in the log (copied from the master, shared, "accept all") is
                 // only handed in, never worked on alone: bots died on it again and again
                 // (jealous-sound/azerothcore-wotlk-coa#5521).
@@ -1313,6 +1459,12 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
                 std::vector<POIInfo> poiInfo;
                 if (GetQuestPOIPosAndObjectiveIdx(questId, poiInfo, true))
                 {
+                    // --- CoA World (CoA Monde session) ---
+                    // Not a quest whose place is a subzone for levels well above the bot's (Leveling's AreaGuard).
+                    if (!poiInfo.empty() && CoaWorldAreaTooHigh(bot, bot->GetMapId(), poiInfo.front().pos.x,
+                                                                poiInfo.front().pos.y, bot->GetPositionZ()))
+                        continue;
+                    // --- end CoA World ---
                     availableQuests.push_back(questId);
                 }
             }
@@ -1425,6 +1577,12 @@ bool NewRpgBaseAction::CheckRpgStatusAvailable(NewRpgStatus status)
                 if (botAI->lowPriorityQuest.find(questId) != botAI->lowPriorityQuest.end())
                     continue;
 
+                // --- CoA World (CoA Monde session) ---
+                // A quest the bot got stuck on is left aside a while (CoaWorldRecovery).
+                if (CoaWorldQuestQuarantined(bot->GetGUID().GetCounter(), questId))
+                    continue;
+                // --- end CoA World ---
+
                 // An elite, group or too high quest in the log (copied from the master, shared, "accept all") is
                 // only handed in, never worked on alone: bots died on it again and again
                 // (jealous-sound/azerothcore-wotlk-coa#5521).
@@ -1435,6 +1593,11 @@ bool NewRpgBaseAction::CheckRpgStatusAvailable(NewRpgStatus status)
                 std::vector<POIInfo> poiInfo;
                 if (GetQuestPOIPosAndObjectiveIdx(questId, poiInfo, true))
                 {
+                    // --- CoA World (CoA Monde session) ---
+                    if (!poiInfo.empty() && CoaWorldAreaTooHigh(bot, bot->GetMapId(), poiInfo.front().pos.x,
+                                                                poiInfo.front().pos.y, bot->GetPositionZ()))
+                        continue;
+                    // --- end CoA World ---
                     return true;
                 }
             }

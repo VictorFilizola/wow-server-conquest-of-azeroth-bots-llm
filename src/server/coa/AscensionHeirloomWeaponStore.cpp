@@ -1,5 +1,6 @@
 /* Copyright (C) 2016+ AzerothCore, GNU AGPL v3. */
 #include "AscensionCompatOpcodes.h"
+#include "AscensionRealmLevelPurchase.h"
 
 #include "../../../modules/mod-worldforged-upgrades/src/WorldforgedUpgrades.h"
 
@@ -21,10 +22,9 @@ constexpr uint32 STORE_HEIRLOOM_WEAPONS = 7;
 constexpr uint32 HEIRLOOM_WEAPON_TOKEN = 414010;
 constexpr uint32 TOKENS_PER_WEAPON = 1;
 
-constexpr std::array<uint32, 23> HEIRLOOM_WEAPONS = {
-    1518202, 1518203, 1542943, 1642846, 1642847, 1642902, 1642943, 1642944, 1642945, 1642946, 1642947,
-    1642948, 1642999, 1644091, 1644092, 1644093, 1644094, 1644095, 1644096, 1648716, 1648718, 3142943,
-    3148335,
+constexpr std::array<uint32, 22> HEIRLOOM_WEAPONS = {
+    1518202, 1518203, 1642846, 1642847, 1642902, 1642943, 1642944, 1642945, 1642946, 1642947, 1642948,
+    1642999, 1644091, 1644092, 1644093, 1644094, 1644095, 1644096, 1648716, 1648718, 3142943, 3148335,
 };
 
 bool IsHeirloomWeapon(uint32 entry)
@@ -95,6 +95,12 @@ bool HandlePurchase(WorldSession* session, WorldPacket const& packet)
     uint32 const weapon = packet.read<uint32>(0);
     if (!IsHeirloomWeapon(weapon))
         return false;
+
+    if (AscensionRealmLevelPurchase::Refuse(player, weapon))
+    {
+        SendPurchaseResult(session, "PURCHASE_CUSTOM_STORE_ITEM_UNKNOWN");
+        return true;
+    }
 
     if (!player->HasItemCount(HEIRLOOM_WEAPON_TOKEN, TOKENS_PER_WEAPON))
     {

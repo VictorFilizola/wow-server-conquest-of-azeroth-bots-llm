@@ -5,8 +5,10 @@
  */
 
 #include "TalkToQuestGiverAction.h"
+#include "CoaAutoNextQuest.h"
 #include "BroadcastHelper.h"
 #include "ChatHelper.h"
+#include "CoaAltAddon.h"
 #include "Event.h"
 #include "ItemUsageValue.h"
 #include "Object.h"
@@ -37,12 +39,21 @@ bool TalkToQuestGiverAction::ProcessQuest(Quest const* quest, Object* questGiver
 
     if (sPlayerbotAIConfig.syncQuestWithPlayer)
     {
-        if (master && master->GetQuestStatus(quest->GetQuestId()) == QUEST_STATUS_COMPLETE &&
+        // The player may already have handed the quest in (rewarded) before the bot talks to the quest giver.
+        if (master &&
+            (master->GetQuestStatus(quest->GetQuestId()) == QUEST_STATUS_COMPLETE ||
+             master->GetQuestRewardStatus(quest->GetQuestId())) &&
             (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_FAILED))
         {
             isCompleted |= CompleteQuest(bot, quest->GetQuestId());
             status = bot->GetQuestStatus(quest->GetQuestId());
         }
+    }
+
+    if (status != QUEST_STATUS_COMPLETE && CoaAltAddon::ToAddon(botAI))
+    {
+        CoaAltAddon::SendQuestState(botAI, quest);
+        return isCompleted;
     }
 
     switch (status)
@@ -109,6 +120,7 @@ void TalkToQuestGiverAction::RewardNoItem(Quest const* quest, Object* questGiver
         BroadcastHelper::BroadcastQuestTurnedIn(botAI, bot, quest);
 
         bot->RewardQuest(quest, 0, questGiver, false);
+        CoaTakeAutoNextQuest(bot, quest, questGiver);  // the auto-accept next quest, as for a player
     }
     else
     {
@@ -129,6 +141,7 @@ void TalkToQuestGiverAction::RewardSingleItem(Quest const* quest, Object* questG
         out << PlayerbotTextMgr::instance().GetBotText("quest_status_complete_single_reward", args);
         BroadcastHelper::BroadcastQuestTurnedIn(botAI, bot, quest);
         bot->RewardQuest(quest, index, questGiver, true);
+        CoaTakeAutoNextQuest(bot, quest, questGiver);  // the auto-accept next quest, as for a player
     }
     else
     {
@@ -190,6 +203,7 @@ void TalkToQuestGiverAction::RewardMultipleItem(Quest const* quest, Object* ques
             }
             ItemTemplate const* item = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[best]);
             bot->RewardQuest(quest, best, questGiver, true);
+            CoaTakeAutoNextQuest(bot, quest, questGiver);  // the auto-accept next quest, as for a player
             out << "Rewarded " << ChatHelper::FormatItem(item);
         }
         else
@@ -217,6 +231,7 @@ void TalkToQuestGiverAction::RewardMultipleItem(Quest const* quest, Object* ques
             uint32 firstId = *bestIds.begin();
             ItemTemplate const* item = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[firstId]);
             bot->RewardQuest(quest, firstId, questGiver, true);
+            CoaTakeAutoNextQuest(bot, quest, questGiver);  // the auto-accept next quest, as for a player
 
             out << "Rewarded " << ChatHelper::FormatItem(item);
         }
@@ -277,6 +292,12 @@ bool TurnInQueryQuestAction::Execute(Event event)
             status = bot->GetQuestStatus(quest->GetQuestId());
         }
     }
+    if (status != QUEST_STATUS_COMPLETE && CoaAltAddon::ToAddon(botAI))
+    {
+        CoaAltAddon::SendQuestState(botAI, quest);
+        return true;
+    }
+
     std::ostringstream out;
     out << "Quest ";
     switch (status)

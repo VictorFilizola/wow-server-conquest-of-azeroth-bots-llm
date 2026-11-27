@@ -10,6 +10,7 @@
 #include "CureTriggers.h"
 #include "FishingTriggers.h"
 #include "GenericTriggers.h"
+#include "CoaTankAction.h"
 #include "GuildTriggers.h"
 #include "HealthTriggers.h"
 #include "LfgTriggers.h"
@@ -36,6 +37,7 @@ public:
         creators["return"] = &TriggerContext::_return;
         creators["sit"] = &TriggerContext::sit;
         creators["return to stay position"] = &TriggerContext::return_to_stay_position;
+        creators["coa placement away"] = &TriggerContext::coa_placement_away;
         creators["collision"] = &TriggerContext::collision;
 
         creators["timer"] = &TriggerContext::Timer;
@@ -110,6 +112,7 @@ public:
         creators["enemy out of melee"] = &TriggerContext::EnemyOutOfMelee;
         creators["enemy out of spell"] = &TriggerContext::EnemyOutOfSpell;
         creators["target out of sight"] = &TriggerContext::target_out_of_sight;
+        creators["group out of sight"] = &TriggerContext::group_out_of_sight;
         creators["enemy too close for spell"] = &TriggerContext::enemy_too_close_for_spell;
         creators["enemy too close for shoot"] = &TriggerContext::enemy_too_close_for_shoot;
         creators["enemy too close for auto shot"] = &TriggerContext::enemy_too_close_for_auto_shot;
@@ -168,6 +171,7 @@ public:
         creators["medium group heal setting"] = &TriggerContext::medium_group_heal_occasion;
         creators["invalid target"] = &TriggerContext::invalid_target;
         creators["lfg proposal active"] = &TriggerContext::lfg_proposal_active;
+        creators["lfg role wanted"] = &TriggerContext::lfg_role_wanted;
 
         creators["unknown dungeon"] = &TriggerContext::unknown_dungeon;
 
@@ -260,6 +264,7 @@ private:
     static Trigger* no_rti(PlayerbotAI* botAI) { return new NoRtiTrigger(botAI); }
     static Trigger* _return(PlayerbotAI* botAI) { return new ReturnTrigger(botAI); }
     static Trigger* return_to_stay_position(PlayerbotAI* ai) { return new ReturnToStayPositionTrigger(ai); }
+    static Trigger* coa_placement_away(PlayerbotAI* ai) { return new CoaPlacementAwayTrigger(ai); }
     static Trigger* sit(PlayerbotAI* botAI) { return new SitTrigger(botAI); }
     static Trigger* far_from_rpg_target(PlayerbotAI* botAI) { return new FarFromRpgTargetTrigger(botAI); }
     static Trigger* near_rpg_target(PlayerbotAI* botAI) { return new NearRpgTargetTrigger(botAI); }
@@ -269,6 +274,7 @@ private:
     static Trigger* has_rpg_target(PlayerbotAI* botAI) { return new HasRpgTargetTrigger(botAI); }
     static Trigger* collision(PlayerbotAI* botAI) { return new CollisionTrigger(botAI); }
     static Trigger* lfg_proposal_active(PlayerbotAI* botAI) { return new LfgProposalActiveTrigger(botAI); }
+static Trigger* lfg_role_wanted(PlayerbotAI* botAI) { return new LfgRoleWantedTrigger(botAI); }
     static Trigger* unknown_dungeon(PlayerbotAI* botAI) { return new UnknownDungeonTrigger(botAI); }
     static Trigger* invalid_target(PlayerbotAI* botAI) { return new InvalidTargetTrigger(botAI); }
     static Trigger* critical_aoe_heal(PlayerbotAI* botAI)
@@ -354,6 +360,7 @@ private:
     static Trigger* EnemyOutOfMelee(PlayerbotAI* botAI) { return new EnemyOutOfMeleeTrigger(botAI); }
     static Trigger* EnemyOutOfSpell(PlayerbotAI* botAI) { return new EnemyOutOfSpellRangeTrigger(botAI); }
     static Trigger* target_out_of_sight(PlayerbotAI* botAI) { return new TargetOutOfSightTrigger(botAI); }
+    static Trigger* group_out_of_sight(PlayerbotAI* botAI) { return new GroupOutOfSightTrigger(botAI); }
     static Trigger* enemy_too_close_for_spell(PlayerbotAI* botAI) { return new EnemyTooCloseForSpellTrigger(botAI); }
     static Trigger* enemy_too_close_for_auto_shot(PlayerbotAI* botAI)
     {

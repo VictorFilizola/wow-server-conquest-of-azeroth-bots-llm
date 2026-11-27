@@ -9,6 +9,7 @@
 #include "BroadcastHelper.h"
 #include "Chat.h"
 #include "ChatHelper.h"
+#include "CoaAltAddon.h"
 #include "Event.h"
 #include "ItemTemplate.h"
 #include "ObjectGuid.h"
@@ -99,7 +100,7 @@ bool QuestAction::CompleteQuest(Player* player, uint32 entry)
         uint8 msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, count - curItemCount);
         if (msg == EQUIP_ERR_OK)
         {
-            Item* item = player->StoreNewItem(dest, id, true);
+            Item* item = player->StoreNewItem(dest, id, true, Item::GenerateItemRandomPropertyId(id));
             player->SendNewItem(item, count - curItemCount, true, false);
         }
     }
@@ -197,10 +198,20 @@ bool QuestAction::ProcessQuests(WorldObject* questGiver)
         bot->SetFacingToObject(questGiver);
 
     bot->SetTarget(guid);
-    if (!CoaQuestMenuFits(guid))
+    if (!CoaQuestMenuFits(bot, guid))
     {
-        botAI->TellError("Too many quests on this board");
-        return false;
+        // A Call Board or mission board: an alt follows its player there without a quest menu; random bots skip it.
+        Player* master = botAI->GetMaster();
+        if (!master || master == bot || GET_PLAYERBOT_AI(master))
+        {
+            botAI->TellError("Too many quests on this board");
+            return false;
+        }
+
+        bool processed = false;
+        for (Quest const* quest : CoaBigBoardQuests(bot, master, guid))
+            processed |= ProcessQuest(quest, questGiver);
+        return processed;
     }
     bot->PrepareQuestMenu(guid);
 
@@ -224,6 +235,12 @@ bool QuestAction::AcceptQuest(Quest const* quest, ObjectGuid questGiver)
     std::ostringstream out;
 
     uint32 questId = quest->GetQuestId();
+    bool const toAddon = CoaAltAddon::ToAddon(botAI);
+    bool const addonSeen = CoaAltAddon::AddonSeen(botAI);
+    std::string result;
+
+    if (bot->GetQuestStatus(questId) == QUEST_STATUS_NONE && !bot->CanTakeQuest(quest, false))
+        CoaAltAddon::CatchUp(botAI, quest);
 
     if (bot->GetQuestStatus(questId) == QUEST_STATUS_COMPLETE)
         out << "Already completed";
@@ -233,11 +250,18 @@ bool QuestAction::AcceptQuest(Quest const* quest, ObjectGuid questGiver)
             out << "Already on";
         else
             out << "Can't take";
+        result = "refused";
     }
     else if (!bot->SatisfyQuestLog(false))
+    {
         out << "Quest log is full";
+        result = "log_full";
+    }
     else if (!bot->CanAddQuest(quest, false))
+    {
         out << "Bags are full";
+        result = "bags_full";
+    }
     else
     {
         WorldPacket p(CMSG_QUESTGIVER_ACCEPT_QUEST);
@@ -256,11 +280,27 @@ bool QuestAction::AcceptQuest(Quest const* quest, ObjectGuid questGiver)
         if (bot->GetQuestStatus(questId) != QUEST_STATUS_NONE && bot->GetQuestStatus(questId) != QUEST_STATUS_REWARDED)
         {
             BroadcastHelper::BroadcastQuestAccepted(botAI, bot, quest);
-            out << "Accepted " << chat->FormatQuest(quest);
-            botAI->TellMaster(out);
+            if (addonSeen)
+                CoaAltAddon::SendToMaster(botAI, "QR\t" + std::to_string(questId) + "\ttaken\t");
+            if (!toAddon)
+            {
+                out << "Accepted " << chat->FormatQuest(quest);
+                botAI->TellMaster(out);
+            }
             return true;
         }
         out << "Cannot accept";
+        result = "refused";
+    }
+
+    if (toAddon)
+    {
+        if (result == "refused" || result.empty())
+        {
+            CoaAltAddon::SendQuestState(botAI, quest);
+            return false;
+        }
+        CoaAltAddon::SendToMaster(botAI, "QR\t" + std::to_string(questId) + "\t" + result + "\t");
     }
 
     out << " " << chat->FormatQuest(quest);

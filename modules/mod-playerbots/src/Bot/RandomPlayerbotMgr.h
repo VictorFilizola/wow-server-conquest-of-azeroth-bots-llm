@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -158,6 +159,8 @@ public:
     uint32 activeBots = 0;
     static bool HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args);
     bool IsRandomBot(Player* bot);
+    // CoA World (CoA Monde session), density: this bot's time in the world ends now.
+    void CoaRetireBot(uint32 bot);
     bool IsRandomBot(ObjectGuid::LowType bot);
     bool IsAddclassBot(Player* bot);
     bool IsAddclassBot(ObjectGuid::LowType bot);
@@ -181,7 +184,11 @@ public:
     void CoaReleaseOrphanGroups();
     Player* GetRandomPlayer();
     std::vector<Player*> GetPlayers() { return players; };
+    // A copy of the bot map: for a caller that logs bots in or out (or may) while it loops.
     PlayerBotMap GetAllBots() { return playerBots; };
+    // The bot map in place, no copy (2000 nodes allocated per call otherwise): for a caller that only reads it.
+    // World thread only, and nothing in the loop may log a bot in or out.
+    PlayerBotMap const& GetAllBotsRef() const { return playerBots; }
     void InitArenaTeams();
     void PrintStats();
     double GetBuyMultiplier(Player* bot);
@@ -191,6 +198,10 @@ public:
     uint32 GetTradeDiscount(Player* bot, Player* master);
     void Refresh(Player* bot);
     void RandomTeleportForLevel(Player* bot);
+    // CoA 3.3: the teleport of a level up (AutoTeleportForLevel): no arrival within 150 yards of a real player
+    // (AiPlayerbot.CoaLive.LevelupTeleportGuard); RandomTeleportForLevel's other callers as before.
+    void RandomTeleportForLevelUp(Player* bot);
+    void TeleportForLevel(Player* bot, bool levelUp);
     void RandomTeleportGrindForLevel(Player* bot);
     void RandomTeleportForRpg(Player* bot);
     uint32 GetMaxAllowedBotCount();
@@ -204,6 +215,8 @@ public:
     std::string GetData(uint32 bot, std::string const& type);
     void SetValue(uint32 bot, std::string const& type, uint32 value, std::string const& data = "");
     void SetValue(Player* bot, std::string const& type, uint32 value, std::string const& data = "");
+    // A value that never expires (the choices of a player: the enchanter of the team).
+    void SetPermanentValue(uint32 guid, std::string const& type, uint32 value, std::string const& data = "");
     bool IsSpecPvp(uint32 bot, uint8 cls);
     // AiPlayerbot.CoaGearByContent: PvP or PvE gear for what the random bot does, at its grouping player's item level.
     void CoaUpdateGear(Player* bot);
@@ -220,6 +233,9 @@ public:
     bool IsNearLfgPlayerLevels(TeamId team, uint32 dungeonId, uint32 level);
     // A queued real player of this team still lacks a tank or a healer: damage dealers hold back.
     std::array<std::atomic<bool>, 2> LfgNeedTankOrHeal{};
+    // 3.2.1: the same, role by role (CoaLfgRolePriority: a bot of the missing role queues first).
+    std::array<std::atomic<bool>, 2> LfgNeedTank{};
+    std::array<std::atomic<bool>, 2> LfgNeedHeal{};
     void CheckBgQueue();
     // How many healer and damage bots the rated solo queues real players wait in still need (CheckBgQueue).
     void CountRatedSoloNeeds();
@@ -242,7 +258,9 @@ public:
     float getActivityMod() { return activityMod; }
     float getActivityPercentage() { return activityMod * 100.0f; }
     void setActivityPercentage(float percentage) { activityMod = percentage / 100.0f; }
-    static uint8 GetTeamClassIdx(bool isAlliance, uint8 claz) { return isAlliance * 20 + claz; }
+    // CoA 3.2.2 (Dungeon Clear, issue 62): the CoA classes go up to 32 (MAX_CLASSES 33); "isAlliance * 20" put a Horde
+    // class of 21 and more in the bucket of the Alliance class 20 below it (.playerbots addclass drew the other side).
+    static uint8 GetTeamClassIdx(bool isAlliance, uint8 claz) { return isAlliance * MAX_CLASSES + claz; }
 
     void PrepareAddclassCache();
     void Init();
@@ -309,6 +327,12 @@ private:
     void GetBots();
     std::vector<uint32> GetBgBots(uint32 bracket);
     time_t BgCheckTimer;
+
+public:
+    // CoA World (BgSim): a real player queued for a battleground or arena; the queues are looked at on the next update.
+    void RequestBgCheck() { BgCheckTimer = time(nullptr) - 36; }
+
+private:
     time_t ArenaCaptainCheckTimer = 0;
     time_t LfgCheckTimer;
     time_t PlayersCheckTimer;
@@ -316,15 +340,19 @@ private:
     time_t DelayLoginBotsTimer;
     time_t printStatsTimer;
     std::unordered_map<ObjectGuid::LowType, time_t> coaOrphanGroups;  // group -> since when it has been orphaned
+    // Low level bots: their last experience mark and since when (ProcessBot), in memory only: after a restart the
+    // check just starts over. World thread; a bot's entry goes when it logs out.
+    std::unordered_map<uint32, std::pair<uint32, uint32>> coaXpTrack;  // bot -> (progress, since)
     time_t coaOrphanCheckAt = 0;
     uint32 AddRandomBots();
     void CoaTrimBotsForPlayers(uint32 target);
     bool ProcessBot(uint32 bot);
     void ScheduleRandomize(uint32 bot, uint32 time);
     void RandomTeleport(Player* bot);
-    void RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth = false);
+    void RandomTeleport(Player* bot, std::vector<WorldLocation>& locs, bool hearth = false, bool levelUp = false);
     uint32 GetZoneLevel(uint16 mapId, float teleX, float teleY, float teleZ);
     std::vector<WorldLocation> GetPlayerZoneTeleportLocations(std::vector<WorldLocation> const& locs, Player* bot);
+    void UpdatePlayerZones();
     typedef void (RandomPlayerbotMgr::*ConsoleCommandHandler)(Player*);
     std::vector<Player*> players;
 
@@ -335,7 +363,14 @@ private:
     // Lowest and highest level of the real players of a team waiting for a dungeon. Written by CheckLfgQueue,
     // read by the bots from the map update threads.
     std::map<TeamId, std::map<uint32, std::pair<uint8, uint8>>> lfgPlayerLevels;
+    // CoA World: the longest wait of those players (seconds), and since when each one waits (CheckLfgQueue only).
+    std::map<TeamId, std::map<uint32, time_t>> lfgPlayerWaited;
+    std::unordered_map<ObjectGuid, time_t> lfgQueuedSince;
     std::mutex lfgPlayerLevelsLock;
+    // Map and zone of the real players, for RandomBotConcentrateInPlayerZone. Written on the world thread, read
+    // from the map update threads.
+    std::set<std::pair<uint32, uint32>> _playerZones;
+    std::mutex _playerZonesLock;
     // Bot AI reads and writes these values from the map update threads.
     std::mutex eventCacheLock;
     std::unordered_map<uint32, BotEventCache> eventCache;
@@ -351,5 +386,8 @@ private:
 };
 
 #define sRandomPlayerbotMgr RandomPlayerbotMgr::instance()
+
+// CoA 3.2.2: a random bot with no player for master never teleports to map 530 or 571 (OnPlayerBeforeTeleport).
+bool CoaRefusesFarMap(Player* bot, uint32 mapId);
 
 #endif

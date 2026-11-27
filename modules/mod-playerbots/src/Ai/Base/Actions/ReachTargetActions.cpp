@@ -9,15 +9,56 @@
 #include "Formations.h"
 #include "Group.h"
 #include "GroupReference.h"
+#include "PathGenerator.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
 #include "ServerFacade.h"
+#include <cmath>
+#include "SpellMgr.h"
+#include "SpellInfo.h"
+#include "GridNotifiersImpl.h"
+#include "GridNotifiers.h"
+#include "DynamicObject.h"
+#include "CellImpl.h"
 
 static constexpr float GROUP_SIGHT_SPOT_DISTANCE = 3.0f;
+
 
 bool ReachTargetAction::Execute(Event /*event*/)
 {
     Unit* target = AI_VALUE(Unit*, GetTargetName());
+
+    // A point next to the enemy that is not in a ground effect: the one nearest the straight way in, else, with the enemy
+    // standing in it, a damage dealer waits at its edge (the tank still goes in).
+    if (target && bot->IsValidAttackTarget(target) && bot->GetGroup() && !botAI->IsTank(bot))
+    {
+        std::vector<CoaGround> const zones = CoaHostileGround(bot);
+        if (!zones.empty() && !CoaInGround(zones, bot->GetPositionX(), bot->GetPositionY(), 0.0f))
+        {
+            float const reach = std::max(distance - 1.0f, 1.0f);
+            float const base = target->GetAngle(bot);
+            float const straightX = target->GetPositionX() + reach * std::cos(base);
+            float const straightY = target->GetPositionY() + reach * std::sin(base);
+            if (CoaInGround(zones, straightX, straightY))
+            {
+                for (float step : { 0.4f, -0.4f, 0.8f, -0.8f, 1.2f, -1.2f, 1.6f, -1.6f, 2.0f, -2.0f, 2.4f, -2.4f, float(M_PI) })
+                {
+                    float x = target->GetPositionX() + reach * std::cos(base + step);
+                    float y = target->GetPositionY() + reach * std::sin(base + step);
+                    float z = target->GetPositionZ();
+                    if (CoaInGround(zones, x, y))
+                        continue;
+                    bot->UpdateAllowedPositionZ(x, y, z);
+                    if (!target->IsWithinLOS(x, y, z + 2.0f))
+                        continue;
+                    if (bot->GetExactDist2d(x, y) <= 1.5f)
+                        return false;
+                    return MoveTo(bot->GetMapId(), x, y, z, false, false, false, true, MovementPriority::MOVEMENT_COMBAT, true);
+                }
+                return false;
+            }
+        }
+    }
     // Heal and resurrect reaches use this class too. Only hostile targets get the stack.
     if (target && bot->IsValidAttackTarget(target) && bot->GetGroup() && !botAI->IsTank(bot))
     {
@@ -228,6 +269,72 @@ bool ReachLineOfSightAction::isUseful()
 }
 
 std::string const ReachLineOfSightAction::GetTargetName() { return "current target"; }
+
+bool RegainGroupSightAction::isUseful()
+{
+    if (botAI->HasStrategy("stay", botAI->GetState()))
+        return false;
+
+    Unit* tank = AI_VALUE(Unit*, "main tank");
+    return tank && tank != bot && tank->IsAlive() && !bot->IsWithinLOSInMap(tank);
+}
+
+Player* RegainGroupSightAction::FindMemberInSightOf(Unit* tank)
+{
+    Player* best = nullptr;
+    int bestRank = 3;
+    float bestDistance = sPlayerbotAIConfig.sightDistance;
+    float const range = botAI->GetRange("heal");
+
+    for (GroupReference* ref = bot->GetGroup()->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == bot || !member->IsAlive() || member->IsCharmed() ||
+            member->GetMapId() != bot->GetMapId() || !member->IsWithinLOSInMap(tank) ||
+            member->GetExactDist(tank) > range)
+            continue;
+
+        // The healer and the ranged stand where the group means to stand; the tank itself is in the melee.
+        int rank = 1;
+        if (botAI->IsHeal(member))
+            rank = 0;
+        else if (member == tank)
+            rank = 2;
+
+        float const distance = bot->GetExactDist(member);
+        if (rank < bestRank || (rank == bestRank && distance < bestDistance))
+        {
+            best = member;
+            bestRank = rank;
+            bestDistance = distance;
+        }
+    }
+
+    return best;
+}
+
+bool RegainGroupSightAction::Execute(Event /*event*/)
+{
+    Unit* tank = AI_VALUE(Unit*, "main tank");
+    if (!tank || !bot->GetGroup() || !IsMovingAllowed())
+        return false;
+
+    Player* member = FindMemberInSightOf(tank);
+    if (!member)
+        return false;
+
+    // A bot standing inside the geometry finds no path at all; it is never ported out, it waits for the fight or
+    // for its master to move it.
+    PathGenerator path(bot);
+    path.CalculatePath(member->GetPositionX(), member->GetPositionY(), member->GetPositionZ(), false);
+    PathType const type = path.GetPathType();
+    if (type != PATHFIND_NORMAL && type != PATHFIND_INCOMPLETE)
+        return false;
+
+    if (bot->IsNonMeleeSpellCast(false))
+        bot->InterruptNonMeleeSpells(false);
+    return MoveNear(member, GROUP_SIGHT_SPOT_DISTANCE, MovementPriority::MOVEMENT_COMBAT);
+}
 
 ReachPartyMemberToHealAction::ReachPartyMemberToHealAction(PlayerbotAI* botAI)
     : ReachTargetAction(botAI, "reach party member to heal", botAI->GetRange("heal"))

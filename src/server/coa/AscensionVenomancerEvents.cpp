@@ -19,27 +19,27 @@ class aura_ascension_venomancer_event : public AuraScript
     PrepareAuraScript(aura_ascension_venomancer_event);
     Player* Caster()
     {
-        if (GetId() == 300855 || GetId() == 504352 || GetId() == 808082 || GetId() == 808083)
+        if (GetId() == 504352 || GetId() == 808082 || GetId() == 808083)
             return Owner(GetCaster());
         return Owner(GetTarget());
     }
     bool Check(ProcEventInfo& event)
     {
+        auto* info = event.GetSpellInfo();
+        uint32 damage = event.GetDamageInfo() ? event.GetDamageInfo()->GetDamage() : 0;
+        if (GetId() == EnvenomedWeapons)
+            return event.GetActor() == GetTarget() && event.GetActionTarget() && damage && !Derived(info) &&
+                (!info || info->Id != EnvenomedJet) && roll_chance_i(GetSpellInfo()->ProcChance);
         Player* player = Caster();
         if (!player || !event.GetActor() || !event.GetActionTarget() || State(player).event)
             return false;
         uint32 id = GetId();
-        auto* info = event.GetSpellInfo();
-        uint32 damage = event.GetDamageInfo() ? event.GetDamageInfo()->GetDamage() : 0;
         uint32 healing = event.GetHealInfo() ? event.GetHealInfo()->GetEffectiveHeal() : 0;
         bool periodic = event.GetTypeMask() & (PROC_FLAG_DONE_PERIODIC | PROC_FLAG_TAKEN_PERIODIC);
         bool critical = event.GetHitMask() & PROC_HIT_CRITICAL;
         bool automatic = event.GetTypeMask() & (PROC_FLAG_DONE_MELEE_AUTO_ATTACK | PROC_FLAG_TAKEN_MELEE_AUTO_ATTACK);
         bool received = event.GetActionTarget() == GetTarget();
         bool own = event.GetActor() == player;
-        if (id == 300855)
-            return event.GetActor() == GetTarget() && damage && !Derived(info) && (!info || info->Id != 803178) &&
-                roll_chance_i(GetSpellInfo()->ProcChance);
         if (id == 808082)
             return own && received && healing && !Derived(info);
         if (received && damage)
@@ -90,13 +90,14 @@ class aura_ascension_venomancer_event : public AuraScript
             case 705980: return damage && Named(info,803570);
             case 705982: return damage && critical && Any(info,{803570,803199,803193});
             case 705993: return (damage || healing) && Chance(player,id);
-            case 706001: return damage && Named(info,803199);
+            case 706001: return damage && Any(info,{803193,803199});
             case 706016: return healing && critical;
             case 706018: return healing && !periodic && Chance(player,id);
             case 706030: return damage && periodic && Chance(player,id);
             case 706035: return (damage || healing) && critical && Chance(player,id,5000);
             case 706271: return damage && periodic && Chance(player,id,2000);
-            case 706938: return healing && Named(info,504342);
+            case 706938: return event.GetHealInfo() && event.GetHealInfo()->GetHeal() &&
+                !(event.GetTypeMask() & TAKEN_HIT_PROC_FLAG_MASK) && Named(info,504342);
             case 707224: return damage && Named(info,804986);
             case 707233: return damage && periodic && (!info || info->Id != 707234) && Chance(player,id);
             case 707382: return damage && critical && info && info->Id == 504705;
@@ -128,11 +129,16 @@ class aura_ascension_venomancer_event : public AuraScript
     void Proc(ProcEventInfo& event)
     {
         PreventDefaultAction();
+        Unit* target = event.GetActionTarget();
+        if (GetId() == EnvenomedWeapons)
+        {
+            Cast(GetTarget(),target,EnvenomedJet);
+            return;
+        }
         Player* player = Caster();
         if (!player)
             return;
         uint32 id = GetId();
-        Unit* target = event.GetActionTarget();
         Unit* actor = event.GetActor();
         uint32 damage = event.GetDamageInfo() ? event.GetDamageInfo()->GetDamage() : 0;
         uint32 healing = event.GetHealInfo() ? event.GetHealInfo()->GetEffectiveHeal() : 0;
@@ -140,7 +146,6 @@ class aura_ascension_venomancer_event : public AuraScript
         State(player).event = true;
         switch (id)
         {
-            case 300855: Cast(player,target,803178); break;
             case 92142:
                 Reduce(player,800946,INT32_MAX);
                 Cast(player,player,706032);
@@ -242,6 +247,8 @@ class aura_ascension_venomancer_event : public AuraScript
                 if (!amulet)
                 {
                     Cast(player,player,800914);
+                    if (!player->HasSpellCooldown(800914))
+                        player->SendClearCooldown(800914, player);
                     if (Aura* added = player->GetAura(800914))
                         added->SetDuration(std::min(5000,added->GetMaxDuration()));
                 }

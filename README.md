@@ -53,7 +53,7 @@ docker compose restart ac-authserver
 
 ## Client Setup
 
-To connect and use all features (Transmog UI, custom CoA progression, and the Chatter Companion bot-editor UI), apply the client patches and addons below to your **Ascension Conquest of Azeroth (3.3.5a)** client folder (`<Client>`, e.g. `ascension-live/`).
+To connect and use all features (Transmog UI, custom CoA progression, the **SquidBots Lite** bot/alt UI, and the **Chatter Companion** bot-editor UI), apply the client patches and addons below to your **Ascension Conquest of Azeroth (3.3.5a)** client folder (`<Client>`, e.g. `ascension-live/`).
 
 ### 1. Apply Required Client Patches (`client-patch/`)
 Copy the files from `client-patch/` into your `<Client>` directory (see also `client-patch/README_CLIENT.md`):
@@ -61,10 +61,11 @@ Copy the files from `client-patch/` into your `<Client>` directory (see also `cl
   - `client-patch/DivxTac.dll` — native 32-bit stub DLL that prevents the 100% loading-screen deadlock under Wine/Proton.
   - `client-patch/play.sh` — Wine/DXVK launch script (`WINEDLLOVERRIDES="d3d9=n,b" wine Ascension.exe`).
 - **Data directory (`<Client>/Data/`, overwrite when prompted):**
-  - `client-patch/Data/patch-B.MPQ` — fixes the Transmog UI (`C_Appearance.ApplyPendingAppearances()`) and silences obsolete `localtalent` / `localspec` chat spam.
+  - `client-patch/Data/patch-B.MPQ` — fixes the Transmog UI (`C_Appearance.ApplyPendingAppearances()`), silences obsolete `localtalent` / `localspec` chat spam, and includes upstream CoA FrameXML Lua fixes (`XPHotspots.lua`, `CoAHeirloomArmorTooltip.lua`, `CoAIntellectTooltip.lua`, `CoANamePlateCombat.lua`, `CoASpecBuildMemory.lua`, `CoASpellbookHighlight.lua`, `CoAVenomancerIncarnationNames.lua`).
   - `client-patch/Data/realmlist.wtf` — pre-configured with `set realmlist 127.0.0.1`. For LAN or Tailscale play, edit this file to `set realmlist <your-server-ip>`.
 
 ### 2. Install Client AddOns (`client-addons/`)
+- **SquidBots Lite (recommended for `mod-playerbots` v3.3 + `mod-dungeon-clear`):** Copy `client-addons/SquidBotsLite` into `<Client>/Interface/AddOns/SquidBotsLite` so `SquidBotsLite.toc` sits directly at `Interface/AddOns/SquidBotsLite/SquidBotsLite.toc`. **Keep the folder name exact.**
 - **Chatter Companion (recommended for `mod-llm-chatter`):** Copy `client-addons/Chatter` into `<Client>/Interface/AddOns/Chatter` so `Chatter.toc` sits directly inside `Interface/AddOns/Chatter/Chatter.toc`. **Keep the folder name `Chatter` exact**, otherwise the 3.3.5a client will not list or load it.
 - **Crow's Cache (optional):** Copy `client-addons/CoACrowsCache` into `<Client>/Interface/AddOns/CoACrowsCache` if you enable the High-Risk level-60 Crow's Cache world-map marker event.
 
@@ -79,6 +80,8 @@ Expected `<Client>` layout after setup:
 │   └── realmlist.wtf            # from client-patch/Data/ (127.0.0.1 or server IP)
 └── Interface/
     └── AddOns/
+        ├── SquidBotsLite/       # from client-addons/SquidBotsLite/
+        │   └── SquidBotsLite.toc
         ├── Chatter/             # from client-addons/Chatter/
         │   └── Chatter.toc
         └── CoACrowsCache/       # optional, from client-addons/CoACrowsCache/
@@ -90,8 +93,10 @@ Expected `<Client>` layout after setup:
    - **Linux / Wine / Proton:** run `./play.sh` (or `WINEDLLOVERRIDES="d3d9=n,b" wine Ascension.exe`).
    - **Windows:** launch `Ascension.exe`.
    - *(Always perform a full client restart after adding new addon folders for the first time — `/reload` alone will not detect newly added files.)*
-2. **Enable AddOns at Character Select:** Click **AddOns** in the bottom-left corner, make sure **Chatter** is checked, and tick **Load out of date AddOns**.
-3. **Open Chatter In-Game:** Type `/chatter` or `/llmc` in chat (or open **Esc → Interface → AddOns → Chatter → Bot Traits / Background Stories**) to view Known Bots, edit traits, and edit or regenerate bot backstories.
+2. **Enable AddOns at Character Select:** Click **AddOns** in the bottom-left corner, make sure **SquidBotsLite** and **Chatter** are checked, and tick **Load out of date AddOns**.
+3. **Open AddOn UIs In-Game:**
+   - **SquidBots Lite:** Click the **SquidBots** minimap button or type `/sbl` (or `/squidlite`) in chat to manage alts, party orders, Main Tank controls, Gathering Missions, Dungeon Clear runs, and target bot debugging.
+   - **Chatter Companion:** Type `/chatter` or `/llmc` in chat (or open **Esc → Interface → AddOns → Chatter → Bot Traits / Background Stories**) to view Known Bots, edit traits, and edit or regenerate bot backstories.
 
 ---
 
@@ -127,43 +132,42 @@ This server replaces the standard 10 classes with **21 completely unique, fully 
 
 ## Companion & Solo Systems
 
-### 1. `mod-playerbots` (Alt-Squad System)
-- **Random Bots:** 2,500 bots roam the world, questing, fighting, chatting, and running dungeons.
-- **Alt-Squad Party:** You can log in your own alternate characters as intelligent AI bots to form a permanent 5-man leveling squad!
-  - **Summon your alt:** `.playerbots bot add <AltName>` *(or `.bot +<AltName>`)*
-  - **Invite to party:** `/invite <AltName>` *(they instantly accept, follow, fight, heal, and gain XP with you)*
-  - **Dismiss alt:** `.playerbots bot remove <AltName>` *(or `.bot -<AltName>`)*
-  - **Party Chat commands:** Whisper or say `follow`, `stay`, `attack`, `nc -loot` (stop looting), `nc +loot`.
+### 1. `mod-playerbots` (SquidBots `v3.3`) + `mod-dungeon-clear` (`v3.3.0`)
+- **Living World Bots:** Random bots (`500` online by default in `playerbots.conf`, scaling across levels 1–80) quest, run simulated dungeons, visit bankers/auctioneers, sit on inn chairs, hammer at forges/anvils, fight in level-matched **City Gate Duels**, wear cosmetic **transmog sets**, and participate in the **Auction House & Guild Bank economy**.
+- **Alt-Squad Party:** Log in your own alternate characters as intelligent AI bots to form a permanent 5-man leveling/raiding squad:
+  - **Summon / invite / dismiss:** Managed visually via **SquidBots Lite** (`/sbl`), or via chat/GM commands (`.playerbots bot add <AltName>`, `/invite <AltName>`, `.playerbots bot remove <AltName>`).
+  - **Main-Tank controls (`tank main`):** Tell bots when *you* are tanking so bot tanks hold back instead of stealing threat (`tank main on|off`, `tank target`, `tank taunt`, `tank swap`, `tank hold`).
+  - **Alt Gathering Missions:** Whisper an alt `/w <AltName> mission gather 30 mining|herbalism` (or use the UI) to send them farming and receive materials by mail.
+  - **Dungeon Clear (`mod-dungeon-clear` `v3.3.0`):** Let a bot tank route and clear dungeons boss-to-boss with scripted event support (`.dc on`, `.dc off`, `.dc pause`, `.dc skip`, `.dc pull`, or via the **SquidBots Lite** Dungeon panel).
 
-### 2. `mod-llm-chatter` (AI Roleplay Personalities)
+### 2. SquidBots Lite Addon (`client-addons/SquidBotsLite`)
+The in-game UI control bar ([Zyth45/squidbots-addon](https://github.com/Zyth45/squidbots-addon) `v3.2`) toggled with `/sbl` (or `/squidlite`) or the minimap button:
+- **Alt Roster & Inventory Management:** Summon/dismiss alts with one click, inspect bags and equipped gear, configure CoA talent layouts/key spells, and drag-and-drop items to trade directly with alts.
+- **Party & Tank Bar:** Issue movement/combat/loot orders, manage quest sync prompts, and control **Main Tank** target assignment/taunt/swap without typing whispers.
+- **Gathering Missions & Dungeon Clear Panel:** Launch alt gathering runs, drive **Dungeon Clear** pulls and boss targets, and inspect live bot behavior with the *"Why is this bot doing that?"* (`.squidbots why`) target inspector.
+
+### 3. `mod-llm-chatter` (AI Roleplay Personalities)
 Bots use LLM-driven intelligence (DeepSeek / OpenAI / Anthropic / Google / OpenRouter / Ollama) to hold in-character conversations across party/raid chat, proximity `/say`, General, Guild, battlegrounds, and raids, complete with persistent shared memories and generated background stories.
 - Configured with **bespoke roleplay speech modifiers for all 21 custom CoA classes** (e.g. Barbarians roar about battle fury, Witch Doctors speak of spirits and mojo, Chronomancers speak in temporal paradoxes).
 - See `CONFIG.md` to configure your DeepSeek / OpenRouter API key.
 
-### 3. Chatter Companion Addon (`client-addons/Chatter`)
+### 4. Chatter Companion Addon (`client-addons/Chatter`)
 An in-game WoW 3.3.5a companion UI ([Hokken/Chatter-Companion](https://github.com/Hokken/Chatter-Companion)) for managing `mod-llm-chatter` bot personalities directly inside the client:
 - Browse your **Known Bots** roster (bots that hold memories with your character).
 - Edit each bot's **3 persistent personality traits** (up to 64 characters each) and view its LLM-generated speaking **tone**.
 - Read, rewrite (**Save Story**, up to 1,000 characters), or **Regenerate Story** for each bot's background story.
 - **Forget selected** bots to erase their shared memories with your character while preserving their global personality.
 
-**Installation:**
-1. Copy `client-addons/Chatter` into your client's `Interface/AddOns/` folder so `Chatter.toc` sits directly at `<Client>/Interface/AddOns/Chatter/Chatter.toc` (the folder must be named exactly `Chatter`).
-2. Fully restart the WoW / Ascension client (a `/reload` alone will not discover newly added files on first install).
-3. At the character selection screen, click **AddOns** (bottom-left), verify **Chatter** is enabled, and tick **Load out of date AddOns**.
+**Installation & Quick Use:**
+1. Copy `client-addons/Chatter` into `<Client>/Interface/AddOns/Chatter` (`Chatter.toc` directly inside `Chatter/`), restart the client, and enable **Chatter** + **Load out of date AddOns** at character select.
+2. Type `/chatter` or `/llmc` to open the floating editor window (or open **Interface → AddOns → Chatter** for **Bot Traits** and **Background Stories**).
+3. Play briefly with a bot so it forms a memory with your character, click **Refresh**, edit traits (**Save Traits**) or custom backstories (**Save Story** / **Regenerate Story**), or clear per-character memories (**Forget selected**).
 
-**How to Use In-Game:**
-- Type `/chatter` or `/llmc` to open the floating editor window (or open **Interface → AddOns → Chatter** for the dedicated **Bot Traits** and **Background Stories** panels).
-- Group up with a bot and play briefly so it forms a memory of your character and appears in the **Known Bots** list (click **Refresh** to update the roster).
-- Select a bot, edit its 3 traits, and click **Save Traits** — the Python bridge regenerates its tone and background story asynchronously while the UI polls and displays the result automatically.
-- Edit the story box and click **Save Story** to write a custom backstory without regenerating traits/tone, or click **Regenerate Story** to generate a fresh origin story.
-- Check one or more bots in the list and click **Forget selected** to clear their memories with your character.
+### 5. `mod-autobalance` & `mod-cfbg`
+- **`mod-autobalance`:** Automatically scales creature health and damage dynamically for solo players or 5-man Alt-Squad parties across dungeons and raids.
+- **`mod-cfbg`:** Cross-Faction Battlegrounds enabled (`CFBG.conf`), allowing Alliance and Horde queues to form mixed-faction battlegrounds on low-population/solo servers.
 
-### 4. `mod-autobalance`
-- Automatically scales creature health and damage dynamically based on your group size.
-- 5-man dungeons are tuned for 1 player; 10/25/40-man raids are tuned for your 5-man Alt-Squad party.
-
-### 5. `mod-transmog`
+### 6. `mod-transmog`
 - Full transmog system with **all restrictions removed**:
   - `IgnoreReqClass = 1` (wear any appearance across classes).
   - `IgnoreReqLevel = 1` (transmog high-level appearances at level 1).
@@ -190,11 +194,11 @@ Running the Ascension Conquest of Azeroth client on modern Linux/Wine or Windows
   ```
   Transmog appearances now apply directly and instantly.
 
-### 3. Silencing Talent & Spec Spam (`patch-B.MPQ`)
+### 3. Silencing Talent & Spec Spam + CoA FrameXML Overlays (`patch-B.MPQ`)
 - **The Problem:** Leveling up or selecting talents flooded the chat frame with errors:
-  `"command localtalent <id> does not exist"` and `"command localspec <id> does not exist"`.
+  `"command localtalent <id> does not exist"` and `"command localspec <id> does not exist"`. Upstream CoA updates also added several FrameXML UI/tooltip fixes.
 - **The Cause:** Legacy compatibility scripts (`CharacterAdvancementStateCompat.lua` and `CharacterAdvancementCompat.lua`) were sending deprecated slash commands on every state change.
-- **The Fix:** Neutralized the command dispatchers inside `patch-B.MPQ`.
+- **The Fix:** Neutralized the deprecated command dispatchers and packed all 7 upstream CoA `Interface/FrameXML/*.lua` overlays (`XPHotspots.lua`, `CoAHeirloomArmorTooltip.lua`, `CoAIntellectTooltip.lua`, `CoANamePlateCombat.lua`, `CoASpecBuildMemory.lua`, `CoASpellbookHighlight.lua`, `CoAVenomancerIncarnationNames.lua`) into `patch-B.MPQ`.
 
 ### 4. Wine Execution Parameters
 To ensure DXVK renders custom CoA particle effects, spell overlays, and UI textures properly, launch the game with:
@@ -245,8 +249,11 @@ Enable GM powers in-game:
 .playerbots bot remove <Name> # Dismiss your alt bot
 ```
 
-### Chatter Companion Addon
+### Client AddOn Commands (`SquidBotsLite` & `Chatter Companion`)
 ```text
+/sbl                          # Toggle the SquidBots Lite bar (alts, tank bar, missions, dungeon clear)
+/squidlite                    # Alias for /sbl
+/dc on | off | pause | skip   # Drive Dungeon Clear manually via party chat / GM command
 /chatter                      # Open the floating Chatter Companion bot traits & backstory editor
 /llmc                         # Alias to open Chatter Companion
 ```

@@ -4,12 +4,28 @@
  * or (at your option) any later version.
  */
 
+#include "CoaBotMute.h"
+#include "CoaStarterWeapon.h"
+#include "CoaMoveAudit.h"
+#include "CoaTrust.h"
+#include "CoaWorldGuilds.h"
+#include "CoaWorldAiBudget.h"
+#include <chrono>
+#include "CoaWorldBgPace.h"
 #include "Playerbots.h"
+#include "Group.h"
+#include "LootMgr.h"
 #include "CoaSpecialization.h"
 #include "BattleGroundTactics.h"
 #include "CoaBossKnowledge.h"
 #include "BattlefieldScript.h"
+#include "CoaLeaveInstance.h"
+#include "CoaMissionMgr.h"
 #include "Channel.h"
+#include "CityDuels.h"
+#include "CoaAltAddon.h"
+#include "CoaBotIdentify.h"
+#include "CoaLive.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "DatabaseLoader.h"
@@ -28,7 +44,7 @@
 #include <algorithm>
 
 // Shown to players at login: bump it with every CoA Bots release.
-static constexpr char const* COA_BOTS_VERSION = "2.6";
+static constexpr char const* COA_BOTS_VERSION = "3.3";
 
 // For ".playerbots version", which still answers when a host removed the login message.
 char const* CoaBotsVersion() { return COA_BOTS_VERSION; }
@@ -91,25 +107,63 @@ public:
         PLAYERHOOK_ON_GIVE_EXP,
         PLAYERHOOK_ON_UPDATE_ZONE,
         PLAYERHOOK_ON_LOOT_ITEM,
-        PLAYERHOOK_ON_BEFORE_TELEPORT
+        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
+        PLAYERHOOK_ON_BEFORE_TELEPORT,
+        PLAYERHOOK_ON_PLAYER_JUST_DIED
     }) {}
+
+    // An alt on a gathering mission counts its deaths: it gives up at AiPlayerbot.Missions.MaxDeaths.
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (player && GET_PLAYERBOT_AI(player))
+            sCoaMissionMgr.OnDied(player);
+    }
 
     // What the bots bring back. Only the finds worth a line, and only from bots: a server watching
     // its bots wants to know what dropped, not to read every piece of linen cloth. The bar is
     // AiPlayerbot.LootLogMinQuality (3, rare, by default; 4 for epics only).
     // Off unless worldserver.conf points "playerbots.loot" at an appender.
-    void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid /*lootguid*/) override
+    void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid) override
     {
         if (!player || !item || !GET_PLAYERBOT_AI(player))
             return;
+
+        // What an alt on a gathering mission gathers is mailed to its owner at the end.
+        sCoaMissionMgr.OnLoot(player, item, count, lootguid);
 
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto || proto->Quality < sPlayerbotAIConfig.lootLogMinQuality)
             return;
 
-        LOG_INFO("playerbots.loot", "{} (class {} level {}) looted {} ({}) quality {} ilvl {} x{}",
+        LogLoot(player, proto, count, lootguid);
+    }
+
+    // CoA 3.2.2 (bench of 3606e5be: no dungeon line in an hour of self-found runs): in a group, a rare item is rolled
+    // for, and the winner gets it through the roll (Group::CountTheRoll), never through OnPlayerLootItem.
+    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count, RollVote /*voteType*/, Roll* roll) override
+    {
+        if (!player || !item || !GET_PLAYERBOT_AI(player))
+            return;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto || proto->Quality < sPlayerbotAIConfig.lootLogMinQuality)
+            return;
+        Loot const* loot = roll ? roll->getTarget() : nullptr;
+        LogLoot(player, proto, count, loot ? loot->sourceWorldObjectGUID : ObjectGuid::Empty);
+    }
+
+    // CoA 3.2.2 (the dashboard's last dungeon and raid loots): in a dungeon or a raid, the map and the creature
+    // looted (0: a chest, an item) end the line; its start is unchanged (the dashboard's rare finds read it).
+    static void LogLoot(Player* player, ItemTemplate const* proto, uint32 count, ObjectGuid source)
+    {
+        Map* map = player->GetMap();
+        std::string const where =
+            map && map->IsDungeon()
+                ? " map " + std::to_string(map->GetId()) + (map->IsRaid() ? " raid" : " dungeon") + " boss " +
+                      std::to_string(source.IsCreature() ? source.GetEntry() : 0)
+                : "";
+        LOG_INFO("playerbots.loot", "{} (class {} level {}) looted {} ({}) quality {} ilvl {} x{}{}",
                  player->GetName(), uint32(player->getClass()), uint32(player->GetLevel()), proto->Name1,
-                 proto->ItemId, uint32(proto->Quality), uint32(proto->ItemLevel), count);
+                 proto->ItemId, uint32(proto->Quality), uint32(proto->ItemLevel), count, where);
     }
 
     // A client joins the channels of the zone it enters. A bot did it once, at login, and then
@@ -177,9 +231,14 @@ public:
         }
     }
 
-    bool OnPlayerBeforeTeleport(Player* /*player*/, uint32 /*mapid*/, float /*x*/, float /*y*/, float /*z*/,
+    bool OnPlayerBeforeTeleport(Player* player, uint32 mapid, float /*x*/, float /*y*/, float /*z*/,
                                 float /*orientation*/, uint32 /*options*/, Unit* /*target*/) override
     {
+        if (CoaRefusesFarMap(player, mapid))  // CoA 3.2.2: no random bot on map 530 or 571, whatever the caller
+            return false;
+        CoaMoveAudit::NoteTeleport(player);  // CoA 3.2.2: a teleport by the server, no anomaly for the move audit
+        CoaLeaveInstance::OnBeforeTeleport(player, mapid);
+
         /* for now commmented out until proven its actually required
         * havent seen any proof CleanVisibilityReferences() is needed
 
@@ -227,23 +286,72 @@ public:
     {
         PlayerbotAI* const botAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
 
-        if (botAI != nullptr)
+        // CoA World (AiBudgetMs): over its map's AI budget this tick, the bot skips its AI and keeps the time.
+        if (botAI != nullptr && CoaWorldAiBudget::On() && CoaWorldAiBudget::Skip(player, botAI))
         {
-            botAI->UpdateAI(diff);
+            botAI->coaBudgetWaitMs += diff;
+            CoaLive::OnBotUpdate(player, botAI, diff);
+        }
+        else if (botAI != nullptr)
+        {
+            auto const aiStart = std::chrono::steady_clock::now();
+            diff += botAI->coaBudgetWaitMs;
+            botAI->coaBudgetWaitMs = 0;
+            // CoA World (BotOnlyBgPace): in a battleground or arena with no real player on the map nor in its queue,
+            // the bot thinks every IntervalMs; back to every tick as soon as one comes (checked every second).
+            if (CoaWorldBgPace::On() && player->InBattleground())
+            {
+                botAI->coaBgCheckMs += diff;
+                if (botAI->coaBgCheckMs >= 1000)
+                {
+                    botAI->coaBgCheckMs = 0;
+                    botAI->coaBgBotOnly = CoaWorldBgPace::BotOnly(player);
+                }
+            }
+            else
+                botAI->coaBgBotOnly = false;
+
+            if (botAI->coaBgBotOnly)
+            {
+                botAI->coaBgWaitMs += diff;
+                if (botAI->coaBgWaitMs >= CoaWorldBgPace::IntervalMs())
+                {
+                    botAI->UpdateAI(botAI->coaBgWaitMs);
+                    botAI->coaBgWaitMs = 0;
+                }
+            }
+            else
+            {
+                botAI->UpdateAI(diff + botAI->coaBgWaitMs);
+                botAI->coaBgWaitMs = 0;
+            }
+            if (CoaWorldAiBudget::On())
+                CoaWorldAiBudget::Spent(player, uint64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                           std::chrono::steady_clock::now() - aiStart).count()));
+            CoaLive::OnBotUpdate(player, botAI, diff);
         }
 
         if (PlayerbotMgr* playerbotMgr = GET_PLAYERBOT_MGR(player))
         {
             playerbotMgr->UpdateAI(diff);
         }
+
+        if (botAI == nullptr)
+            CoaLeaveInstance::OnUpdate(player);
     }
 
     using PlayerScript::OnPlayerCanUseChat;  // keep the base overloads visible
 
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Player* receiver) override
     {
-        if (type != CHAT_MSG_WHISPER || lang == LANG_ADDON)
+        if (type != CHAT_MSG_WHISPER)
         {
+            return true;
+        }
+
+        if (lang == LANG_ADDON)
+        {
+            CoaAltAddon::OnAddonWhisper(player, receiver, msg);
             return true;
         }
 
@@ -253,6 +361,14 @@ public:
         {
             return true;
         }
+
+        // CoA World (Guilds.GearAsk): "yes"/"no" to a guildmate's offer of gear.
+        if (CoaWorldGuildGiftWhisper(player, receiver, msg))
+            return true;
+
+        // CoA Live: a stranger's whisper to a random bot gets a human answer, not a command.
+        if (CoaLive::OnWhisper(player, receiver, msg))
+            return true;
 
         botAI->HandleCommand(type, msg, player);
 
@@ -268,8 +384,23 @@ public:
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Group* group) override
     {
         // Addon traffic (DBM, Carbonite, ...) is no bot command; its text used to trigger item commands like trade.
+        // Only the SquidBots Lite "WHO?" gets an answer from the bots of the group (CoaBotIdentify).
         if (lang == LANG_ADDON)
+        {
+            CoaBotIdentify::OnGroupAddonMessage(player, type, msg, group);
             return true;
+        }
+
+        // "summon" from the leader of a raid built by ".playerbots coa raid" (SquidBots Lite Regroup): this hook runs
+        // in the world thread (CMSG_MESSAGECHAT), so the server brings every bot of the raid itself, across maps, and
+        // the bots do not get the command again (RC11c). Any other group or command: unchanged.
+        if (group && msg == "summon" && CoaIsBuiltRaid(group) && group->IsLeader(player->GetGUID()) &&
+            !GET_PLAYERBOT_AI(player))
+        {
+            uint32 const sent = CoaRegroupRaid(player);
+            LOG_WARN("playerbots", "coa regroup: {} summons the raid: {} teleport(s) sent", player->GetName(), sent);
+            return true;
+        }
 
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
@@ -292,6 +423,10 @@ public:
     bool OnPlayerCanUseChat(Player* player, uint32 type, uint32 lang, std::string& msg, Guild* /*guild*/) override
     {
         if (type != CHAT_MSG_GUILD || lang == LANG_ADDON)
+            return true;
+        // CoA World: an order to the guild ("need 20 [Silver Bar]") is not a command for the player's own bots (an item
+        // link would have them whisper their inventory).
+        if (CoaWorldGuildOrderHeard(msg))
             return true;
 
         PlayerbotMgr* playerbotMgr = PlayerbotsMgr::instance().GetPlayerbotMgr(player);
@@ -441,21 +576,33 @@ public:
 
         if (sPlayerbotAIConfig.coaBossKnowledge)
             CoaBossKnowledge::Load();
+        CoaTrust::Load();
+        CoaBotMute::Load();
+        CoaStarterWeapon::Load();
+        CoaMoveAudit::Load();  // the night bench of the odd moves (off by default)  // the self-found bots that got their starting weapon once  // the players who muted their bots (AiPlayerbot.CoaMute.Enable), table playerbots_coa_mute  // the trust of the players in their bots (AiPlayerbot.CoaTrust.Enable), table playerbots_coa_trust
 
         LOG_INFO("server.loading", "Playerbots World Thread Processor initialized");
     }
 
     void OnUpdate(uint32 diff) override
     {
+        if (sPlayerbotAIConfig.coaStartupCheckOnly)  // AiPlayerbot.StartupCheckOnly: no bot, nothing to update
+            return;
+
         PlayerbotWorldThreadProcessor::instance().Update(diff);
         sRandomPlayerbotMgr.UpdateAI(diff);  // World thread only
         sRandomPlayerbotMgr.CoaReleaseOrphanGroups();
+        CoaRegroupUpdate();  // raid check after ".playerbots coa raid" (RC11c), world thread
+        CityDuels::Update(diff);
+        CoaTrust::Flush(diff);  // the changed trust scores, every minute
     }
 
     void OnShutdown() override
     {
         // Command server sessions run on detached threads that would otherwise outlive the world thread processor.
         PlayerbotCommandServer::instance().Stop();
+        CityDuels::ReleaseAll(false);
+        CoaTrust::Flush(0, true);
     }
 };
 
@@ -486,6 +633,7 @@ public:
     {
         if (player)
             GuildTaskMgr::instance().CheckKillTask(player, victim);
+        CoaTrust::OnKill(player, victim);  // the trust of a player in the bots that fought with him
     }
 
     void OnPlayerbotCheckPetitionAccount(Player* player, bool& found) override
@@ -523,6 +671,9 @@ public:
 
     void OnPlayerbotUpdate(uint32 /*diff*/) override
     {
+        if (sPlayerbotAIConfig.coaStartupCheckOnly)
+            return;
+
         sRandomPlayerbotMgr.UpdateSessions();  // Per-bot updates only
     }
 
@@ -584,10 +735,13 @@ public:
                 break;
         }
 
-        bgStrategies[bg->GetInstanceID()] = data;
+        BGTactics::SetBotStrategies(bg->GetInstanceID(), data);
     }
 
-    void OnBattlegroundEnd(Battleground* bg, TeamId /*winnerTeam*/) override { bgStrategies.erase(bg->GetInstanceID()); }
+    void OnBattlegroundEnd(Battleground* bg, TeamId /*winnerTeam*/) override
+    {
+        BGTactics::ClearBotStrategies(bg->GetInstanceID());
+    }
 };
 
 // Workaround for missing InitEnabledHooksIfNeeded for new BattlefieldScript in ScriptMgr
@@ -600,6 +754,8 @@ public:
 void AddPlayerbotsSecureLoginScripts();
 void AddPlayerbotsSelfBotAfkScripts();
 
+void AddSC_ZulGurubBotScripts();
+void AddSC_MoltenCoreBotScripts();
 void AddSC_MagtheridonBotScripts();
 void AddSC_TempestKeepBotScripts();
 void AddSC_HyjalSummitBotScripts();
@@ -607,9 +763,23 @@ void AddSC_IcecrownBotScripts();
 void AddSC_RubySanctumBotScripts();
 void AddSC_randombot_level_mgr();
 
+void AddSC_coa_bot_damage_scale();
 void AddSC_coa_group_telemetry();
 void AddSC_coa_status_file();
 void AddSC_coa_arena_ready();
+void AddSC_random_bot_transmog();
+void AddSC_coa_leave_instance();
+void AddSC_coa_player_main_tank();
+void AddSC_coa_gardes_menace();
+
+// One entry point per code session, each defined in the session's own file:
+// Economy src/Ai/Coa/Economy/CoaEconomyScripts.cpp, World src/Ai/Coa/World/CoaWorldScripts.cpp,
+// Live src/Ai/Coa/Social/CoaLiveScripts.cpp, Combat src/Ai/Coa/Combat/CoaCombatScripts.cpp.
+// A session registers a new script in its own file, never here.
+void AddCoaEconomyScripts();
+void AddCoaWorldScripts();
+void AddCoaLiveScripts();
+void AddCoaCombatScripts();
 
 void AddPlayerbotsScripts()
 {
@@ -625,14 +795,27 @@ void AddPlayerbotsScripts()
     AddPlayerbotsSelfBotAfkScripts();
     AddPlayerbotsCommandscripts();
     PlayerBotsGuildValidationScript();
+    AddSC_ZulGurubBotScripts();
+    AddSC_MoltenCoreBotScripts();
     AddSC_MagtheridonBotScripts();
     AddSC_TempestKeepBotScripts();
     AddSC_HyjalSummitBotScripts();
     AddSC_IcecrownBotScripts();
     AddSC_RubySanctumBotScripts();
     AddSC_randombot_level_mgr();
+    AddSC_coa_bot_damage_scale();
     AddSC_coa_group_telemetry();
     AddSC_coa_status_file();
     AddSC_coa_arena_ready();
+    AddSC_random_bot_transmog();
+    AddSC_coa_leave_instance();
+    AddSC_coa_player_main_tank();
+    AddSC_coa_gardes_menace();
     AddSC_coa_lfg();
+
+    // Code sessions, in the order they were registered before (hooks shared by two of them keep their call order).
+    AddCoaEconomyScripts();
+    AddCoaWorldScripts();
+    AddCoaLiveScripts();
+    AddCoaCombatScripts();
 }

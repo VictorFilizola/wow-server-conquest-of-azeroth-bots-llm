@@ -9,6 +9,8 @@
 #include "CoaReborn.h"
 #include "CoaSpecialization.h"
 #include "CoaWildcard.h"
+#include "CoaMissionAction.h"
+#include "CoaMissionMgr.h"
 #include "Config.h"
 #include "GroupMgr.h"
 #include "GuildTaskMgr.h"
@@ -53,6 +55,7 @@ public:
             {"pmon", HandlePerfMonCommand, SEC_GAMEMASTER, Console::Yes},
             {"rndbot", HandleRandomPlayerbotCommand, SEC_GAMEMASTER, Console::Yes},
             {"coa", HandleCoaRecruitCommand, SEC_PLAYER, Console::Yes},
+            {"missiontest", HandleMissionTestCommand, SEC_ADMINISTRATOR, Console::Yes},
             {"version", HandleVersionCommand, SEC_PLAYER, Console::Yes},
             {"debug", playerbotsDebugCommandTable},
             {"account", playerbotsAccountCommandTable},
@@ -82,7 +85,7 @@ public:
 
     // .playerbots coa tank|heal|dps [class] : recruit a Conquest of Azeroth bot for that role, of
     // that class when one is named (".playerbots coa heal sun cleric").
-    // .playerbots coa raid [size] [tanks] [healers] : fills a raid with bots (25: 3 tanks, 6 healers).
+    // .playerbots coa raid [size] [tanks] [healers] : fills a raid with bots (25: 2 tanks, 4 healers).
     // Players may build a raid too, within AiPlayerbot.CoaRaidPlayerMax raids at a time on the realm and one
     // every AiPlayerbot.CoaRaidPlayerCooldown minutes each; game masters have no limit and alone recruit one role.
     // .playerbots coa regear [level] : game masters only, gears again the random bots online of that level or
@@ -169,6 +172,7 @@ public:
         {
             uint32 const minLevel = className.empty() ? 60 : std::max(1, std::atoi(className.c_str()));
             uint32 done = 0, skipped = 0;
+            // A copy on purpose: re-gearing a bot in the loop goes through the factory, which may touch the bot map.
             for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBots())
             {
                 if (!bot || !bot->IsInWorld() || bot->GetLevel() < minLevel)
@@ -360,6 +364,131 @@ public:
         }
 
         sPerfMonitor.PrintStats();
+        return true;
+    }
+
+    // .playerbots missiontest [count] [minutes] [mining|herbalism|skinning|fishing|cloth|all] | status | stop : a test
+    // bench of the gathering missions, for random bots with no owner (nothing is mailed, each end is logged as MISSION BENCH
+    // END in the CoA bot log). Bots without the profession are taught it for the test, with a skill matching their
+    // level, and given its tool.
+    static bool HandleMissionTestCommand(ChatHandler* handler, char const* args)
+    {
+        std::istringstream in(args ? args : "");
+        std::string first;
+        in >> first;
+
+        std::vector<Player*> bots;
+        for (auto const& [guid, bot] : sRandomPlayerbotMgr.GetAllBotsRef())  // read only: the list is acted on after
+            if (bot && bot->IsInWorld())
+                bots.push_back(bot);
+
+        if (first == "status" || first == "stop")
+        {
+            uint32 count = 0;
+            for (Player* bot : bots)
+            {
+                if (!sCoaMissionMgr.IsBench(bot))
+                    continue;
+                ++count;
+                if (first == "stop")
+                    sCoaMissionMgr.Finish(bot, "bench stopped");
+                else
+                    handler->PSendSysMessage("{} lvl {}: {}", bot->GetName(), bot->GetLevel(),
+                                             sCoaMissionMgr.StatusLine(bot));
+            }
+            handler->PSendSysMessage("{} bench missions {}.", count, first == "stop" ? "stopped" : "running");
+            return true;
+        }
+
+        // The numbers are the count then the minutes. Without a profession, half mine and half pick herbs; "all"
+        // takes the four in turn.
+        uint32 wanted = 10;
+        uint32 minutes = 60;
+        std::vector<uint32> professions = {SKILL_MINING, SKILL_HERBALISM};
+        uint32 numbers = 0;
+        for (std::string word = first; !word.empty(); word.clear(), in >> word)
+        {
+            if (word == "mining")
+                professions = {SKILL_MINING};
+            else if (word == "herbalism")
+                professions = {SKILL_HERBALISM};
+            else if (word == "skinning")
+                professions = {SKILL_SKINNING};
+            else if (word == "fishing")
+                professions = {SKILL_FISHING};
+            else if (word == "cloth")
+                professions = {TravelMgr::GATHER_CLOTH};
+            else if (word == "all")
+                professions = {SKILL_MINING, SKILL_HERBALISM, SKILL_SKINNING, SKILL_FISHING};
+            else if (numbers++ == 0)
+                wanted = std::max<uint32>(1, uint32(std::atoi(word.c_str())));
+            else
+                minutes = std::max<uint32>(1, uint32(std::atoi(word.c_str())));
+        }
+
+        Acore::Containers::RandomShuffle(bots);
+        uint32 started = 0;
+        uint32 taught = 0;
+        for (Player* bot : bots)
+        {
+            if (started >= wanted)
+                break;
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!botAI || bot->GetLevel() < 5 || !bot->IsAlive() || bot->IsInCombat() || bot->GetGroup() ||
+                sCoaMissionMgr.IsOnMission(bot))
+                continue;
+
+            // The professions in turn; a bot that does not know it is taught it for the test, and given its tool.
+            uint32 const skillId = professions[started % professions.size()];
+            if (skillId != TravelMgr::GATHER_CLOTH && !bot->HasSkill(skillId))
+            {
+                uint32 const value = std::min<uint32>(225, bot->GetLevel() * 5);
+                uint32 const step = value > 150 ? 3 : value > 75 ? 2 : 1;
+                uint32 spells[3] = {2575u, 2576u, 3564u};
+                uint32 tool = 2901;
+                if (skillId == SKILL_HERBALISM)
+                {
+                    spells[0] = 2366u, spells[1] = 2368u, spells[2] = 3570u;
+                    tool = 0;
+                }
+                else if (skillId == SKILL_SKINNING)
+                {
+                    spells[0] = 8613u, spells[1] = 8617u, spells[2] = 8618u;
+                    tool = 7005;
+                }
+                else if (skillId == SKILL_FISHING)
+                {
+                    spells[0] = 7620u, spells[1] = 7731u, spells[2] = 7732u;
+                    tool = 6256;
+                }
+                for (uint32 i = 0; i < step; ++i)
+                    bot->learnSpell(spells[i], false);
+                bot->SetSkill(skillId, step, value, step * 75);
+                if (tool && !bot->HasItemCount(tool, 1))
+                    bot->AddItem(tool, 1);
+                ++taught;
+            }
+
+            CoaMissionAction action(botAI);
+            std::string error;
+            // One bot in three takes an order instead: 10 Copper Ore, Peacebloom, Light Leather or Raw Brilliant
+            // Smallfish or Linen Cloth.
+            uint32 const orders[5] = {2770u, 2447u, 2318u, 6291u, 2589u};
+            uint32 const kind = skillId == SKILL_MINING      ? 0
+                                : skillId == SKILL_HERBALISM ? 1
+                                : skillId == SKILL_SKINNING  ? 2
+                                : skillId == SKILL_FISHING   ? 3
+                                                             : 4;
+            uint32 const order = (started % 3 == 2) ? orders[kind] : 0u;
+            if (!action.Start(nullptr, minutes, order ? 0 : skillId, error, order, order ? 10 : 0))
+            {
+                handler->PSendSysMessage("{} lvl {}: {}", bot->GetName(), bot->GetLevel(), error);
+                continue;
+            }
+            ++started;
+        }
+        handler->PSendSysMessage("{} bench missions started for {} min ({} bots taught a profession).", started,
+                                 minutes, taught);
         return true;
     }
 

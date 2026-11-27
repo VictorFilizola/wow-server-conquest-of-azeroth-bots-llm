@@ -29,6 +29,7 @@
 #include "SharedDefines.h"
 #include "SpellInfo.h"
 #include "CoaAiObjectContext.h"
+#include "CoaMissionMgr.h"
 #include "SpellMgr.h"
 #include "WarlockAiObjectContext.h"
 #include "WarriorAiObjectContext.h"
@@ -305,7 +306,24 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     bool const reborn = IsRebornBot(player);
 
     if (!player->InBattleground())
+    {
         engine->addStrategiesNoInit("racials", "chat", "default", "cast time", "potions", "duel", "boost", nullptr);
+        // Threat lead and assist on the tank's fight, which came from Dungeon Clear (CoaGardesMenaceStrategy).
+        engine->addStrategy("coa gardes menace", false);
+        // Regroup, room boss, Lyceum, Iron Hall, ground hazards and target exclusion guards (Dungeon Clear
+        // session's port).
+        engine->addStrategiesNoInit("coa gardes combat", "coa ground hazards", "coa target exclusion", nullptr);
+        // CoA Combat guards (src/Ai/Coa/Combat).
+        engine->addStrategy("coa combat escape leap", false);
+        engine->addStrategy("coa combat stuck combat", false);
+        engine->addStrategy("coa combat telegraph", false);
+        engine->addStrategy("coa combat pursuit stop", false);
+        // Only with its option on (restart): with it off, no bot evaluates its triggers.
+        if (sPlayerbotAIConfig.coaCombatCallOfTheGraveEnable)
+            engine->addStrategy("coa combat call of the grave", false);
+        // Group bursts kept for bosses in a group: a shaman's Bloodlust and Heroism, a CoA class burst (CoaBossLust).
+        engine->addStrategy("coa combat boss lust", false);
+    }
 
     // CoA: a grouped bot steps out of ground effects too, not only one a real player leads: in headless dungeon runs
     // (11/12/10) two bots stood in Ramstein's Venom Belch down to 19-24 % health.
@@ -429,7 +447,8 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
         // Random bots take a specialization from level 10; its role picks the rotation.
         EnsureCoaSpecialization(player);
         // Catch up on points earned before bots spent talents (or while this build was not live).
-        ApplyCoaTalents(player);
+        // Capped by AiPlayerbot.CoaLive.TalentsPerUpdate (0: all now, as before); the rest on its next updates.
+        ApplyCoaTalents(player, CoaTalentsPerUpdate());
         switch (GetCoaRole(player))
         {
             case CoaRole::Tank:
@@ -437,6 +456,9 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
                 break;
             case CoaRole::Heal:
                 engine->addStrategiesNoInit("coa heal", "dps assist", nullptr);
+                // A melee healer heals by hitting: on the tank's target, with the plain swing.
+                if (IsCoaMeleeHealer(player))
+                    engine->addStrategiesNoInit("close", "coa basic attack", nullptr);
                 break;
             default:
                 engine->addStrategiesNoInit(GetCoaStyle(player) == CoaStyle::Melee ? "coa" : "coa ranged",
@@ -460,12 +482,12 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
             sPlayerbotAIConfig.coaSpecRotations ? GetCoaSpecStrategyFor(player) : nullptr;
         if (coa)
         {
-            engine->addStrategy(coa->position, false);
+            engine->addStrategy(IsCoaMeleeHealer(player) ? "close" : coa->position, false);
             engine->addStrategy(coa->combat, false);
 
             // The plain swing. Every class strategy brings its own
             // NextAction("melee", ACTION_DEFAULT); `close` does not.
-            if (std::string_view(coa->position) == "close")
+            if (std::string_view(coa->position) == "close" || IsCoaMeleeHealer(player))
                 engine->addStrategy("coa basic attack", false);
         }
 
@@ -484,6 +506,10 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
 
     if (PlayerbotAI::IsHeal(player, true))
     {
+        // Healer placement and heal target guards that came from Dungeon Clear (CoaGardesSoins), for every healer
+        // outside battlegrounds and arenas (the guards themselves act in dungeons and raids only).
+        if (!player->InBattleground())
+            engine->addStrategy("coa gardes soins", false);
         if (sPlayerbotAIConfig.autoSaveMana)
             engine->addStrategy("save mana", false);
         if (!sPlayerbotAIConfig.IsRestrictedHealerDPSMap(player->GetMapId()))
@@ -586,6 +612,11 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
 {
     uint8 tab = GetPlayerSpecTab(player);
 
+    // CoA: out of a fight too: two bots died eating and resurrecting in Nightbane's Charred Earth after the kill
+    // (ladiabale, Karazhan 20/10), others ate in lava (Yeh, 21/10).
+    if (sPlayerbotAIConfig.autoAvoidAoe && (facade->HasGameClientMaster() || player->GetGroup()))
+        nonCombatEngine->addStrategy("avoid aoe", false);
+
     switch (player->getClass())
     {
         case CLASS_PRIEST:
@@ -674,10 +705,17 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
     {
         nonCombatEngine->addStrategiesNoInit("nc", "food", "chat", "follow", "default", "force rebuff", "quest", "loot",
                                             "gather", "duel", "pvp", "buff", "mount", "emote", nullptr);
+        nonCombatEngine->addStrategy("coa gardes menace nc", false);
+        nonCombatEngine->addStrategiesNoInit("coa gardes noncombat", "coa ground hazards", nullptr);
+        // CoA Combat guards (src/Ai/Coa/Combat).
+        nonCombatEngine->addStrategy("coa combat escape leap nc", false);
+        nonCombatEngine->addStrategy("coa combat stuck combat nc", false);
     }
 
     if (sPlayerbotAIConfig.autoSaveMana && PlayerbotAI::IsHeal(player, true))
         nonCombatEngine->addStrategy("save mana", false);
+    if (PlayerbotAI::IsHeal(player, true) && !player->InBattleground())
+        nonCombatEngine->addStrategy("coa gardes soins", false);
 
     if ((sRandomPlayerbotMgr.IsRandomBot(player)) && !player->InBattleground())
     {
@@ -800,6 +838,10 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
             nonCombatEngine->removeStrategy("mount", false);
         }
     }
+
+    // An alt on a gathering mission keeps its mission strategies through every reset.
+    if (!player->InBattleground() && sCoaMissionMgr.IsOnMission(player))
+        CoaMissionMgr::ApplyEngineStrategies(nonCombatEngine, sCoaMissionMgr.IsBench(player));
 }
 
 Engine* AiFactory::createNonCombatEngine(Player* player, PlayerbotAI* const facade, AiObjectContext* aiObjectContext)

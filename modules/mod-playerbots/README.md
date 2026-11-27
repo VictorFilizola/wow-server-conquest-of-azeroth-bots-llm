@@ -2,6 +2,9 @@
 > **This is the Conquest of Azeroth fork of mod-playerbots.** Build instructions, recommended settings and the current
 > status of the CoA bots are in **[README_COA.md](README_COA.md)**.
 
+> [!NOTE]
+> **News, new versions and support for the CoA bots: the SquidBots Discord, https://discord.gg/DTJceaG9Ky**
+
 <p align="center">
     <a href="https://github.com/mod-playerbots/mod-playerbots/blob/master/README.md">English</a>
     |

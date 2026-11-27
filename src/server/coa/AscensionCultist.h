@@ -7,6 +7,8 @@
 #include "TaskScheduler.h"
 #include <list>
 #include <set>
+#include <utility>
+#include <vector>
 class Player;
 class Spell;
 class Unit;
@@ -21,16 +23,20 @@ constexpr uint32 BlackBlood = 804153;
 constexpr uint32 CthunTentacle = 50272;
 constexpr uint32 MentalAssault = 801151;
 constexpr uint32 CthunDamage = 804999;
+constexpr uint32 PresenceOfNzoth = 803037;
+constexpr uint32 PresenceTentacleVisual = 889830;
+constexpr uint32 Thoughtseize = 806596;
 struct CultistState
 {
     EventMap timers;
     TaskScheduler scheduler;
     ObjectGuid covenant, tentacle;
     std::set<ObjectGuid> summons, dashHits;
+    std::vector<std::pair<int32, uint32>> embodimentGrants;
     Position dashPrevious;
     uint32 dashMs = 0, shockInsanity = 0;
     uint64 sequence = 0;
-    bool event = false, refreshing = false;
+    bool event = false, refreshing = false, hourOfTwilightCorruptMind = false;
 };
 Player* Owner(Unit const* unit);
 CultistState& State(Player* player);
@@ -51,13 +57,18 @@ std::list<Unit*> Allies(Player* player, Unit* center, float radius, uint32 count
 uint32 Highest(Player* player, uint32 root);
 void Reduce(Player* player, uint32 root, int32 milliseconds);
 void RestoreBlade(Player* player);
+void MarkVoidTouched(Player* player, Unit* healed);
 void SetHelper(Player* player, uint32 id, bool enabled);
 void SetAmount(Player* player, uint32 id, uint8 slot, int32 amount);
 void Accumulate(Player* player, Unit* target, uint32 id, uint32 total);
-void Summon(Player* player, uint32 entry, Position const& position, uint32 duration, Unit* target = nullptr);
+void GrantEmbodiment(Player* player, uint32 amount);
+void ExpireEmbodiment(Player* player, uint32 diff);
+void Summon(Player* player, uint32 entry, Position const& position, uint32 duration, Unit* target = nullptr,
+    uint32 spellId = 0);
 void Command(Player* player, Unit* target, bool blast = false);
 void StartDash(Player* player);
 void UpdateDash(Player* player, uint32 diff);
 void ApplyContracts(SpellInfo* info);
+void OverrideSpellVisual(Unit* unit, uint32 spell, uint32 visual);
 }
 #endif

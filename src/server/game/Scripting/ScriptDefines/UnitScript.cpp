@@ -60,6 +60,17 @@ void ScriptMgr::ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& damage)
     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_MELEE_DAMAGE, script->ModifyMeleeDamage(target, attacker, damage));
 }
 
+void ScriptMgr::ModifyMeleeDamageRange(Unit* target, Unit* attacker, float& minDamage, float& maxDamage)
+{
+    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_MELEE_DAMAGE_RANGE, script->ModifyMeleeDamageRange(target, attacker, minDamage, maxDamage));
+}
+
+void ScriptMgr::OnUnitUpdateRunSpeed(Unit* unit, int32& mainSpeedMod, float& stackBonus, float& nonStackBonus)
+{
+    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_UPDATE_RUN_SPEED,
+        script->OnUnitUpdateRunSpeed(unit, mainSpeedMod, stackBonus, nonStackBonus));
+}
+
 void ScriptMgr::ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo)
 {
     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN, script->ModifySpellDamageTaken(target, attacker, damage, spellInfo));
@@ -72,9 +83,9 @@ void ScriptMgr::ModifySpellEffectBaseValue(Unit const* caster, SpellInfo const* 
         script->ModifySpellEffectBaseValue(caster, spellInfo, effectIndex, value));
 }
 
-void ScriptMgr::ResolveSpellCast(Unit* caster, SpellInfo const*& spellInfo)
+void ScriptMgr::ResolveSpellCast(Unit* caster, SpellInfo const*& spellInfo, AuraEffect const* triggeredByAura)
 {
-    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_RESOLVE_SPELL_CAST, script->ResolveSpellCast(caster, spellInfo));
+    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_RESOLVE_SPELL_CAST, script->ResolveSpellCast(caster, spellInfo, triggeredByAura));
 }
 
 void ScriptMgr::ModifyHealReceived(Unit* target, Unit* healer, uint32& heal, SpellInfo const* spellInfo)
@@ -130,11 +141,16 @@ bool ScriptMgr::CanUnitAttack(Unit const* attacker, Unit const* target, SpellInf
     CALL_ENABLED_BOOLEAN_HOOKS(UnitScript, UNITHOOK_CAN_UNIT_ATTACK, !script->CanUnitAttack(attacker, target, spell));
 }
 
-Unit* ScriptMgr::SpellMagnetTarget(Unit* attacker, Unit* victim, SpellInfo const* spell)
+bool ScriptMgr::CanUnitAssist(Unit const* assister, Unit const* target, SpellInfo const* spell)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(UnitScript, UNITHOOK_CAN_UNIT_ASSIST, !script->CanUnitAssist(assister, target, spell));
+}
+
+Unit* ScriptMgr::SpellMagnetTarget(Unit* attacker, Unit* victim, SpellInfo const* spell, bool& ignoreM2Los)
 {
     Unit* result = nullptr;
     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_SPELL_MAGNET_TARGET,
-        if (!result) result = script->SpellMagnetTarget(attacker, victim, spell));
+        if (!result) result = script->SpellMagnetTarget(attacker, victim, spell, ignoreM2Los));
     return result;
 }
 

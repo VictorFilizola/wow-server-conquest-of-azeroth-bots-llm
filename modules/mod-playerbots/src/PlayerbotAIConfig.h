@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 enum class BotCheatMask : uint32
@@ -86,6 +87,9 @@ struct LevelBracketConfig
     uint8 pct = 0;
 };
 
+// AiPlayerbot.GuildBankDeposit.Items "boe": bind-on-equip gear the bot cannot wear (no item class is negative).
+static constexpr int32 GUILD_DEPOSIT_BOE = -2;
+
 class PlayerbotAIConfig
 {
 public:
@@ -98,7 +102,16 @@ public:
 
     bool Initialize();
     void LoadRandomBotLevelConfig();
+
+    // Code sessions: each one loads its own settings, in a file of its own, called by Initialize().
+    void LoadCoaLiveConfig();     // src/Ai/Coa/Social/CoaLiveConfig.cpp
+    void LoadCoaWorldConfig();    // src/Ai/Coa/World/CoaWorldConfig.cpp
+    void LoadCoaEconomyConfig();  // src/Ai/Coa/Economy/CoaEconomyConfig.cpp
+    void LoadCoaCombatConfig();   // src/Ai/Coa/Combat/CoaCombatConfig.cpp
+
     bool IsInRandomAccountList(uint32 id);
+    // "tradegoods,herb,7:9,5": item classes or class:subclass pairs, with a few names.
+    void LoadGuildBankDepositItems(std::string const& value);
     bool IsInRandomQuestItemList(uint32 id);
     bool IsPvpProhibited(uint32 zoneId, uint32 areaId);
     bool IsInPvpProhibitedZone(uint32 id);
@@ -170,6 +183,8 @@ public:
     uint32 minRandomBotChangeStrategyTime, maxRandomBotChangeStrategyTime;
     uint32 minRandomBotReviveTime, maxRandomBotReviveTime;
     uint32 minRandomBotTeleportInterval, maxRandomBotTeleportInterval;
+    // Whether the refresh at each random teleport empties the bags of the bots that are not self-found.
+    bool refreshClearsInventory;
     uint32 permanentlyInWorldTime;
     uint32 minRandomBotPvpTime, maxRandomBotPvpTime;
     uint32 randomBotsPerInterval;
@@ -319,6 +334,8 @@ public:
     uint32 randombotStartingLevel;
     bool enablePeriodicOnlineOffline;
     float periodicOnlineOfflineRatio;
+    bool onlineSelectionFollowPlayerLevels;
+    uint32 onlineSelectionLevelWindow;
     bool gearscorecheck;
     bool randomBotPreQuests;
     bool botSendMailEnabled;
@@ -403,15 +420,20 @@ public:
     bool autoLearnTradeskillSpells;
     bool coaClassesOnly;
     bool gatherOnlySkillUp;
+    float altLootMasterDistance;
     std::vector<uint32> excludedBotRaces;
     bool customRacesForBots;
     bool coaSpecRotations;
     uint32 coaHealerManaReserve;
     uint32 coaCasterManaReserve;
     bool coaGroupTelemetry;
+    bool coaGroupTelemetryRaids;
+    uint32 coaLogTargets;
+    uint32 coaReleaseDelay;
     bool coaSmartHeal;
     bool coaSmartTank;
     bool coaLfgMissingRoles;
+    bool lfgKeepRandomBots;
     bool coaHoldBehindTank;
     uint32 coaPlayersReplaceBots;
     uint32 coaPlayersReplaceBotsMin;
@@ -430,12 +452,38 @@ public:
     bool coaAvoidMarkedAlly;
     bool coaMeleeNoRangedHardcast;
     bool coaLootMakeRoom;
+    bool openChestsWithoutOrder;
+    // AiPlayerbot.Missions.*: gathering missions of the alts ("mission gather <minutes>" whispered to the bot).
+    bool missionsEnable;
+    uint32 missionsMaxMinutes;
+    uint32 missionsDefaultMinutes;
+    uint32 missionsMaxPerPlayer;
+    uint32 missionsMaxDeaths;
+    bool missionsTeleportFallback;
+    bool missionsTeleportToSpot;
+    bool missionsHighRisk;
+    uint32 missionsRiskMailEvery;
+    uint32 missionsRiskMailMinutes;
+    // Alts and the SquidBots Lite addon (CoaAltAddon).
+    bool altChatToAddon;
+    bool catchUpQuestChains;
+    // AiPlayerbot.AltDisenchant: the enchanter of the team (CoaEnchanter).
+    bool altDisenchant;
+    // AiPlayerbot.AltLootCompanion: the alts bring out a loot pet and leave it the corpses (CoaLootPetAction).
+    bool altLootCompanion;
+    // AiPlayerbot.CoaTotemRecall: bots of any class put their totems away after the fight (CoaTotemRecall).
+    bool coaTotemRecall;
+    // AiPlayerbot.GuildBankDeposit.*: bots of a real player's guild fill the guild bank near a guild vault.
+    bool guildBankDepositEnable;
+    std::vector<std::pair<int32, int32>> guildBankDepositItems;  // item class, subclass (-1 = all)
+    uint32 guildBankDepositKeepGold;
+    uint32 guildBankDepositMinStack;
+    uint32 guildBankDepositTab;  // 1-6, 0 = first tab where the bot may deposit
     bool coaAoeNoIdlePull;
     bool coaPvpTrinket;
     bool coaArenaPurge;
     bool coaBossKnowledge;
     bool coaRecruitSameFaction;
-    bool coaBotSurname;
     uint32 coaThreatHold;
     uint32 coaTankThreatBonus;
     bool coaAttackLoop;
@@ -468,16 +516,26 @@ public:
     bool coaStatusEnabled;
     std::set<uint32> coaExcludedSpecializations;
     std::set<uint32> coaOffensiveHealerSpecs;
+    std::set<uint32> coaMeleeHealerSpecs;
+    // Percent of their damage bots of a class or specialization deal (AiPlayerbot.CoaBotDamageByClass / BySpec).
+    std::unordered_map<uint32, uint32> coaBotDamagePctByClass;
+    std::unordered_map<uint32, uint32> coaBotDamagePctBySpec;
+    bool coaBotDamageVsPlayers = false;
+    uint32 zoneCrowdLimit;
     std::set<std::string> coaHealsExcluded;
     uint32 lootLogMinQuality;
     bool autoDoQuests;
     bool enableNewRpgStrategy;
     std::unordered_map<NewRpgStatus, uint32> RpgStatusProbWeight;
+    uint32 questMaxDropsPerPass;
     bool syncLevelWithPlayers;
     bool randomBotConcentrateInPlayerZone;
     bool autoLearnQuestSpells;
     bool autoTeleportForLevel;
     bool randomBotGroupNearby;
+    bool flyOnlyOutOfSight;
+    bool teleportOnlyOutOfSight;
+    bool standOffObjects;
     int32 enableRandomBotTrading;
     uint32 tweakValue;  // Debugging config
 
@@ -529,6 +587,25 @@ public:
             altMaintenanceGemsEnchants;
     int32 autoGearCommand, autoGearCommandAltBots, autoGearQualityLimit, autoGearScoreLimit;
     int32 autoGearBisCommand;
+    // Self-found: no bot is ever given gear it did not loot, earn or receive, and no level it did not earn.
+    bool coaSelfFound;
+    // Self-found applies up to this level; above it bots are geared and levelled as usual.
+    uint32 coaSelfFoundMaxLevel;
+    // Share (0-100 %, the launcher's self-found preset sets 20) of the random bots that are self-found on their own while the realm is geared as usual: from
+    // level 10 they keep the gear they loot, and Dungeon Clear sends groups of them through dungeons.
+    uint32 coaSelfFoundBotsPercent;
+    // Random bots show other gear models of their armor and weapon types: visual only, nothing saved.
+    bool randomBotTransmog;
+    uint32 randomBotTransmogPercent;
+    uint32 randomBotTransmogMinLevel;
+    uint32 randomBotTransmogCosmeticSets;
+    // Below this health (percent) the player main tank's enemies are no longer left to the player (0: never).
+    uint32 playerMainTankRescueHealth;
+    // A bot tank says in /say each order of the Main Tank bar it carries out (a failure stays in the bar).
+    bool coaTankOrdersSay;
+    // Bot gear rolls its random property or suffix like a looted item instead of the best one for the spec:
+    // 0 never, 1 random bots out in the world, 2 every bot.
+    uint32 gearRollRandomSuffix;
 
     uint32 useGroundMountAtMinLevel;
     uint32 useFastGroundMountAtMinLevel;
@@ -597,6 +674,176 @@ public:
     uint32 resetBotLevelPlayedTimeCheckFrequency;
     bool resetBotLevelIgnoreGuildWithRealPlayers;
     std::vector<std::string> resetBotLevelExcludeNames;
+
+    // ---- CoA Live, owned by the CoA SquidBot session (loaded by LoadCoaLiveConfig, CoaLiveConfig.cpp) ----
+    uint32 coaBotSurname;  // 0 none, 1 "Bot" (default), 2 a family name (CoaSurnameRules.h)
+    bool coaBotIdentify;  // AiPlayerbot.CoaBotIdentify: bots answer the addon's "WHO?" (CoaBotIdentify)
+    std::vector<std::string> coaBotSurnameList;  // AiPlayerbot.CoaBotSurnameList, never empty (default list)
+    // AiPlayerbot.CoaLive.*: bots react like people, from the bank of CoA IA MIND (CoaLive)
+    bool coaLiveEnable;
+    uint32 coaLiveTypoChance;
+    uint32 coaLiveAbbrevChance;
+    uint32 coaLiveRareChance;
+    uint32 coaLiveNoRepeatBot;
+    uint32 coaLiveNoRepeatChannel;
+    uint32 coaLiveTypingMsPerCharMin;
+    uint32 coaLiveTypingMsPerCharMax;
+    uint32 coaLiveGreetRange;
+    // AiPlayerbot.CoaLive.Sessions.*: the random bots come and go like players (CoaSessionRules.h)
+    bool coaLiveSessionsEnable;
+    bool coaLiveDataFileEnable;      // AiPlayerbot.CoaLive.DataFile.Enable: world.json for the dashboard
+    std::string coaLiveDataDir;      // AiPlayerbot.CoaDataDir (shared with the other sessions)
+    bool coaLiveDataFiles;           // AiPlayerbot.CoaDataFiles (shared: 0 stops every data file)
+    bool coaAltBags;  // AiPlayerbot.CoaAltBags.Enable: alt cmp|bags|sell|destroy for the addon (default 1)
+    bool coaPetsAutoBooks;        // AiPlayerbot.CoaPets.AutoBooks: alts use their class and craft books by themselves
+    bool coaSoulEnable;           // AiPlayerbot.CoaSoul.Enable (souls of the bots)
+    bool coaSoulAddon;            // AiPlayerbot.CoaSoul.Addon: SquidBots Lite asks a bot's soul (SQBW SOUL?)
+    std::string coaSoulWeights;   // AiPlayerbot.CoaSoul.Weights: lazy, quester, wanderer, trader, pvp
+    bool coaFreshStartEnable;  // AiPlayerbot.CoaFreshStart.Enable (launch of a new living realm)
+    bool coaCatchUpEnable;          // AiPlayerbot.CoaFreshStart.CatchUp.Enable (only with FreshStart)
+    uint32 coaCatchUpMarginLevels;  // AiPlayerbot.CoaFreshStart.CatchUp.MarginLevels
+    uint32 coaCatchUpStepPercent;   // AiPlayerbot.CoaFreshStart.CatchUp.StepPercent
+    float coaCatchUpMaxRate;        // AiPlayerbot.CoaFreshStart.CatchUp.MaxRate
+    uint32 coaCatchUpMinHumans;     // AiPlayerbot.CoaFreshStart.CatchUp.MinHumans
+    float coaCatchUpMaxTotalRate;   // AiPlayerbot.CoaFreshStart.CatchUp.MaxTotalRate (0: no cap)
+    uint32 coaCatchUpActiveDays;    // AiPlayerbot.CoaFreshStart.CatchUp.ActiveDays
+    std::vector<std::string> coaCatchUpServiceAccounts;  // AiPlayerbot.CoaFreshStart.CatchUp.ServiceAccounts (upper case)
+    bool coaCatchUpCountGameMasters;  // AiPlayerbot.CoaFreshStart.CatchUp.CountGameMasters (default 1)
+    bool coaLiveImmersionEnable;
+    uint32 coaLiveImmersionFishingPerThousand;  // AiPlayerbot.CoaLive.Immersion.FishingPerThousand  // AiPlayerbot.CoaLive.Immersion.Enable (L2 fishing)
+    bool coaLiveCleanWorldEnable;  // AiPlayerbot.CoaLive.CleanWorld.Enable
+    bool coaLiveSheathEnable;  // AiPlayerbot.CoaLive.Sheath.Enable (#11610)
+    uint32 coaLiveTradeMessagesPerMinute;  // AiPlayerbot.CoaLive.TradeMessagesPerMinute (0: the bank's own pace)
+    bool coaLiveNoAwayFlag;  // AiPlayerbot.CoaLive.NoAwayFlag: resting bots not shown <Away>
+    bool coaLiveChatEnable;  // AiPlayerbot.CoaLive.Chat.Enable: off, the bots write no CoA Live line (default 1)
+    bool coaLiveLegacyChat;  // AiPlayerbot.CoaLive.LegacyChat: the older lines speak with the living chat (default 0)
+    uint32 coaLiveHeavyRefreshPerTick;  // AiPlayerbot.CoaLive.HeavyRefreshPerTick (0: no budget)
+    bool coaLiveMaintenanceSpread;  // AiPlayerbot.CoaLive.MaintenanceSpread: level-up maintenance a step a second
+    bool coaLiveTrainerDedup;  // AiPlayerbot.CoaLive.TrainerDedup: each trainer's spell list walked once a round
+    uint32 coaLiveTalentsPerUpdate;  // AiPlayerbot.CoaLive.TalentsPerUpdate (0: all CoA talents at once)
+    bool coaLiveNightBankEnable;  // AiPlayerbot.CoaLive.NightBank.Enable (playerbots_coa_night_lines)
+    bool coaLiveDebugIgnoreRealPlayer;  // AiPlayerbot.CoaLive.Debug.IgnoreRealPlayer (hidden test key, bench only)
+    bool coaLiveCityEnable;  // AiPlayerbot.CoaLive.City.Enable (L2 City Life)
+    bool coaLiveSocialEnable;
+    uint32 coaLiveSocialInviteCooldownMinutes;  // AiPlayerbot.CoaLive.Social.InviteCooldownMinutes  // AiPlayerbot.CoaLive.Social.Enable (L2 social bots)
+    // Text emotes of the bots of a group with a real player, in 10 minutes (AiPlayerbot.CoaLive.GroupEmotes.*, 0: no cap).
+    uint32 coaLiveGroupEmotesPerBot;
+    uint32 coaLiveGroupEmotesPerGroup;
+    // Tank specializations bots play in normal dungeons only (AiPlayerbot.CoaTankNormalDungeonOnly).
+    std::set<uint32> coaTankNormalDungeonOnly;
+    bool coaLiveChannelQuestions;  // AiPlayerbot.CoaLive.ChannelQuestions.Enable: a bot answers open questions in channels
+    bool coaLivePlayerReplies;            // AiPlayerbot.CoaLive.PlayerReplies.Enable: bots answer what a player does
+    bool coaLiveDungeonChat;              // AiPlayerbot.CoaLive.DungeonChat.Enable: the group's bots talk in a dungeon
+    bool coaLiveGreetReplies;             // AiPlayerbot.CoaLive.GreetReplies.Enable: a hello back in /say and Zone
+    bool coaLiveLootNeedAsk;              // AiPlayerbot.CoaLive.LootNeedAsk.Enable: a bot asks before it Needs
+    uint32 coaLiveLootNeedAskPerDungeon;  // AiPlayerbot.CoaLive.LootNeedAsk.PerDungeon
+    float coaLiveLootNeedAskMinPct;       // AiPlayerbot.CoaLive.LootNeedAsk.MinUpgradePct
+    std::string coaLiveLootNeedAskTestPlayer;  // .TestPlayer: bench only, this character counts as a real player
+    std::string coaLiveLootNeedAskTestAnswer;  // .TestAnswer: bench only, its answer (yes, no, none)
+    uint32 coaLiveChannelClassAnswers;  // AiPlayerbot.CoaLive.ChannelQuestions.ClassAnswers: bots answering the class question
+    bool coaLiveHealRequest;       // AiPlayerbot.CoaLive.HealRequest.Enable: "heal please", the healers bring it to full
+    bool coaLiveCcRequest;         // AiPlayerbot.CoaLive.CcRequest.Enable: "cc please", one bot CCs the player's target
+    bool coaLiveTauntRequest;      // AiPlayerbot.CoaLive.TauntRequest.Enable: "taunt please", the tank taunts it
+    bool coaLiveWhisperEscape;     // AiPlayerbot.CoaLive.WhisperEscape.Enable: a long whisper talk ends on an excuse
+    bool coaKeySpells;             // AiPlayerbot.CoaKeySpells.Enable: the addon's key spells bar (keyspells, keepcd)
+    bool coaQuestLog;              // AiPlayerbot.CoaQuestLog.Enable: the addon's group Quests tab (qlog, turnin)
+    bool coaCursedFormUpkeep;      // AiPlayerbot.CoaCursedFormUpkeep: a Bloodmage Eternal tank keeps its Cursed Form
+    bool coaStartupCheckOnly = false;  // AiPlayerbot.StartupCheckOnly (or CoA.ValidationMode): load, no bot at all
+    bool coaCapsAddon = true;      // AiPlayerbot.CoaCaps.Addon: the addon's "CAPS?" (is Dungeon Clear built in)
+    // CoA Live 3.1.6
+    bool coaPetPassiveOnStay = true;  // AiPlayerbot.CoaPetPassiveOnStay: "stay" sets the bot's pets passive
+    bool coaHearthWithMaster = true;  // AiPlayerbot.CoaHearthWithMaster: the master's bots hearth with him
+    uint32 coaLiveCityPostChancePct = 25;   // AiPlayerbot.CoaLive.City.PostChancePct: a long post at a station
+    uint32 coaLiveCityPostMinMinutes = 20;  // AiPlayerbot.CoaLive.City.PostMinMinutes
+    uint32 coaLiveCityPostMaxMinutes = 60;  // AiPlayerbot.CoaLive.City.PostMaxMinutes
+    uint32 coaLiveCityFishingPct = 10;      // AiPlayerbot.CoaLive.City.FishingPct: a stop at the city's water
+    bool coaSelfFoundStarterWeapon = true;
+    bool coaSelfFoundRolls = true;     // AiPlayerbot.CoaSelfFound.Rolls: a self-found bot needs its upgrades, greeds the rest
+    bool coaSelfFoundRollLog = false;  // AiPlayerbot.CoaSelfFound.RollLog: each bot vote and simulated-dungeon gift logged  // AiPlayerbot.CoaSelfFound.StarterWeapon: once, for a bot with none
+    bool coaMute = true;       // AiPlayerbot.CoaMute.Enable: the addon's Mute button (CoaBotMute)
+    bool coaGiveToAlt = true;  // AiPlayerbot.CoaGiveToAlt.Enable: "give" an item from an alt to another (CoaAltGive)
+    bool coaTrust = true;      // AiPlayerbot.CoaTrust.Enable: the trust of a player in his bots (CoaTrust)
+    uint32 coaTrustKill = 1;        // AiPlayerbot.CoaTrust.Kill: points for a monster killed together
+    uint32 coaTrustBoss = 25;       // AiPlayerbot.CoaTrust.Boss: for a boss outside a raid
+    uint32 coaTrustRaidBoss = 100;  // AiPlayerbot.CoaTrust.RaidBoss: for a raid boss
+    std::string coaTrustRanks = "0,100,500,1500,4000,10000";  // AiPlayerbot.CoaTrust.Ranks: where each rank starts
+    bool coaLiveCitySquares = true;        // AiPlayerbot.CoaLive.City.Squares: bots on the capitals' squares (3.2.2)
+    uint32 coaLiveCitySquareMaxBots = 3;   // AiPlayerbot.CoaLive.City.SquareMaxBots: at most this many on one (1 to 3)
+    uint32 coaLivePvpStatsKeepDays = 30;  // AiPlayerbot.CoaLive.PvpStatsKeepDays: battleground stats kept (0: never purged)
+    bool coaLfgRolePriority = true;  // AiPlayerbot.CoaLfgRolePriority: a bot of the missing role queues first (3.2.1)
+    // ---- end of CoA Live ----
+
+    // ---- CoA World (LoadCoaWorldConfig, CoaWorldConfig.cpp) ----
+    // Most AiPlayerbot.CoaWorld.* are read by their own bricks (src/Ai/Coa/World).
+    // AiPlayerbot.CoaWorld.DpsTargetCache: the "dps target" value is kept for one AI pass (100 ms).
+    bool coaDpsTargetCache = false;
+    // AiPlayerbot.CoaWorld.SlowIdleTriggers: out of combat, an unforced bot checks its low-relevance triggers once a second.
+    bool coaSlowIdleTriggers = false;
+    // ---- end of CoA World ----
+
+    // ---- CoA Economy (LoadCoaEconomyConfig, CoaEconomyConfig.cpp) ----
+    // The auction house bot reads its own AiPlayerbot.CoaEconomy.* keys (Economy/AuctionHouse, Market, Launch).
+    // New rpg bots sell at vendors (Economy/Rpg/CoaRpgTrade): on/off, and the bag fill (%) that sends them there.
+    bool coaEconomyRpgSellEnable = false;
+    uint32 coaEconomyRpgSellBagPercent = 70;
+    // ---- end of CoA Economy ----
+
+    // ---- CoA Combat (LoadCoaCombatConfig, CoaCombatConfig.cpp) ----
+    // B2 breath guard outside a Dungeon Clear run (always on inside one).
+    bool coaCombatBreathGuardEnable = true;
+    // B3 stuck combat breaker outside a Dungeon Clear run (always on inside one), and its timeout in seconds (0 = off;
+    // DungeonClear.StuckCombatTimeout first when the player has it).
+    bool coaCombatStuckCombatEnable = false;
+    float coaCombatStuckCombatTimeoutSeconds = 15.0f;
+    // B4 combat purge outside a Dungeon Clear run (always on inside one), and its window in ms (no key of its own:
+    // DungeonClear.UnreachableCombatPurgeSecs when the player has it, else 60 s; 0 = off).
+    bool coaCombatCombatPurgeEnable = false;
+    uint32 coaCombatCombatPurgeWindowMs = 60000;
+    // B5 Sunken Temple, Avatar of Hakkar (vanilla-st) outside a Dungeon Clear run (always on inside one).
+    bool coaCombatSunkenTempleEnable = false;
+    // Telegraphs (Targorr): leave a listed ground marker that announces a hit. New everywhere, Dungeon Clear runs too.
+    bool coaCombatTelegraphEnable = false;
+    // Pursuit stop: no chase of a fleeing mob beyond 20 yd from the tank. New everywhere, Dungeon Clear runs too.
+    bool coaCombatPursuitStopEnable = false;
+    // Off-tank: a second tank takes the loose adds and never taunts what another tank holds.
+    bool coaCombatOffTankEnable = false;
+    // Gear score: item set bonuses and raid tokens count in the choice of gear (CoaGearScore).
+    bool coaCombatGearScoreEnable = false;
+    // At LootNeedRollLevel 2, how long a bot that wants an item waits for the real players to vote first (ms).
+    uint32 coaCombatLootNeedWaitMs = 20000;
+    // Lot 7: the session's Molten Core fixes (kill orders, burn phases, dodges; docs/MC-ETAT-3.0.md).
+    bool coaCombatMoltenCoreEnable = false;
+    // Lot 7: the session's Blackwing Lair fixes (drake tank swaps, Chromaggus, Dominion; docs/BWL-ETAT-3.0.md).
+    bool coaCombatBlackwingLairEnable = false;
+    // Lot 7: the session's Zul'Gurub fixes (Mandokir's gaze, Hakkar's heart and siphon, kill orders; docs/ZG-ETAT-3.0.md).
+    bool coaCombatZulGurubEnable = false;
+    // Lot 7: the session's Ahn'Qiraj fixes, AQ20 and AQ40 (Buru, Ossirian, Sartura; docs/AQ-ETAT-3.0.md).
+    bool coaCombatAhnQirajEnable = false;
+    // Loot Need refined: Need kept only for an upgrade of at least this many percent over the piece worn (0: off),
+    // and only on epic or better items (off).
+    float coaCombatLootNeedMinUpgradePct = 0.0f;
+    bool coaCombatLootNeedEpicOnly = false;
+    // Call of the Grave (Dire Maul West): the curse removed first, the melee out of its casters' 5 yd.
+    bool coaCombatCallOfTheGraveEnable = false;
+    // "The player leads" (docs/JOUEUR-MENE-3.0.md): the player's Main Tank bar comes first for the raid strategies'
+    // main tank, and the boss stand-down falls back to the boss flags outside a Dungeon Clear run.
+    bool coaCombatPlayerLedEnable = false;
+    // Bench only: the breath guard, stuck combat breaker, combat purge and Sunken Temple read their own key alone, also
+    // inside a Dungeon Clear run, so that a Dungeon Clear series compares key 0 with key 1.
+    bool coaCombatBenchKeyOnly = false;
+    // Body pull guard in a fight: an idle pack counts only if it would see the destination and the move brings the
+    // bot closer to it (CoaPullGuardSightRule), so ranged bots come out from behind walls. On by default: dungeon series
+    // SFK, BRD, Scholomance, 6 runs per arm, deaths 1 -> 0, ranged time out of sight 16.4 % -> 11.5 % of combat.
+    bool coaCombatPullGuardSightEnable = true;
+    // Its strict form: a step that stays as far from a pack but comes into its sight counts too.
+    bool coaCombatPullGuardSightStrict = false;
+    // Bot gear holds no PvP piece nobody can get (Grand Marshal's, High Warlord's; CoaGearPvp, CoaGearPvpRule).
+    bool coaCombatGearPvpSoldOnly = true;
+    // In a group, a bot keeps its group burst (Bloodlust, Heroism, a CoA class burst) for a boss: at the pull or under
+    // coaCombatLustBossHealthPct (CoaBossLust, CoaBossLustRule). 0 for the threshold: at the pull only.
+    bool coaCombatLustBossOnly = true;
+    uint32 coaCombatLustBossHealthPct = 30;
+    // ---- end of CoA Combat ----
 
 private:
     PlayerbotAIConfig() = default;

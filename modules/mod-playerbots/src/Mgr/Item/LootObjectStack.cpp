@@ -5,6 +5,9 @@
  */
 
 #include "LootObjectStack.h"
+#include "CoaLootPetAction.h"
+#include "CoaLootRules.h"
+#include "CoaMissionMgr.h"
 #include "GameObjectAI.h"
 #include "LootMgr.h"
 #include "Object.h"
@@ -117,7 +120,9 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
     Creature* creature = botAI->GetCreature(lootGUID);
     if (creature && creature->getDeathState() == DeathState::Corpse)
     {
-        if (creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
+        // An alt whose companion loots (AiPlayerbot.AltLootCompanion) leaves it the corpses within its reach.
+        if (creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE) &&
+            !CoaLeavesCorpseToCompanion(bot, creature, false))
             guid = lootGUID;
 
         if (creature->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE))
@@ -125,7 +130,8 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
             skillId = creature->GetCreatureTemplate()->GetRequiredLootSkill();
             uint32 targetLevel = creature->GetLevel();
             reqSkillValue = targetLevel < 10 ? 1 : targetLevel < 20 ? (targetLevel - 10) * 10 : targetLevel * 5;
-            if (botAI->HasSkill((SkillType)skillId) && bot->GetSkillValue(skillId) >= reqSkillValue)
+            if (botAI->HasSkill((SkillType)skillId) && bot->GetSkillValue(skillId) >= reqSkillValue &&
+                !(skillId == SKILL_SKINNING && CoaLeavesCorpseToCompanion(bot, creature, true)))
                 guid = lootGUID;
         }
 
@@ -338,6 +344,11 @@ bool LootObject::IsLootPossible(Player* bot)
     if (!worldObj)
         return false;
 
+    // A corpse picked farther off becomes the companion's once the alt walks within its reach.
+    if (Creature* corpse = worldObj->ToCreature())
+        if (CoaLeavesCorpseToCompanion(bot, corpse, false) && LootObject(bot, guid).IsEmpty())
+            return false;
+
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (!botAI)
     {
@@ -346,7 +357,17 @@ bool LootObject::IsLootPossible(Player* bot)
     if (reqItem && !bot->HasItemCount(reqItem, 1))
         return false;
 
-    if (abs(worldObj->GetPositionZ() - bot->GetPositionZ()) > INTERACTION_DISTANCE - 2.0f)
+    // Alts ran alone to corpses and nodes up to 100 yards off, jumped off ships for them, and went back at once after
+    // a regroup (Discord, Maky): an alt that follows a player loots only near that player, never while the player
+    // rides a transport or a flight path. A target the player left behind stops being possible, so the alt drops it.
+    Player* master = botAI->GetMaster();
+    if (master && master != bot && !GET_PLAYERBOT_AI(master) && !sRandomPlayerbotMgr.IsRandomBot(bot) &&
+        (master->GetTransport() || master->IsInFlight() || !master->IsInMap(worldObj) ||
+         master->GetDistance(worldObj) > sPlayerbotAIConfig.altLootMasterDistance) &&
+        !sCoaMissionMgr.IsOnMission(bot))
+        return false;
+
+    if (!LootHeightReachable(worldObj->GetPositionZ() - bot->GetPositionZ(), bot->GetExactDist2d(worldObj)))
         return false;
 
     Creature* creature = botAI->GetCreature(guid);
@@ -384,6 +405,18 @@ bool LootObject::IsLootPossible(Player* bot)
     if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !go->ActivateToQuest(bot))
         return false;
 
+    // A bot without a player master whose bags are over 80 % full gathered a herb, ore or skin, could not
+    // pick it up and gathered it again for ever. Alts that follow a player stop only once no slot is left.
+    bool const gatheringObject = skillId == SKILL_HERBALISM || skillId == SKILL_MINING ||
+                                 skillId == SKILL_SKINNING || skillId == SKILL_ENGINEERING;
+    if (gatheringObject)
+    {
+        bool const hasActivePlayerMaster = master && !GET_PLAYERBOT_AI(master);
+        uint8 const bagSpace = botAI->GetAiObjectContext()->GetValue<uint8>("bag space")->Get();
+        if (bagSpace >= 100 || (!hasActivePlayerMaster && bagSpace > 80))
+            return false;
+    }
+
     // A chest that stays and rolls new loot for every opener (worldforged pickups) is opened once: under
     // group loot rules each opening started a new roll, so the party drew its item again and again.
     if (go && HasOpened(bot, go) && !NeedsQuestItemFrom(bot, go))
@@ -391,8 +424,10 @@ bool LootObject::IsLootPossible(Player* bot)
 
     // Loot already rolled that holds nothing this bot may take: a worldforged pickup it has spent is
     // still there for everyone else, and the bot opened it again and again for ever
-    // (jealous-sound/azerothcore-wotlk-coa#5519).
-    if (go && !go->loot.empty() && !go->loot.gold)
+    // (jealous-sound/azerothcore-wotlk-coa#5519). Not a chest that rolls its loot again for the next opener: what it
+    // holds is the last opener's, and an alt right behind its player never took its own worldforged pickup.
+    if (go && !go->loot.empty() && !go->loot.gold &&
+        CoaHeldLootIsWhatOpenerGets(go->getLootState() == GO_READY, go->GetGOInfo()->GetLootId()))
     {
         bool takeable = false;
         for (LootItem const& item : go->loot.items)

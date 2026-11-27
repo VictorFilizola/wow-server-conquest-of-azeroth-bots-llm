@@ -9,7 +9,8 @@
 namespace AscensionStockScriptShapes
 {
 static_assert(EFFECT_APPLY_AURA == SPELL_EFFECT_APPLY_AURA && EFFECT_SCRIPT_EFFECT == SPELL_EFFECT_SCRIPT_EFFECT &&
-    EFFECT_LEARN_SPELL == SPELL_EFFECT_LEARN_SPELL && EFFECT_TRIGGER_SPELL == SPELL_EFFECT_TRIGGER_SPELL &&
+    EFFECT_SUMMON == SPELL_EFFECT_SUMMON && EFFECT_LEARN_SPELL == SPELL_EFFECT_LEARN_SPELL &&
+    EFFECT_TRIGGER_SPELL == SPELL_EFFECT_TRIGGER_SPELL &&
     EFFECT_SUMMON_OBJECT_WILD == SPELL_EFFECT_SUMMON_OBJECT_WILD && EFFECT_DUMMY == SPELL_EFFECT_DUMMY &&
     EFFECT_SCHOOL_DAMAGE == SPELL_EFFECT_SCHOOL_DAMAGE && EFFECT_INSTAKILL == SPELL_EFFECT_INSTAKILL);
 static_assert(AURA_DUMMY == SPELL_AURA_DUMMY && AURA_MOD_CHARM == SPELL_AURA_MOD_CHARM &&
@@ -32,6 +33,10 @@ static_assert(TARGET_UNIT_CASTER == ::TARGET_UNIT_CASTER && TARGET_UNIT_TARGET_E
 
 namespace
 {
+constexpr uint32 SPELL_SUPPRESSION_AURA = 22247;
+constexpr uint32 DURATION_PERMANENT = 21;
+constexpr uint32 DURATION_SIX_SECONDS = 32;
+
 std::unordered_map<uint32, std::vector<Restore const*>> const& RestoresBySpell()
 {
     static std::unordered_map<uint32, std::vector<Restore const*>> const bySpell = []
@@ -88,5 +93,11 @@ void ApplyAscensionStockScriptShapes(SpellInfo* spellInfo)
         if (Matches(restore->Broken, int32(effect.Effect), int32(effect.ApplyAuraName),
             int32(effect.TargetA.GetTarget())))
             Apply(effect, restore->Stock);
+    }
+    if (spellInfo->Id == SPELL_SUPPRESSION_AURA)
+    {
+        if (spellInfo->DurationEntry && spellInfo->DurationEntry->ID == DURATION_PERMANENT)
+            spellInfo->DurationEntry = sSpellDurationStore.LookupEntry(DURATION_SIX_SECONDS);
+        spellInfo->AttributesEx3 &= ~SPELL_ATTR3_DOT_STACKING_RULE;
     }
 }

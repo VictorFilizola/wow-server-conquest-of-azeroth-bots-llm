@@ -10,6 +10,10 @@
 
 #include "RandomBotLevelMgr.h"
 #include "ArenaTeamMgr.h"
+#include "CharacterCache.h"
+#include "Group.h"
+#include "CoaMissionMgr.h"
+#include "CoaLevelBracketRules.h"
 #include "DatabaseEnv.h"
 #include "LFGMgr.h"
 #include "Log.h"
@@ -27,6 +31,24 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+
+namespace
+{
+// A random bot in the group of a player (a recruit, a guild party): the player chose it at its level, so the level
+// resets leave it alone while it is there (a raid's bots fell back from 60, a47). Read from the group's slots, so a
+// player offline still counts.
+bool InPlayersGroup(Player* bot)
+{
+    Group* group = bot ? bot->GetGroup() : nullptr;
+    if (!group)
+        return false;
+    for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        if (slot.guid != bot->GetGUID() &&
+            !sPlayerbotAIConfig.IsInRandomAccountList(sCharacterCache->GetCharacterAccountIdByGuid(slot.guid)))
+            return true;
+    return false;
+}
+}  // namespace
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -143,7 +165,7 @@ static bool IsBotSafeForLevelReset(Player* bot)
     if (!bot || !bot->GetSession() || bot->GetSession()->isLogingOut() || bot->IsDuringRemoveFromWorld())
         return false;
 
-    if (RandomBotLevelMgr::IsHeld(bot->GetGUID()))
+    if (RandomBotLevelMgr::IsHeld(bot->GetGUID()) || PlayerbotFactory::IsSelfFoundBot(bot))
         return false;
 
     if (!bot->IsInWorld())
@@ -369,6 +391,9 @@ int RandomBotLevelMgr::GetLevelRangeIndex(uint8 level, TeamId team)
 // be resized on a config reload.
 void RandomBotLevelMgr::AdjustBotToRange(Player* bot, int targetRangeIndex, TeamId team)
 {
+    // A bot on a gathering mission keeps its level and its place until the mission ends.
+    if (sCoaMissionMgr.IsOnMission(bot))
+        return;
     if (!bot || !bot->IsInWorld() || !bot->GetSession() || bot->GetSession()->isLogingOut() ||
         bot->IsDuringRemoveFromWorld())
         return;
@@ -734,6 +759,15 @@ void RandomBotLevelMgr::RunLevelBracketsDistribution()
             }
         }
 
+        // CoA 3.2: a bracket weighs its width in levels (CoaLevelBracketRules): 50-54 and 55-59 no longer get two
+        // shares between them, the max level alone keeps a full one.
+        for (uint8 i = 0; i < _numRanges; ++i)
+        {
+            allianceWeights[i] *= CoaLevelBracketRules::WidthFactor(_allianceRanges[i].lower, _allianceRanges[i].upper,
+                                                                    sPlayerbotAIConfig.randomBotMaxLevel);
+            hordeWeights[i] *= CoaLevelBracketRules::WidthFactor(_hordeRanges[i].lower, _hordeRanges[i].upper,
+                                                                 sPlayerbotAIConfig.randomBotMaxLevel);
+        }
         ApplyBracketWeights(_allianceRanges, allianceWeights);
         ApplyBracketWeights(_hordeRanges, hordeWeights);
 
@@ -764,6 +798,9 @@ void RandomBotLevelMgr::RunLevelBracketsDistribution()
         if (IsNameInExcludeList(player, sPlayerbotAIConfig.levelBracketsExcludeNames))
             continue;
         if (IsHeld(player->GetGUID()))
+            continue;
+        // A self-found random bot keeps the level it earned: no bracket moves it.
+        if (PlayerbotFactory::IsSelfFoundBot(player))
             continue;
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
@@ -928,6 +965,8 @@ uint8 RandomBotLevelMgr::ComputeResetChance(uint8 level) const
 // whichever is higher) via a full PlayerbotFactory randomize.
 void RandomBotLevelMgr::ResetBot(Player* player, uint8 currentLevel)
 {
+    if (sCoaMissionMgr.IsOnMission(player))
+        return;
     uint8 levelToResetTo = sPlayerbotAIConfig.resetBotLevelResetTo;
 
     uint8 dkMinLevel = static_cast<uint8>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL));
@@ -951,6 +990,8 @@ void RandomBotLevelMgr::ResetBot(Player* player, uint8 currentLevel)
 // level, whichever is higher) via a full PlayerbotFactory randomize.
 void RandomBotLevelMgr::SkipBotLevel(Player* player, uint8 currentLevel)
 {
+    if (sCoaMissionMgr.IsOnMission(player))
+        return;
     uint8 levelToSkipTo = sPlayerbotAIConfig.resetBotLevelSkipTo;
 
     uint8 dkMinLevel = static_cast<uint8>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL));
@@ -1028,6 +1069,10 @@ void RandomBotLevelMgr::RunResetPlayedTimeCheck()
 
 void RandomBotLevelMgr::Update(uint32 diff)
 {
+    // Self-found: no level bracket nor level reset moves a bot, it levels by playing only.
+    if (sPlayerbotAIConfig.coaSelfFound)
+        return;
+
     if (sPlayerbotAIConfig.levelBracketsEnabled)
     {
         _bracketsTimer += diff;
@@ -1060,7 +1105,13 @@ void RandomBotLevelMgr::Update(uint32 diff)
 
 void RandomBotLevelMgr::OnBotLogin(Player* player)
 {
+    if (sPlayerbotAIConfig.coaSelfFound)
+        return;
+
     if (!sRandomPlayerbotMgr.IsRandomBot(player))
+        return;
+
+    if (InPlayersGroup(player))
         return;
 
     if (IsNameInExcludeList(player, sPlayerbotAIConfig.resetBotLevelExcludeNames))
@@ -1113,7 +1164,13 @@ void RandomBotLevelMgr::OnBotLogin(Player* player)
 
 void RandomBotLevelMgr::OnBotLevelChanged(Player* player, uint8 oldLevel)
 {
+    if (sPlayerbotAIConfig.coaSelfFound)
+        return;
+
     if (!sRandomPlayerbotMgr.IsRandomBot(player))
+        return;
+
+    if (InPlayersGroup(player))
         return;
 
     // Only react to a natural level up.

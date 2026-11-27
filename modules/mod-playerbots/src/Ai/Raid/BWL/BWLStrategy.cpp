@@ -29,6 +29,8 @@ void RaidBwlStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
         NextAction("rear flank", ACTION_MOVE + 4) }));
     triggers.push_back(new TriggerNode("bwl vaelastrasz burning adrenaline", {
         NextAction("bwl vaelastrasz move away", ACTION_RAID + 5) }));
+    triggers.push_back(new TriggerNode("bwl vaelastrasz tank swap", {
+        NextAction("bwl vaelastrasz tank swap", ACTION_RAID + 2) }));
 
     triggers.push_back(new TriggerNode("bwl broodlord fire resistance", {
         NextAction("bwl broodlord fire resistance", ACTION_RAID) }));
@@ -46,6 +48,24 @@ void RaidBwlStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
     triggers.push_back(new TriggerNode("bwl flamegor not victim", {
         NextAction("bwl flamegor avoid breath", ACTION_MOVE + 4) }));
 
+    triggers.push_back(new TriggerNode("bwl chromaggus fire resistance", {
+        NextAction("bwl chromaggus fire resistance", ACTION_RAID) }));
+
+    // CoA Combat (lot 7, docs/BWL-ETAT-3.0.md): drake tank swaps (F1, E1), Chromaggus (C1, C2).
+    triggers.push_back(new TriggerNode("bwl firemaw tank swap", {
+        NextAction("bwl firemaw tank swap", ACTION_RAID + 2) }));
+    triggers.push_back(new TriggerNode("bwl ebonroc tank swap", {
+        NextAction("bwl ebonroc tank swap", ACTION_RAID + 2) }));
+    triggers.push_back(new TriggerNode("bwl chromaggus positioning", {
+        NextAction("bwl chromaggus rear flank", ACTION_MOVE + 4) }));
+    triggers.push_back(new TriggerNode("bwl chromaggus red affliction", {
+        NextAction("bwl chromaggus cure red", ACTION_RAID + 1) }));
+    // CoA Combat (C4, P1-a, G2): out of the ground patches; the Combustion carrier alone.
+    triggers.push_back(new TriggerNode("bwl ground effect", {
+        NextAction("bwl move from ground effect", ACTION_RAID + 1) }));
+    triggers.push_back(new TriggerNode("bwl flamegor combustion", {
+        NextAction("bwl flamegor combustion move away", ACTION_RAID + 1) }));
+
     triggers.push_back(new TriggerNode("bwl affliction bronze", {
         NextAction("bwl use hourglass sand", ACTION_RAID) }));
 
@@ -62,17 +82,28 @@ void RaidBwlStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 
 void RaidBwlStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
 {
+    multipliers.push_back(new RazorgorePossessionMultiplier(botAI));
     multipliers.push_back(new RazorgoreTankMultiplier(botAI));
     multipliers.push_back(new VaelastraszTankMultiplier(botAI));
     multipliers.push_back(new VaelastraszBurningAdrenalineMultiplier(botAI));
+    multipliers.push_back(new BwlDrakeTauntHoldMultiplier(botAI));
+    multipliers.push_back(new BwlDominionCloneAoeMultiplier(botAI));
 }
 
 void RaidBwlStrategy::AppendTargetExclusions(GuidSet& exclusions, TargetValueExclusionType type)
 {
+    AiObjectContext* context = botAI->GetAiObjectContext();
+
+    // CoA Nefarian: nobody attacks Dominion's Shadow Clones or a raid member Nefarius holds.
+    for (ObjectGuid const guid : AI_VALUE(GuidVector, "attackers"))
+    {
+        if (BlackwingLairHelpers::IsNefarianDoNotAttackTarget(botAI->GetUnit(guid)))
+            exclusions.insert(guid);
+    }
+
     if (type != TargetValueExclusionType::TankTarget)
         return;
 
-    AiObjectContext* context = botAI->GetAiObjectContext();
     if (Unit* broodlord = AI_VALUE2(Unit*, "find target", "broodlord lashlayer"))
     {
         Unit* bossVictim = broodlord->GetVictim();
@@ -101,6 +132,27 @@ void RaidBwlStrategy::AppendTargetExclusions(GuidSet& exclusions, TargetValueExc
             {
                 Unit* unit = botAI->GetUnit(guid);
                 if (BlackwingLairHelpers::IsCorruptedWhelp(unit))
+                    exclusions.insert(guid);
+            }
+        }
+    }
+
+    if (Unit* nefarian = AI_VALUE2(Unit*, "find target", "nefarian"))
+    {
+        // The tank holding Nefarian ignores everything else, e.g. the Bone Constructs he raises at 20%.
+        // While no tank holds him (tank died), the main tank, or the first living assist tank, takes him.
+        Player* bot = botAI->GetBot();
+        Unit* bossVictim = nefarian->GetVictim();
+        Player* bossVictimPlayer = bossVictim ? bossVictim->ToPlayer() : nullptr;
+        bool const tankHoldsBoss = bossVictimPlayer && PlayerbotAI::IsTank(bossVictimPlayer);
+        Unit* mainTank = botAI->GetUnit(PlayerbotAI::GetMainTankGuid(bot->GetGroup()));
+        bool const isFallbackTank = mainTank && mainTank->IsAlive() ? PlayerbotAI::IsMainTank(bot)
+                                                                    : PlayerbotAI::IsAssistTankOfIndex(bot, 0, true);
+        if (bossVictim == bot || (!tankHoldsBoss && isFallbackTank))
+        {
+            for (ObjectGuid const guid : AI_VALUE(GuidVector, "attackers"))
+            {
+                if (guid != nefarian->GetGUID())
                     exclusions.insert(guid);
             }
         }

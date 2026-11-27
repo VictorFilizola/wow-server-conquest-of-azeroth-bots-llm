@@ -1,5 +1,6 @@
 /* Copyright (C) 2016+ AzerothCore, GNU AGPL v3. */
 #include "AscensionVenomancer.h"
+#include "AscensionIncarnation.h"
 #include "AscensionVenomancerData.h"
 #include "CellImpl.h"
 #include "DynamicObject.h"
@@ -258,11 +259,12 @@ void Expose(Player* player, uint32 stacks, bool molt)
     else if (Aura* added = player->AddAura(Exposed, player))
         added->SetStackAmount(after);
     uint32 applied = Count(player, Exposed);
-    if (applied > current && player->HasAura(CharmOfWarding))
+    uint32 healedStacks = applied > current ? applied - current : (molt ? 0 : 1);
+    if (healedStacks && player->HasAura(CharmOfWarding))
     {
-        SpellInfo const* talent = sSpellMgr->GetSpellInfo(CharmOfWarding);
-        HealInfo heal(player, player, player->CountPctFromMaxHealth((applied - current) * Amount(CharmOfWarding)),
-            talent, talent->GetSchoolMask());
+        SpellInfo const* logged = sSpellMgr->GetSpellInfo(ExposedFleshHeal);
+        HealInfo heal(player, player, player->CountPctFromMaxHealth(healedStacks * Amount(CharmOfWarding)),
+            logged, logged->GetSchoolMask());
         player->HealBySpell(heal);
     }
     if (!molt)
@@ -283,7 +285,7 @@ void ReducePercent(Player* player, uint32 root, int32 percent)
             player->ModifySpellCooldown(pair.first, -int32(CalculatePct(
                 player->GetSpellCooldownDelay(pair.first), std::clamp(percent, 0, 100))));
 }
-void ExtendOwned(Player* player, Unit* target, uint32 root, int32 milliseconds)
+void ExtendOwned(Player* player, Unit* target, uint32 root, int32 milliseconds, bool extendTicks)
 {
     for (auto const& pair : target->GetAppliedAuras())
     {
@@ -291,7 +293,9 @@ void ExtendOwned(Player* player, Unit* target, uint32 root, int32 milliseconds)
         if (aura->GetCasterGUID() != player->GetGUID() || !Named(aura->GetSpellInfo(), root) || aura->GetDuration() <= 0)
             continue;
         int32 duration = int32(std::clamp<int64>(int64(aura->GetDuration()) + milliseconds, 0, INT32_MAX));
-        aura->SetMaxDuration(std::max(aura->GetMaxDuration(), duration));
+        int32 maxDuration = extendTicks ?
+            int32(std::clamp<int64>(int64(aura->GetMaxDuration()) + milliseconds, 0, INT32_MAX)) : duration;
+        aura->SetMaxDuration(std::max(aura->GetMaxDuration(), maxDuration));
         aura->SetDuration(duration);
         return;
     }
@@ -350,7 +354,8 @@ void ApplyVenoms(Player* player, Unit* target, bool fromSpiderling)
 }
 void UpdateSpiderLordDisplay(Player* player)
 {
-    bool spiderLord = player->HasAura(Beetle) && player->HasAura(SpiderLord);
+    bool spiderLord = player->HasAura(Beetle) && player->HasAura(SpiderLord) &&
+        !AscensionIncarnation::HasActiveFormIncarnation(player);
     uint32 beetleDisplay = player->GetModelForForm(player->GetShapeshiftForm(), Beetle);
     if (spiderLord && beetleDisplay && player->GetDisplayId() == beetleDisplay)
     {
@@ -406,9 +411,9 @@ void Refresh(Player* player)
     {
         bool enabled = player->HasAura(talent) || player->HasSpell(talent);
         if (enabled && !player->HasSpell(active))
-            player->learnSpell(active, true);
+            player->learnSpell(active);
         else if (!enabled)
-            player->removeSpell(active, SPEC_MASK_ALL, true);
+            player->removeSpell(active, SPEC_MASK_ALL, false);
     }
     bool widowsKiss = player->HasAura(807600);
     for (auto [root, replacement, known, enabled] : {std::tuple(800880u,504705u,widowsKiss,

@@ -12,9 +12,16 @@
 bool InvalidTargetValue::Calculate()
 {
     Unit* target = AI_VALUE(Unit*, qualifier);
-    Unit* enemy = AI_VALUE(Unit*, "enemy player target");
-    if (target && enemy && target == enemy && target->IsAlive())
-        return false;
+    // CoA Combat (perf, a46): no target, or one that is not a player, can never be the enemy player target, so that
+    // value is only asked for a player (same answer, without the "enemy player" search on every tick).
+    if (!target)
+        return true;
+    if (target->IsPlayer())
+    {
+        Unit* enemy = AI_VALUE(Unit*, "enemy player target");
+        if (enemy && target == enemy && target->IsAlive())
+            return false;
+    }
 
     if (target && qualifier == "current target")
     {
@@ -22,7 +29,12 @@ bool InvalidTargetValue::Calculate()
                target->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE) || target->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE_2) ||
                // A feared creature is hit like any other: the bots dropped it as their target and let
                // it run, and CoA puts fear on many rotations (reported in game, 27/09).
-               !target->IsVisible() || !target->IsAlive() || target->IsPolymorphed() || target->IsCharmed() ||
+               !target->IsVisible() || !target->IsAlive() || target->IsPolymorphed() ||
+               // Only a mind-controlled teammate (same raid or same original team) is off limits; enemy charmed
+               // units can be fought.
+               (target->IsCharmed() && target->IsPlayer() &&
+                (bot->IsInSameRaidWith(target->ToPlayer()) ||
+                 target->ToPlayer()->GetTeamId(true) == bot->GetTeamId(true))) ||
                target->HasUnitState(UNIT_STATE_ISOLATED) || target->IsFriendlyTo(bot) ||
                !(sPlayerbotAIConfig.coaKeepTargetOutOfSight ? AttackersValue::IsPossibleTarget(target, bot)
                                                              : AttackersValue::IsValidTarget(target, bot));

@@ -11,7 +11,9 @@ All live configuration files live under `env/dist/etc/`. Docker bind-mounts this
 | `env/dist/etc/coa.conf` | **Conquest of Azeroth core:** class models, progression, plaintext world headers, scaling, rulesets |
 | `env/dist/etc/worldserver.conf` | **Core World Server:** max level (80), drop rates, ports, packet rates |
 | `env/dist/etc/authserver.conf` | **Auth Server:** login realm port (3724), database credentials |
-| `env/dist/etc/modules/playerbots.conf` | **AI Companions & Alt-Squad:** bot count, alt bot behavior, quest sync |
+| `env/dist/etc/modules/playerbots.conf` | **AI Companions & Alt-Squad:** bot count, alt bot behavior, quest sync, living-world economy |
+| `env/dist/etc/modules/mod_dungeon_clear.conf` | **Dungeon Clear (`v3.3.0`):** automated tank-bot dungeon clearing, pull modes, rest thresholds |
+| `env/dist/etc/modules/CFBG.conf` | **Cross-Faction Battlegrounds:** mixed-faction queue matching & team balancing |
 | `env/dist/etc/modules/mod_llm_chatter.conf` | **LLM Roleplay:** DeepSeek / OpenRouter API keys, model selection, trigger rates |
 | `env/dist/etc/modules/transmog.conf` | **Transmog:** visual rules, class/level restrictions, copper cost |
 | `env/dist/etc/modules/AutoBalance.conf` | **Instance Scaling:** 5-man raid scaling, dynamic HP/damage multipliers |
@@ -48,7 +50,7 @@ The heart of the solo companion experience:
 - `AiPlayerbot.KeepAltsInGroup = 1` — Automatically keeps your alternate characters in your party when you invite them.
 - `AiPlayerbot.SummonWhenGroup = 1` — Teleports your alt bot directly to your side upon grouping up.
 - `AiPlayerbot.SyncQuestWithPlayer = 1` — Bots auto-accept and auto-complete your quests when you hand them in.
-- `AiPlayerbot.MinRandomBots = 2500` / `AiPlayerbot.MaxRandomBots = 2500` — Random bots populating the world.
+- `AiPlayerbot.MinRandomBots = 500` / `AiPlayerbot.MaxRandomBots = 500` — Random bots populating the world.
 - `AiPlayerbot.RandomBotMinLevel = 1` / `AiPlayerbot.RandomBotMaxLevel = 80` — Level range of roaming bots.
 
 ### In-Game Bot Commands:

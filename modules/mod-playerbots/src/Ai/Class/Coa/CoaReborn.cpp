@@ -2,7 +2,9 @@
 
 #include "AscensionCoATalentState.h"
 #include "AscensionFreepick.h"
+#include "AscensionMysticEnchant.h"
 #include "AscensionWarcraftRebornRules.h"
+#include "CoaDbCheck.h"
 #include "Config.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
@@ -38,6 +40,7 @@ struct SpecBuild
     WcrRole Role = WcrRole::MeleeDps;
     uint32 PrimaryStat = 0;
     std::vector<AscensionFreepick::GuideSpell> Spells;
+    std::vector<AscensionMysticEnchant::GuideEnchant> Enchants;
 };
 
 using ClassBuilds = std::array<SpecBuild, SPEC_COUNT>;
@@ -120,6 +123,16 @@ std::shared_ptr<Builds const> ReadBuilds()
             }
         }
 
+    // A missing or old table would abort the server on the query: the guide rows and the enchants are left out
+    // (the bots keep the default specs, as with an empty table), one error line says so, the server starts.
+    bool const buildsTable = CoaDbCheck::Require(
+        "Warcraft Reborn builds", "playerbots_coa_wcr_builds",
+        {"class", "spec", "role", "spec_name", "primary_stat", "spell_id", "level", "ord"});
+    bool const enchantsTable = CoaDbCheck::Require("Warcraft Reborn enchants", "playerbots_coa_wcr_enchants",
+                                                          {"class", "spec", "spell", "stacks", "level", "ord"});
+    if (!buildsTable)
+        return builds;
+
     QueryResult result = PlayerbotsDatabase.Query(
         "SELECT class, spec, role, spec_name, primary_stat, spell_id, level FROM playerbots_coa_wcr_builds "
         "ORDER BY class, spec, ord");
@@ -149,6 +162,20 @@ std::shared_ptr<Builds const> ReadBuilds()
         if (uint32 const spellId = fields[5].Get<uint32>())
             build.Spells.push_back({ spellId, fields[6].Get<uint8>() });
     } while (result->NextRow());
+
+    if (!enchantsTable)
+        return builds;
+    if (QueryResult enchants = PlayerbotsDatabase.Query(
+            "SELECT class, spec, spell, stacks, level FROM playerbots_coa_wcr_enchants ORDER BY class, spec, ord"))
+        do
+        {
+            Field* fields = enchants->Fetch();
+            auto const found = builds->find(fields[0].Get<uint8>());
+            uint8 const spec = fields[1].Get<uint8>();
+            if (found != builds->end() && spec < SPEC_COUNT)
+                found->second[spec].Enchants.push_back(
+                    { fields[2].Get<uint32>(), std::max<uint32>(1, fields[3].Get<uint8>()), fields[4].Get<uint8>() });
+        } while (enchants->NextRow());
     return builds;
 }
 
@@ -574,6 +601,10 @@ bool ApplyWcrBuild(Player* bot)
                               std::to_string(result.Rank));
     }
     AscensionFreepick::Synchronize(bot);
+    // Mystic Enchants as players set them at an altar, from the tree's list (playerbots_coa_wcr_enchants): the bot is
+    // taught the ones it lacks, then the core fills its slots in list order within its level and quality limits.
+    if (!build->Enchants.empty() && sConfigMgr->GetOption<bool>("AiPlayerbot.CoaWcrMysticEnchants", true))
+        AscensionMysticEnchant::ApplyGuide(bot, build->Enchants, true);
     return applied;
 }
 

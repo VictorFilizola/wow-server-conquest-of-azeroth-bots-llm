@@ -58,23 +58,39 @@ float MagtheridonUseManticronCubeMultiplier::GetValue(Action* action)
 // Wait for 6 seconds after Magtheridon becomes attackable before engaging
 float MagtheridonWaitToAttackMultiplier::GetValue(Action* action)
 {
+    // The kill order S>W>E>NW>NE is held: once on its channeler the priority action does nothing, and
+    // "dps assist" took 8-9 DPS to another one; the raid split and each death healed and doubled the
+    // others (Soul Transfer), two wipes in a Mag 25 run (24/10).
+    if (!botAI->IsTank(bot) && action->getName() == "dps assist" &&
+        (GetChanneler(bot, SOUTH_CHANNELER) || GetChanneler(bot, WEST_CHANNELER) ||
+         GetChanneler(bot, EAST_CHANNELER) || GetChanneler(bot, NORTHWEST_CHANNELER) ||
+         GetChanneler(bot, NORTHEAST_CHANNELER)))
+        return 0.0f;
+
     Unit* magtheridon = AI_VALUE2(Unit*, "find target", "magtheridon");
     if (!magtheridon || !IsMagtheridonActive(magtheridon))
         return 1.0f;
 
-    if (botAI->IsHeal(bot) || botAI->IsMainTank(bot))
+    if (botAI->IsMainTank(bot))
         return 1.0f;
 
     constexpr uint8 dpsWaitSeconds = 6;
     auto it = dpsWaitTimer.find(magtheridon->GetMap()->GetInstanceId());
     if (it != dpsWaitTimer.end() && time(nullptr) - it->second > dpsWaitSeconds)
-        return 1.0f;
-
-    if (dynamic_cast<AttackAction*>(action) ||
-        dynamic_cast<CastSpellAction*>(action))
     {
-        return 0.0f;
+        // Not before a tank has him: released with no tank alive on him, the healers took him (ladiabale, 20/10).
+        Unit* victim = magtheridon->GetVictim();
+        Player* victimPlayer = victim ? victim->ToPlayer() : nullptr;
+        if (!victim || (victimPlayer && botAI->IsTank(victimPlayer)) || time(nullptr) - it->second > 15)
+            return 1.0f;
     }
+
+    // The CoA attacks are plain actions, held by name. A healer still heals: only its damage waits.
+    std::string const name = action->getName();
+    bool const damage = dynamic_cast<AttackAction*>(action) || name == "coa attack" || name == "coa aoe" ||
+                        name == "shoot" || name == "dps assist";
+    if (damage || (!botAI->IsHeal(bot) && dynamic_cast<CastSpellAction*>(action)))
+        return 0.0f;
 
     return 1.0f;
 }
@@ -126,6 +142,10 @@ float MagtheridonDebrisDangerMultiplier::GetValue(Action* action)
     {
         return 1.0f;
     }
+
+    // A cube holder keeps its channel: cube 43159 stands 9.6 yd from a Debris spot (ladiabale, 20/10).
+    if (bot->HasAura(static_cast<uint32>(MagtheridonSpells::SPELL_SHADOW_GRASP)))
+        return 1.0f;
 
     // 15y is wider than the default hazard zone but is needed to
     // keep the multiplier in effect

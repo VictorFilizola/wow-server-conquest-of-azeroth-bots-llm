@@ -5,7 +5,10 @@
  */
 
 #include "CheckMountStateAction.h"
+
+#include <algorithm>
 #include "CoaWildcard.h"
+#include "Ai/Coa/Combat/Mount/CoaMountRule.h"
 #include "AscensionSpecialization.h"
 #include "AreaDefines.h"
 #include "BattleGroundTactics.h"
@@ -20,6 +23,8 @@
 #include "SpellAuraEffects.h"
 
 static constexpr uint32 SPELL_COLD_WEATHER_FLYING = 54197;
+
+static bool BotCanUseFlyingMount(Player const* bot);
 static constexpr float PARACHUTE_LAND_THRESHOLD = 15.0f;
 
 // Define the static map / init bool for caching bot preferred mount data globally
@@ -60,8 +65,28 @@ MountData CollectMountData(Player const* bot)
                         // checks so that they are all correctly detected.
                         spellInfo->Id == 54729) ? 1 : 0;
         data.allSpells[index][speed].push_back(spellId);
+        if (index == 1)
+            for (uint8 i = EFFECT_1; i <= EFFECT_2; ++i)
+                if (spellInfo->Effects[i].ApplyAuraName == SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED)
+                {
+                    data.flyersThatRun[spellInfo->Effects[i].BasePoints].push_back(spellId);
+                    break;
+                }
     }
     return data;
+}
+
+// The mounts of that type the bot can ride: a master on a ground mount and an alt with only flying mounts (SupportDesk,
+// 05/11) left the alt on foot; its flyers that also run take the place of ground mounts. A pure flyer stays out: the
+// core refuses it where nobody can fly.
+static std::map<int32, std::vector<uint32>> const* MountsOfType(MountData const& data, uint32 type)
+{
+    auto const itr = data.allSpells.find(type);
+    if (itr != data.allSpells.end())
+        return &itr->second;
+    if (type == 0 && !data.flyersThatRun.empty())
+        return &data.flyersThatRun;
+    return nullptr;
 }
 
 bool CheckMountStateAction::Execute(Event /*event*/)
@@ -121,6 +146,22 @@ bool CheckMountStateAction::Execute(Event /*event*/)
 
     bool inBattleground = bot->InBattleground();
     bool const noRealMaster = (!master || master == bot);
+
+    // In a battleground, an enemy player hitting the bot from close by gets it off its mount at once, before it has
+    // even picked a target: it stayed mounted a few seconds under attack (Discord, FeelSoClose).
+    if (inBattleground && bot->IsMounted() && !bot->IsFlying() && bot->IsInCombat())
+    {
+        float const reach = CalculateDismountDistance() + 5.0f;
+        for (ObjectGuid const& guid : AI_VALUE(GuidVector, "attackers"))
+        {
+            Unit* attacker = botAI->GetUnit(guid);
+            if (attacker && attacker->IsPlayer() && attacker->IsAlive() && bot->IsWithinDistInMap(attacker, reach))
+            {
+                Dismount();
+                return true;
+            }
+        }
+    }
 
     // If there is a master and bot not in BG, follow master's mount state regardless of group leader
     if (!noRealMaster && !inBattleground)
@@ -185,8 +226,10 @@ bool CheckMountStateAction::isUseful()
     if (!GET_PLAYERBOT_AI(bot)->HasStrategy("mount", BOT_STATE_NON_COMBAT) && !bot->IsMounted())
         return false;
 
-    // Not useful when level lower than minimum required
-    if (bot->GetLevel() < sPlayerbotAIConfig.useGroundMountAtMinLevel)
+    // Not useful when level lower than minimum required, unless the bot follows its mounted master there or is
+    // mounted itself: a mounted alt below that level must still get off when its master does (CoaMountRule).
+    if (!CoaMountRule::CheckAllowed(bot->GetLevel(), sPlayerbotAIConfig.useGroundMountAtMinLevel, bot->IsMounted(),
+                                    FollowsMountedMasterBelowMinLevel()))
         return false;
 
     // Allow mounting while transformed only if the form allows it
@@ -207,6 +250,31 @@ bool CheckMountStateAction::isUseful()
     }
 
     return true;
+}
+
+// CoA lets a player ride before level 20, and the alts stayed on foot behind their mounted player (Discord, Maky).
+// Only an alt that knows a mount of the master's type: Mount() first strips the bot's form, and a bot without one
+// would lose its form again at each tick for nothing.
+bool CheckMountStateAction::FollowsMountedMasterBelowMinLevel()
+{
+    if (!botAI->IsAltBot() || !master || master == bot || !master->IsMounted())
+        return false;
+
+    MountData const data = CollectMountData(bot);
+    return MountsOfType(data, MountTypeFor(master, data)) != nullptr;
+}
+
+// A master on a mount that can fly (most CoA mounts carry a flight speed, as Aima, Steed of the Second Eidolon) asks
+// for a flying mount even where nobody can fly: random bots, which own only their race's ground mounts below level 60
+// and an Outland flyer at 60, stayed on foot in Elwynn while the alts, whose collection mounts fly too, rode along
+// (test of 04/11). Where the bot cannot fly, its ground mount does, or a flyer of its that also runs; a bot with only
+// pure flyers keeps them.
+uint32 CheckMountStateAction::MountTypeFor(Player* master, MountData const& data) const
+{
+    uint32 const type = GetMountType(master);
+    if (type == 1 && !BotCanUseFlyingMount(bot) && (data.allSpells.contains(0) || !data.flyersThatRun.empty()))
+        return 0;
+    return type;
 }
 
 bool CheckMountStateAction::Mount()
@@ -230,18 +298,41 @@ bool CheckMountStateAction::Mount()
 
     // Get bot mount data
     MountData mountData = CollectMountData(bot);
-    int32 masterMountType = GetMountType(master);
+    int32 masterMountType = MountTypeFor(master, mountData);
     int32 masterSpeed = CalculateMasterMountSpeed(master);
 
     // Try shapeshift
     if (TryForms(master, masterMountType, masterSpeed))
         return true;
 
-    // Try random mount
-    auto spellsIt = mountData.allSpells.find(masterMountType);
-    if (spellsIt != mountData.allSpells.end())
+    // CoA 3.2.2: a random bot of no player keeps a ground mount of its own (StableMountIndex): CoA's ground mounts run
+    // at the riding speed, and the "fastest by its spell" group made nearly every bot ride the same 100% elekk.
+    if ((!master || master == bot) && sRandomPlayerbotMgr.IsRandomBot(bot) && masterMountType == 0 &&
+        !BotCanUseFlyingMount(bot))
     {
-        auto& spells = spellsIt->second;
+        std::vector<uint32> ground;
+        if (auto const it = mountData.allSpells.find(0); it != mountData.allSpells.end())
+            for (auto const& [speed, ids] : it->second)
+                ground.insert(ground.end(), ids.begin(), ids.end());
+        std::sort(ground.begin(), ground.end());
+        ground.erase(std::unique(ground.begin(), ground.end()), ground.end());
+        uint32 const start = CoaMountRule::StableMountIndex(bot->GetGUID().GetRawValue(), uint32(ground.size()));
+        for (uint32 i = 0; i < ground.size(); ++i)
+        {
+            uint32 const spellId = ground[(start + i) % ground.size()];
+            if (!bot->HasSpell(spellId) || !botAI->CanCastSpell(spellId, bot))
+                continue;
+            if (bot->isMoving())
+                bot->StopMoving();
+            if (botAI->CastSpell(spellId, bot))
+                return true;
+        }
+    }
+
+    // Try random mount
+    if (auto const* mounts = MountsOfType(mountData, masterMountType))
+    {
+        auto& spells = *mounts;
         // CoA teaches riding 300 to bots too: under the fast mount level a bot owns only its 60% mount, which the
         // speed filter dropped behind a master on a 100% mount, and it walked (jealous-sound/azerothcore-wotlk-coa#5596).
         if (TryRandomMountFiltered(spells, masterSpeed) || TryRandomMountFiltered(spells, 0))
@@ -297,6 +388,8 @@ void CheckMountStateAction::CompleteDismount(Player* bot)
     bot->SetFallInformation(0, startZ);
     fallInfo.pos.Relocate(x, y, groundZ);
     bot->HandleFall(fallInfo);
+    // Re-anchor at the ground: Player::IsFalling() compares standing Z to this, so startZ reads as a fall.
+    bot->SetFallInformation(0, groundZ);
     bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
 }
 
@@ -503,13 +596,21 @@ bool CheckMountStateAction::TryRandomMountFiltered(std::map<int32, std::vector<u
             if (bot->isMoving())
                 bot->StopMoving();
 
-            uint32 index = urand(0, ids.size() - 1);
-
-            if (botAI->CanCastSpell(ids[index], bot))
-            {
-                botAI->CastSpell(ids[index], bot);
-                return true;
-            }
+            // Every mount of the group is tried, in random order: one refused mount no longer blocks the others.
+            std::vector<uint32> order = ids;
+            for (size_t i = order.size(); i > 1; --i)
+                std::swap(order[i - 1], order[urand(0, i - 1)]);
+            for (uint32 spellId : order)
+                if (botAI->CanCastSpell(spellId, bot))
+                {
+                    botAI->CastSpell(spellId, bot);
+                    return true;
+                }
+            // CoA collection mounts are known and castable but fail CanCastSpell: cast a known one as the preferred
+            // mount path does.
+            for (uint32 spellId : order)
+                if (bot->HasSpell(spellId) && botAI->CastSpell(spellId, bot))
+                    return true;
         }
     }
     return false;
@@ -551,7 +652,7 @@ bool CheckMountStateAction::ShouldDismountForMaster(Player* master) const
     bool isMasterMounted = master->IsMounted() || (masterInShapeshiftForm == FORM_FLIGHT ||
                                                    masterInShapeshiftForm == FORM_FLIGHT_EPIC ||
                                                    masterInShapeshiftForm == FORM_TRAVEL);
-    return !isMasterMounted && bot->IsMounted();
+    return CoaMountRule::DismountForMaster(isMasterMounted, bot->IsMounted());
 }
 
 static bool BotCanUseFlyingMount(Player const* bot)

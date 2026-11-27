@@ -5,6 +5,8 @@
  */
 
 #include "PetsAction.h"
+#include "CoaPet.h"
+#include "CoaPetStay.h"
 #include "CharmInfo.h"
 #include "Creature.h"
 #include "CreatureAI.h"
@@ -52,6 +54,10 @@ bool PetsAction::Execute(Event event)
     std::string param = event.getParam();
     if (param.empty() && !defaultCmd.empty())
         param = defaultCmd;
+
+    // CoA Live: the Pets tab of the SquidBots addon (pet list | set | use | dismiss | auto), alts only (CoaPet).
+    if (CoaPet::Handle(botAI, event.getOwner() ? event.getOwner() : botAI->GetMaster(), param))
+        return true;
 
     if (param.empty())
     {
@@ -505,6 +511,10 @@ bool SetPetStanceAction::Execute(Event /*event*/)
         if (charmInfo)
             charmInfo->SetPlayerReactState(react);
     }
+
+    // CoA: a pet called while its bot stays goes passive too, as the ones it had when told to stay.
+    if (botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT))
+        CoaPetStay::Apply(bot, true);
 
     // If debug is enabled in config, inform the master of the new stance
     if (sPlayerbotAIConfig.petChatCommandDebug == 1)

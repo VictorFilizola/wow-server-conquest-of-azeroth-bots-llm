@@ -5,6 +5,8 @@
  */
 
 #include "GenericTriggers.h"
+#include "CoaOffTank.h"
+#include "CoaPlayerMainTank.h"
 #include "Corpse.h"
 #include "CreatureAI.h"
 #include "GenericBuffUtils.h"
@@ -106,7 +108,19 @@ bool TargetWithComboPointsLowerHealTrigger::IsActive()
            (target->GetHealth() / AI_VALUE(float, "estimated group dps")) <= lifeTime;
 }
 
-bool LoseAggroTrigger::IsActive() { return !AI_VALUE2(bool, "has aggro", "current target"); }
+bool LoseAggroTrigger::IsActive()
+{
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (target && target->IsPlayer())
+        return false;  // players have no threat: taunts only waste the cooldown
+    // Never taunt what the player main tank holds, nor a target given back to the player after a swap.
+    if (target && (CoaPlayerMainTank::HeldByPlayer(bot, target) || CoaPlayerMainTank::Released(bot, target->GetGUID())))
+        return false;
+    // CoA Combat, off-tank: never taunt what another tank of the group holds (AiPlayerbot.CoaCombat.OffTank).
+    if (target && CoaOffTank::IsOffTank(bot) && CoaOffTank::HeldByOtherTank(bot, target))
+        return false;
+    return !AI_VALUE2(bool, "has aggro", "current target");
+}
 
 bool HasAggroTrigger::IsActive() { return AI_VALUE2(bool, "has aggro", "current target"); }
 
@@ -218,12 +232,12 @@ bool MediumThreatTrigger::IsActive()
 
 bool LowTankThreatTrigger::IsActive()
 {
+    Unit* current_target = AI_VALUE(Unit*, "current target");
+    if (!current_target || current_target->IsPlayer())
+        return false;  // players have no threat: Tricks of the Trade / Misdirection would be wasted
+
     Unit* mainTank = AI_VALUE(Unit*, "main tank");
     if (!mainTank)
-        return false;
-
-    Unit* current_target = AI_VALUE(Unit*, "current target");
-    if (!current_target)
         return false;
 
     ThreatManager& mgr = current_target->GetThreatMgr();

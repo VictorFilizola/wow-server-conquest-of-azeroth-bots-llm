@@ -1,4 +1,5 @@
 #include "AscensionFelCommutation.h"
+#include "AscensionAverageItemLevel.h"
 #include "AscensionClientLua.h"
 #include "AscensionCompatOpcodes.h"
 #include "AscensionFelCommutationPolicy.h"
@@ -17,6 +18,7 @@
 #include "ScriptMgr.h"
 #include "StringConvert.h"
 #include "StringFormat.h"
+#include "World.h"
 #include "WorldPacket.h"
 #include "WorldScript.h"
 #include "WorldSession.h"
@@ -38,6 +40,7 @@ std::atomic<bool> clickToggle{false};
 std::atomic<float> altarRange{20.0f};
 std::atomic<double> feeMultiplier{DefaultFeeMultiplier};
 std::atomic<uint32> maxSlots{DefaultMaxSlots};
+std::atomic<bool> insureAllByDefault{true};
 
 std::mutex windowMutex;
 std::unordered_set<ObjectGuid::LowType> windowShown;
@@ -51,8 +54,12 @@ void ForgetWindow(Player const* player)
 }
 
 constexpr char AddonPrefix[] = "FELCOMM";
+constexpr uint32 ActiveIndex = 0;
 constexpr uint32 InsuredSlotsIndex = 1;
+constexpr uint32 DefaultAppliedIndex = 2;
 constexpr std::size_t AddonChunkLength = 200;
+constexpr char DefaultAppliedText[] =
+    "Fel Commutation now protects all your equipment slots. Use a Fel Commutation Portal to remove slots.";
 
 uint32 InsuredSlots(Player const* player)
 {
@@ -65,6 +72,36 @@ bool SlotInsured(uint32 mask, unsigned key)
     return Insurable(key) && (mask & (1u << key)) != 0;
 }
 
+void SendState(Player* player);
+
+void SyncDefault(Player* player)
+{
+    if (player->GetSession()->IsBot())
+        return;
+
+    PlayerSettingVector const* settings = player->FindPlayerSettings(Setting);
+    bool const applied = settings && settings->size() > DefaultAppliedIndex &&
+        (*settings)[DefaultAppliedIndex].value != 0;
+    switch (DecideDefaultSync(enabled, insureAllByDefault, applied))
+    {
+        case DefaultSync::Apply:
+            player->UpdatePlayerSetting(Setting, ActiveIndex, 1);
+            player->UpdatePlayerSetting(Setting, InsuredSlotsIndex, AllSlotsMask);
+            player->UpdatePlayerSetting(Setting, DefaultAppliedIndex, 1);
+            ChatHandler(player->GetSession()).SendSysMessage(DefaultAppliedText);
+            SendState(player);
+            break;
+        case DefaultSync::Clear:
+            player->UpdatePlayerSetting(Setting, ActiveIndex, 0);
+            player->UpdatePlayerSetting(Setting, InsuredSlotsIndex, 0);
+            player->UpdatePlayerSetting(Setting, DefaultAppliedIndex, 0);
+            SendState(player);
+            break;
+        case DefaultSync::None:
+            break;
+    }
+}
+
 void SendAddon(Player* player, std::string const& message)
 {
     WorldPacket packet;
@@ -73,9 +110,11 @@ void SendAddon(Player* player, std::string const& message)
     player->SendDirectMessage(&packet);
 }
 
-uint64 Fee(Item const* item)
+Settlement DeathCost(Player const* player, std::size_t insuredItems)
 {
-    return ItemFee(item->GetTemplate()->ItemLevel, feeMultiplier);
+    return Settle(AscensionAverageItemLevel::Equipped(player),
+        player->GetLevel() >= sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL), feeMultiplier, insuredItems,
+        player->GetMoney());
 }
 
 void SendSlots(Player* player)
@@ -86,7 +125,8 @@ void SendSlots(Player* player)
         flags += SlotInsured(mask, key) ? '1' : '0';
     SendAddon(player, "SLOTS " + flags + " " + std::to_string(maxSlots.load()));
 
-    uint64 total = 0;
+    uint64 const fee = DeathCost(player, 0).total;
+    bool anyInsured = false;
     std::vector<std::string> chunks(1);
     for (unsigned key = 1; key <= SlotCount; ++key)
     {
@@ -94,15 +134,13 @@ void SendSlots(Player* player)
         if (!item || !Insurable(key))
             continue;
 
-        uint64 const fee = Fee(item);
-        if (SlotInsured(mask, key))
-            total += fee;
+        anyInsured = anyInsured || SlotInsured(mask, key);
         std::string const entry = std::to_string(item->GetEntry()) + ":" + std::to_string(fee) + ",";
         if (chunks.back().size() + entry.size() > AddonChunkLength)
             chunks.emplace_back();
         chunks.back() += entry;
     }
-    SendAddon(player, "COST " + std::to_string(total));
+    SendAddon(player, "COST " + std::to_string(anyInsured ? fee : 0));
     for (std::string const& chunk : chunks)
         if (!chunk.empty())
             SendAddon(player, "ITEMS " + chunk);
@@ -110,6 +148,7 @@ void SendSlots(Player* player)
 
 void HandleWindowMessage(Player* player, std::string const& body)
 {
+    SyncDefault(player);
     std::size_t const space = body.find(' ');
     std::string const action = body.substr(0, space);
     unsigned key = 0;
@@ -503,7 +542,7 @@ end
 
 std::string WindowBootstrapLua()
 {
-    return std::string("local showToggle = ") + (clickToggle ? "true" : "false") + WindowLua;
+    return std::string("local showToggle = ") + (clickToggle && !insureAllByDefault ? "true" : "false") + WindowLua;
 }
 
 void RunWindowLua(Player* player)
@@ -578,6 +617,17 @@ void ApplyToggle(Player* player, bool want, bool nearAltar)
         return;
     }
 
+    if (insureAllByDefault)
+    {
+        SendState(player);
+        if (want)
+        {
+            SendResult(player, ToggleResult::Ok);
+            player->KilledMonsterCredit(CreditEntry);
+        }
+        return;
+    }
+
     ToggleResult const result = DecideToggle(Active(player), want, nearAltar, toggleAnywhere);
     if (result == ToggleResult::Ok)
     {
@@ -608,6 +658,7 @@ bool HandleToggle(WorldSession* session, WorldPacket const& received)
         return true;
     }
 
+    SyncDefault(player);
     ApplyToggle(player, want != 0, NearAltar(player));
     return true;
 }
@@ -633,6 +684,7 @@ public:
         feeMultiplier = std::max(0.0, double(sConfigMgr->GetOption<float>("HighRisk.FelCommutation.FeeMultiplier",
             float(DefaultFeeMultiplier))));
         maxSlots = sConfigMgr->GetOption<uint32>("HighRisk.FelCommutation.MaxSlots", DefaultMaxSlots);
+        insureAllByDefault = sConfigMgr->GetOption<bool>("HighRisk.FelCommutation.InsureAllSlotsByDefault", true);
     }
 };
 
@@ -715,11 +767,16 @@ public:
         if (!player)
             return false;
 
+        AscensionClientLuaRoute const route = GetAscensionClientLuaRoute(player->GetSession()->GetAccountId());
         RunWindowLua(player);
-        handler->PSendSysMessage(
-            "Sent the Fel Commutation window (SMSG 0x05BC row {}, 0x05B6 row {}). If "
-            "/dump FelCommutationFrame is nil, run /run ChallengeUtil.GetRequirementLocalization(\"{}\")",
-            WindowBootstrapRow, WindowRequirementRow, WindowBootstrapToken);
+        if (route == AscensionClientLuaRoute::HotPatch)
+            handler->PSendSysMessage("Sent the Fel Commutation window as hot patch {}; /hotpatch lists what the client ran.",
+                WindowBootstrapToken);
+        else if (route == AscensionClientLuaRoute::Queue)
+            handler->PSendSysMessage("Queued hot patch {} until the client announces the hot-patch channel.",
+                WindowBootstrapToken);
+        else
+            handler->PSendSysMessage("Hot patch {} not sent: this client has no hot-patch channel.", WindowBootstrapToken);
         return true;
     }
 
@@ -748,6 +805,7 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         ForgetWindow(player);
+        SyncDefault(player);
         if (player->GetSession()->IsBot())
             return;
 
@@ -819,41 +877,36 @@ bool Active(Player const* player)
 
 uint32 Shield(Player* player, std::vector<Item*> const& insurable, std::vector<Item*>& losses)
 {
+    SyncDefault(player);
     if (!enabled || insurable.empty() || !Active(player))
         return 0;
 
     uint32 const mask = InsuredSlots(player);
     std::vector<Item*> hit;
-    std::vector<uint64> fees;
     for (Item* item : losses)
         if (std::find(insurable.begin(), insurable.end(), item) != insurable.end() &&
             SlotInsured(mask, unsigned(item->GetSlot()) + 1))
-        {
             hit.push_back(item);
-            fees.push_back(Fee(item));
-        }
     if (hit.empty())
         return 0;
 
-    uint64 fee = 0;
-    for (uint64 share : fees)
-        fee += share;
-
+    Settlement const cost = DeathCost(player, hit.size());
     ChatHandler chat(player->GetSession());
-    if (fee > player->GetMoney())
+    if (!cost.covered)
     {
         chat.SendSysMessage(Acore::StringFormat(
-            "Fel Commutation could not protect your items: it needs {} and you carry {}.", FormatMoney(fee),
+            "Fel Commutation could not protect your items: it needs {} and you carry {}.", FormatMoney(cost.total),
             FormatMoney(player->GetMoney())));
         return 0;
     }
 
     for (std::size_t i = 0; i < hit.size(); ++i)
     {
-        chat.SendSysMessage(Acore::StringFormat("Item {} kept safe for {}", ItemLink(hit[i]), FormatMoney(fees[i])));
+        chat.SendSysMessage(Acore::StringFormat("Item {} kept safe for {}", ItemLink(hit[i]),
+            FormatMoney(cost.perItem[i])));
         losses.erase(std::remove(losses.begin(), losses.end(), hit[i]), losses.end());
     }
-    return uint32(fee);
+    return uint32(cost.total);
 }
 
 void ReportLoss(Player* player, uint32 insuranceFee, uint32 droppedGold)

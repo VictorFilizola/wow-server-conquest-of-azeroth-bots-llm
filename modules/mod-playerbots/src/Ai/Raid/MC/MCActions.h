@@ -36,6 +36,31 @@ public:
     bool Execute(Event event) override;
 };
 
+class McMoveFromShazzrahReflectionAction : public MovementAction
+{
+public:
+    McMoveFromShazzrahReflectionAction(PlayerbotAI* botAI, std::string const name = "mc move from shazzrah reflection")
+        : MovementAction(botAI, name) {}
+    bool Execute(Event event) override;
+};
+
+class McShazzrahTankMoveFromReflectionAction : public MovementAction
+{
+public:
+    McShazzrahTankMoveFromReflectionAction(PlayerbotAI* botAI,
+                                           std::string const name = "mc shazzrah tank move from reflection")
+        : MovementAction(botAI, name) {}
+    bool Execute(Event event) override;
+};
+
+class McAttackSacrificialChainsAction : public AttackAction
+{
+public:
+    McAttackSacrificialChainsAction(PlayerbotAI* botAI, std::string const name = "mc attack sacrificial chains")
+        : AttackAction(botAI, name) {}
+    bool Execute(Event event) override;
+};
+
 class McMoveFromLavaAction : public MovementAction
 {
 public:
@@ -94,12 +119,49 @@ public:
     bool Execute(Event event) override;
 };
 
+// CoA Combat (A1): skull the Son of Flame to kill now (FindSonOfFlameToKill), sticky while the skulled one lives.
+class McRagnarosSonsMarkAction : public Action
+{
+public:
+    McRagnarosSonsMarkAction(PlayerbotAI* botAI) : Action(botAI, "mc ragnaros sons mark") {}
+    bool Execute(Event event) override;
+};
+// CoA Combat (R1): skull the Firesworn to kill now (FindFireswornToKill), sticky while the skulled one lives.
+class McGarrFireswornMarkAction : public Action
+{
+public:
+    McGarrFireswornMarkAction(PlayerbotAI* botAI) : Action(botAI, "mc garr firesworn mark") {}
+    bool Execute(Event event) override;
+};
+// CoA Combat (R1): step out of the Eruption of a Firesworn about to die.
+class McGarrMoveFromFireswornAction : public MovementAction
+{
+public:
+    McGarrMoveFromFireswornAction(PlayerbotAI* botAI) : MovementAction(botAI, "mc garr move from firesworn") {}
+    bool Execute(Event event) override;
+};
+// CoA Combat: removes an MC debuff (McRaidDispelTarget)
+class McRaidDispelAction : public Action
+{
+public:
+    McRaidDispelAction(PlayerbotAI* botAI) : Action(botAI, "mc raid dispel") {}
+    bool Execute(Event event) override;
+};
+
 class McCoreHoundMarkAction : public Action
 {
 public:
     McCoreHoundMarkAction(PlayerbotAI* botAI, std::string const name = "mc core hound mark")
         : Action(botAI, name) {};
     Unit* GetTarget() override;
+    bool Execute(Event event) override;
+};
+
+class McMajordomoStopAttackAction : public Action
+{
+public:
+    McMajordomoStopAttackAction(PlayerbotAI* botAI, std::string const name = "mc majordomo stop attack")
+        : Action(botAI, name) {};
     bool Execute(Event event) override;
 };
 

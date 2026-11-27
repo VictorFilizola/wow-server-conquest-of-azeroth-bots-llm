@@ -74,6 +74,9 @@ void WorldSession::HandleRepopRequestOpcode(WorldPacket& recv_data)
     if (GetPlayer()->HasPreventResurectionAura())
         return; // silently return, client should display the error by itself
 
+    if (!sScriptMgr->OnPlayerCanReleaseSpirit(GetPlayer()))
+        return;
+
     // the world update order is sessions, players, creatures
     // the netcode runs in parallel with all of these
     // creatures can kill players
@@ -1677,7 +1680,7 @@ void WorldSession::HandleCancelMountAuraOpcode(WorldPacket& /*recv_data*/)
         return;
 
     // The client sends this with every cast while mounted; these combat mounts are left through their auras.
-    if (_player->IsInTinkerMechsuit() ||
+    if (_player->IsInTinkerMechsuit() || _player->IsOnDivineSteed() ||
         (_player->getClass() == CLASS_STARCALLER && !_player->IsInFlight() &&
             _player->GetMountID() == 9991 && _player->HasAura(704772, _player->GetGUID())))
         return;
@@ -1763,8 +1766,13 @@ void WorldSession::HandleRequestPetInfo(WorldPackets::Pet::RequestPetInfo& /*pac
         recv_data.hexlike();
     */
 
-    if (_player->GetPet())
+    if (Pet* pet = _player->GetPet())
+    {
         _player->PetSpellInitialize();
+        // CoA: a UI reload also clears the client's pet talent points; send them again
+        if (pet->getPetType() == HUNTER_PET)
+            _player->SendTalentsInfoData(true);
+    }
     else if (Unit* charm = _player->GetCharm())
     {
         if (charm->HasUnitState(UNIT_STATE_POSSESSED))

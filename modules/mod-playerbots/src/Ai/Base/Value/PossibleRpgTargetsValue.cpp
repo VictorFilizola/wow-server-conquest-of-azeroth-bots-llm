@@ -6,6 +6,7 @@
 
 #include "PossibleRpgTargetsValue.h"
 #include "CellImpl.h"
+#include "CoaSafeMoveRules.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "NearestGameObjects.h"
@@ -113,7 +114,8 @@ const std::vector<uint32> PossibleNewRpgTargetsValue::allowedNpcFlags = {
 static const std::unordered_set<uint32> rpgRangeOverrideAreaIds = { 3526 /* Ammen Vale */, 2117 /* Deathknell */ };
 
 PossibleNewRpgTargetsValue::PossibleNewRpgTargetsValue(PlayerbotAI* botAI, float range)
-    : NearestUnitsValue(botAI, "possible new rpg targets", range, true), defaultRange(range)
+    : NearestUnitsValue(botAI, "possible new rpg targets", range, true, NEW_RPG_SCAN_INTERVAL_SECONDS),
+      defaultRange(range)
 {
 }
 
@@ -162,6 +164,12 @@ bool PossibleNewRpgTargetsValue::AcceptUnit(Unit* unit)
 
     if (unit->HasNpcFlag(UNIT_NPC_FLAG_SPIRITHEALER))
         return false;
+
+    // CoA 3.2.3: never an NPC that walks by itself, nor a festival's commoner (CoaSafeMove::WanderNpcRefused).
+    if (Creature* creature = unit->ToCreature())
+        if (CoaSafeMove::WanderNpcRefused(creature->GetEntry(),
+                                          creature->GetDefaultMovementType() != IDLE_MOTION_TYPE))
+            return false;
 
     for (uint32 npcFlag : allowedNpcFlags)
     {

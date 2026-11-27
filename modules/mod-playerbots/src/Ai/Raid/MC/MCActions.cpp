@@ -6,12 +6,15 @@
 
 #include "MCActions.h"
 #include "MCHelpers.h"
+#include "MCTriggers.h"
 #include "Playerbots.h"
 #include "RtiTargetValue.h"
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 static constexpr float LIVING_BOMB_DISTANCE = 20.0f;
-static constexpr float INFERNO_DISTANCE = 20.0f;
+static constexpr float INFERNO_DISTANCE = 23.0f;
 
 // dedicated tank positions; prevents assist tanks from positioning Core Ragers on steep walls on pull
 static const Position GOLEMAGG_TANK_POSITION{795.7308, -994.8848, -207.18661};
@@ -57,6 +60,116 @@ bool McShazzrahMoveAwayAction::Execute(Event /*event*/)
             return MoveAway(boss, distToTravel);
     }
     return false;
+}
+
+// The nearest spot around the bot, ring by ring, that is `clearance` away from every Reflection rather
+// than only from the nearest one, so a bot never runs out of one Arcane Explosion into the next. Ranged
+// also stay outside Shazzrah's own explosion and within casting reach of him; on a ring, melee and tanks
+// take the spot nearest Shazzrah.
+static bool FindSpotClearOfReflections(Player* bot, Unit const* boss, std::vector<Creature*> const& reflections,
+                                       float clearance, bool ranged, Position& spot)
+{
+    constexpr int ANGLE_STEPS = 16;
+    constexpr float RING_STEP = 4.0f;
+    constexpr float MAX_RING = 40.0f;
+
+    for (float ring = RING_STEP; ring <= MAX_RING; ring += RING_STEP)
+    {
+        bool found = false;
+        float bestBossDist = 0.0f;
+        for (int step = 0; step < ANGLE_STEPS; ++step)
+        {
+            float const angle = step * (2.0f * static_cast<float>(M_PI) / ANGLE_STEPS);
+            float x = bot->GetPositionX() + ring * std::cos(angle);
+            float y = bot->GetPositionY() + ring * std::sin(angle);
+            float z = bot->GetPositionZ();
+            if (!IsClearOfReflections(reflections, x, y, clearance))
+                continue;
+
+            float const bossDist = boss->GetDistance2d(x, y);
+            if (ranged && (bossDist < ARCANE_EXPLOSION_DISTANCE || bossDist > REFLECTION_RANGED_MAX_BOSS_DISTANCE))
+                continue;
+
+            if (!bot->GetMap()->CheckCollisionAndGetValidCoords(bot, bot->GetPositionX(), bot->GetPositionY(),
+                                                                 bot->GetPositionZ(), x, y, z) ||
+                !IsClearOfReflections(reflections, x, y, clearance))
+                continue;
+
+            if (!found || (!ranged && bossDist < bestBossDist))
+            {
+                found = true;
+                bestBossDist = bossDist;
+                spot.Relocate(x, y, z);
+                if (ranged)
+                    break;
+            }
+        }
+        if (found)
+            return true;
+    }
+    return false;
+}
+
+bool McMoveFromShazzrahReflectionAction::Execute(Event /*event*/)
+{
+    Unit* boss = AI_VALUE2(Unit*, "find target", "shazzrah");
+    if (!boss)
+        return false;
+
+    std::vector<Creature*> const reflections = GetShazzrahReflections(boss);
+    Creature* reflection = FindReflectionNear(reflections, bot, REFLECTION_DISTANCE);
+    if (!reflection)
+        return false;
+
+    // Stop past the trigger distance (hysteresis), on a spot clear of every Reflection.
+    float const clearance = REFLECTION_DISTANCE + REFLECTION_CLEAR_MARGIN;
+    Position spot;
+    if (FindSpotClearOfReflections(bot, boss, reflections, clearance, PlayerbotAI::IsRanged(bot), spot))
+        return MoveTo(bot->GetMapId(), spot.GetPositionX(), spot.GetPositionY(), spot.GetPositionZ(), false, false,
+                      false, false, MovementPriority::MOVEMENT_FORCED, true);
+
+    return MoveAway(reflection, clearance - bot->GetDistance2d(reflection));
+}
+
+bool McShazzrahTankMoveFromReflectionAction::Execute(Event /*event*/)
+{
+    Unit* boss = AI_VALUE2(Unit*, "find target", "shazzrah");
+    if (!boss)
+        return false;
+
+    std::vector<Creature*> const reflections = GetShazzrahReflections(boss);
+    Creature* reflection = FindReflectionNear(reflections, boss, REFLECTION_DISTANCE);
+    if (!reflection)
+        reflection = FindReflectionNear(reflections, bot, REFLECTION_DISTANCE);
+    if (!reflection)
+        return false;
+
+    // Shazzrah follows his tank: walking the tank clear of every Reflection by the boss's reach brings him
+    // along, which keeps every later Blink's reflection apart from the earlier ones.
+    float const clearance = REFLECTION_DISTANCE + REFLECTION_CLEAR_MARGIN + boss->GetCombatReach();
+    Position spot;
+    if (FindSpotClearOfReflections(bot, boss, reflections, clearance, false, spot))
+        return MoveTo(bot->GetMapId(), spot.GetPositionX(), spot.GetPositionY(), spot.GetPositionZ(), false, false,
+                      false, false, MovementPriority::MOVEMENT_FORCED, true);
+
+    float const distToTravel = clearance - bot->GetDistance2d(reflection);
+    if (distToTravel <= 0.0f)
+        return false;
+
+    return MoveAway(reflection, distToTravel);
+}
+
+bool McAttackSacrificialChainsAction::Execute(Event /*event*/)
+{
+    Unit* majordomo = AI_VALUE2(Unit*, "find target", "majordomo executus");
+    if (!majordomo)
+        return false;
+
+    Creature* chain = FindSacrificialChains(majordomo, bot);
+    if (!chain || bot->GetVictim() == chain)
+        return false;
+
+    return Attack(chain);
 }
 
 bool McMoveFromLavaAction::Execute(Event /*event*/)
@@ -339,4 +452,62 @@ bool McCoreHoundMarkAction::Execute(Event /*event*/)
 
     bot->GetGroup()->SetTargetIcon(RtiTargetValue::skullIndex, bot->GetGUID(), target->GetGUID());
     return true;
+}
+
+bool McMajordomoStopAttackAction::Execute(Event /*event*/)
+{
+    // Auto-attack keeps swinging into the Damage Shield; the multiplier keeps the bot from re-engaging.
+    return bot->AttackStop();
+}
+
+bool McRagnarosSonsMarkAction::Execute(Event /*event*/)
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    ObjectGuid const skull = group->GetTargetIcon(RtiTargetValue::skullIndex);
+    if (Unit* current = skull.IsEmpty() ? nullptr : botAI->GetUnit(skull))
+        if (current->IsAlive() && (IsMcEntry(current->GetEntry(), NPC_COA_LESSER_SON_OF_FLAME) ||
+                                   IsMcEntry(current->GetEntry(), NPC_COA_SON_OF_FLAME) ||
+                                   IsMcEntry(current->GetEntry(), NPC_COA_GREATER_SON_OF_FLAME) ||
+                                   IsMcEntry(current->GetEntry(), NPC_COA_UNSTABLE_SON_OF_FLAME)))
+            return false;  // the kill in progress finishes
+    Creature* son = FindSonOfFlameToKill(bot);
+    if (!son)
+        return false;
+    group->SetTargetIcon(RtiTargetValue::skullIndex, bot->GetGUID(), son->GetGUID());
+    return true;
+}
+
+bool McGarrFireswornMarkAction::Execute(Event /*event*/)
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    ObjectGuid const skull = group->GetTargetIcon(RtiTargetValue::skullIndex);
+    if (Unit* current = skull.IsEmpty() ? nullptr : botAI->GetUnit(skull))
+        if (current->IsAlive() && IsMcEntry(current->GetEntry(), NPC_GARR_FIRESWORN))
+            return false;  // the kill in progress finishes
+    Creature* add = FindFireswornToKill(bot);
+    if (!add)
+        return false;
+    group->SetTargetIcon(RtiTargetValue::skullIndex, bot->GetGUID(), add->GetGUID());
+    return true;
+}
+
+bool McGarrMoveFromFireswornAction::Execute(Event /*event*/)
+{
+    Creature* add = FindDyingFireswornNear(bot, FIRESWORN_ERUPTION_YARDS + 1.0f);
+    if (!add)
+        return false;
+    return MoveAway(add, FIRESWORN_ERUPTION_YARDS + 3.0f - bot->GetDistance2d(add));
+}
+
+bool McRaidDispelAction::Execute(Event /*event*/)
+{
+    uint32 spellId = 0;
+    Player* target = McRaidDispelTarget(bot, spellId);
+    if (!target || !spellId || !botAI->CanCastSpell(spellId, target))
+        return false;
+    return botAI->CastSpell(spellId, target);
 }

@@ -23,8 +23,12 @@
 #include "TravelNode.h"
 #include "VMapFactory.h"
 #include "VMapMgr2.h"
+#include "DBCStores.h"
+#include "RandomPlayerbotMgr.h"
+#include "ObjectMgr.h"
 #include <iomanip>
 #include <numeric>
+#include <unordered_map>
 
 // Navigation data
 
@@ -1228,7 +1232,10 @@ bool QuestObjectiveTravelDestination::isActive(Player* bot)
     if (getEntry() > 0)
     {
         CreatureTemplate const* cInfo = sObjectMgr->GetCreatureTemplate(getEntry());
-        if (cInfo && (int)cInfo->maxlevel - (int)bot->GetLevel() > 4)
+        if (!cInfo)
+            return false;
+
+        if ((int)cInfo->maxlevel - (int)bot->GetLevel() > 4)
             return false;
 
         // Do not try to hand-in dungeon/elite quests in instances without a group.
@@ -3931,10 +3938,8 @@ std::vector<WorldPosition> TravelMgr::getNextPoint(WorldPosition center, std::ve
     if (retVec.empty() && points.size() > 0)
         retVec.push_back(points[0]);
 
-    if (!retVec.empty())
-        return retVec;
-
-    assert(!"No valid point found.");
+    if (retVec.empty())
+        LOG_DEBUG("playerbots", "[Travel] No valid point found among {} weighted points.", points.size());
 
     return retVec;
 }
@@ -4358,6 +4363,7 @@ void TravelMgr::Init()
     {
         PrepareZone2LevelBracket();
         PrepareDestinationCache();
+        PrepareGatherNodeCache();
     }
     sTravelNodeMap.InitTaxiGraph();
     LOG_INFO("playerbots", "Playerbots Taxi graph and destination cache built.");
@@ -4426,6 +4432,15 @@ std::vector<std::vector<uint32>> TravelMgr::GetOptimalFlightDestinations(Player*
     if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(bot->GetZoneId()))
         botInCapital = (area->flags & AREA_FLAG_CAPITAL) != 0;
 
+    // CoA 3.2.2 (bench of 5f662017: 6 bots of level 14-16 refused map 530 again and again at the Thalassian Pass, on
+    // a flight from the Eastern Plaguelands to Ghostlands): a random bot never flies to a zone of map 530 or 571.
+    bool const randomBot = sRandomPlayerbotMgr.IsRandomBot(bot);
+    auto farZone = [randomBot](uint32 zoneId)
+    {
+        AreaTableEntry const* entry = sAreaTableStore.LookupEntry(zoneId);
+        return randomBot && entry && (entry->mapid == 530 || entry->mapid == 571);
+    };
+
     //Simplify destination delection. Its either target cities (Based on config value) or target world.
     std::vector<uint32> candidateZones;
     if (botLevel >= 10 && !botInCapital && urand(0, 100) < sPlayerbotAIConfig.probTeleToBankers * 100)
@@ -4434,6 +4449,8 @@ std::vector<std::vector<uint32>> TravelMgr::GetOptimalFlightDestinations(Player*
         for (Capital const& capital : capitals)
         {
             if (capital.team != TEAM_NEUTRAL && capital.team != botTeam)
+                continue;
+            if (farZone(capital.zoneId))
                 continue;
             candidateZones.push_back(capital.zoneId);
         }
@@ -4453,6 +4470,8 @@ std::vector<std::vector<uint32>> TravelMgr::GetOptimalFlightDestinations(Player*
                 if (zoneEntry->team == 2 && bot->GetTeamId() == TEAM_HORDE)
                     continue;
             }
+            if (farZone(zoneId))
+                continue;
             if (GetFlightNodesInZone(zoneId, bot->GetTeamId(), fromNode).empty())
                 continue;
             candidateZones.push_back(zoneId);
@@ -4491,16 +4510,16 @@ const std::vector<WorldLocation> TravelMgr::GetTeleportLocations(Player* bot)
     uint32 level = bot->GetLevel();
     uint8 isAlliance = bot->GetTeamId() == TEAM_ALLIANCE;
     if (sPlayerbotAIConfig.enableNewRpgStrategy)
-        return isAlliance ? allianceHubsPerLevelCache[level] : hordeHubsPerLevelCache[level];
+        return isAlliance ? CacheAt(allianceHubsPerLevelCache, level) : CacheAt(hordeHubsPerLevelCache, level);
 
-    return locsPerLevelCache[level];
+    return CacheAt(locsPerLevelCache, level);
 }
 
 const std::vector<WorldLocation> TravelMgr::GetTravelHubs(Player* bot)
 {
     std::vector<WorldLocation> locs = bot->GetTeamId() == TEAM_ALLIANCE
-                                                 ? allianceHubsPerLevelCache[bot->GetLevel()]
-                                                 : hordeHubsPerLevelCache[bot->GetLevel()];
+                                                 ? CacheAt(allianceHubsPerLevelCache, bot->GetLevel())
+                                                 : CacheAt(hordeHubsPerLevelCache, bot->GetLevel());
     return locs;
 }
 
@@ -4509,7 +4528,7 @@ std::vector<WorldLocation> TravelMgr::GetCityLocations(Player* bot)
     uint32 level = bot->GetLevel();
 
     std::vector<WorldLocation> fallbackLocations;
-    for (auto& bLoc : bankerLocsPerLevelCache[level])
+    for (auto const& bLoc : CacheAt(bankerLocsPerLevelCache, level))
         fallbackLocations.push_back(bLoc.loc);
 
     if (!sPlayerbotAIConfig.enableWeightTeleToCityBankers)
@@ -4517,7 +4536,7 @@ std::vector<WorldLocation> TravelMgr::GetCityLocations(Player* bot)
 
     TeamId botTeamId = bot->GetTeamId();
     std::unordered_set<uint32> validBankerCities;
-    for (auto& loc : bankerLocsPerLevelCache[level])
+    for (auto const& loc : CacheAt(bankerLocsPerLevelCache, level))
     {
         Capital const* capital = FindCapitalByBanker(loc.entry);
         if (!capital)
@@ -4812,6 +4831,10 @@ void TravelMgr::PrepareDestinationCache()
                 // Bots 1-60 go to base game bankers (all have minlevel 30 or 45)
                 if (l <=60 && level > 45)
                     continue;
+                // CoA 3.2.2: of the old continents (maps 0, 1): the Exodar's and Silvermoon's bankers (map 530, level
+                // 30 to 45) sent bots of level 19 and 24 to cities CoA has no use for (world 6, 23/11).
+                if (l <= 60 && mapId != 0 && mapId != 1)
+                    continue;
 
                 // Bots 61-70 go to Shattrath bankers (all have minlevel 60 or 70)
                 if ((l >=61 && l <=70) && (level < 60 || level > 70))
@@ -4835,16 +4858,46 @@ void TravelMgr::PrepareDestinationCache()
         {
             CreatureTemplate const* creatureTemplate = sObjectMgr->GetCreatureTemplate(creatureDataList[0].id);
             uint32 level = (creatureTemplate->minlevel + creatureTemplate->maxlevel + 1) / 2;
+            // CoA 3.2.2: the grind spot is the real spawn nearest the middle of the cell's spawns, not the cell's corner
+            // (x, y and z rounded to 50 yards): bots were sent to points in the air or under the ground and stood there.
+            float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+            for (auto const& data : creatureDataList)
+            {
+                cx += data.posX;
+                cy += data.posY;
+                cz += data.posZ;
+            }
+            float const n = float(creatureDataList.size());
+            cx /= n;
+            cy /= n;
+            cz /= n;
+            // Of a creature that walks (never a bird or a bat flying over: its spawn is in the air). The caches hold
+            // the maps of RandomBotMaps only, no instance; RandomTeleport keeps random bots off maps 530 and 571.
+            CreatureData const* spot = nullptr;
+            float best = FLT_MAX;
+            for (auto const& data : creatureDataList)
+            {
+                CreatureTemplate const* proto = sObjectMgr->GetCreatureTemplate(data.id);
+                if (!proto || !proto->Movement.IsGroundAllowed() || proto->Movement.IsFlightAllowed())
+                    continue;
+                float const d = (data.posX - cx) * (data.posX - cx) + (data.posY - cy) * (data.posY - cy) +
+                                (data.posZ - cz) * (data.posZ - cz);
+                if (d < best)
+                {
+                    best = d;
+                    spot = &data;
+                }
+            }
+            if (!spot)
+                continue;
             for (int32 l = (int32)level - (int32)sPlayerbotAIConfig.randomBotTeleLowerLevel;
                  l <= (int32)level + (int32)sPlayerbotAIConfig.randomBotTeleHigherLevel; l++)
             {
                 if (l < 1 || l > int32(maxLevel))
                     continue;
 
-                locsPerLevelCache[(uint8)l].push_back(WorldLocation(std::get<0>(gridTuple),
-                    static_cast<float>(std::get<1>(gridTuple)) * 50.0f,
-                    static_cast<float>(std::get<2>(gridTuple)) * 50.0f,
-                    static_cast<float>(std::get<3>(gridTuple)) * 50.0f));
+                locsPerLevelCache[(uint8)l].push_back(
+                    WorldLocation(std::get<0>(gridTuple), spot->posX, spot->posY, spot->posZ));
             }
         }
     }
@@ -4882,7 +4935,8 @@ void TravelMgr::PrepareDestinationCache()
 
             for (int32 l = 1; l <= 5; l++)
             {
-                if ((1 << (i - 1)) & sRaceMgr->GetAllianceRaceMask())
+                // IsAlliance, not the race mask: the shift is undefined past race 32 and the mask knows no added race.
+                if (IsAlliance(uint8(i)))
                     allianceHubsPerLevelCache[(uint8)l].push_back(pos);
                 else
                     hordeHubsPerLevelCache[(uint8)l].push_back(pos);
@@ -4891,4 +4945,520 @@ void TravelMgr::PrepareDestinationCache()
         }
     }
     LOG_INFO("playerbots", ">> {} flight masters and {} innkeepers and {} banker locations for level collected.", flightMastersCount, innkeepersCount, bankerCount);
+}
+
+// The gathering nodes, read once from the spawns the core already holds (this replaces the old commented query on
+// gameobject_loot_template above): every chest-type object of the bots' continents whose lock asks for Herbalism or
+// Mining, grouped by map, skill and 200-yard cell. Woodcutting and the other CoA professions are left out.
+namespace
+{
+// The Skinning a corpse of this level asks for (as LootObject reads it).
+uint32 SkinningSkillFor(uint32 level) { return level < 10 ? 1 : level < 20 ? (level - 10) * 10 : level * 5; }
+}  // namespace
+
+void TravelMgr::PrepareGatherNodeCache()
+{
+    gatherCells.clear();
+
+    constexpr float cellSize = 200.0f;
+    std::map<std::tuple<uint32, uint32, int32, int32>, GatherCell> cells;
+    uint32 nodes = 0;
+
+    for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+    {
+        if (std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), data.mapid) ==
+            sPlayerbotAIConfig.randomBotMaps.end())
+            continue;
+        if (!(data.phaseMask & PHASEMASK_NORMAL))
+            continue;
+
+        GameObjectTemplate const* goInfo = sObjectMgr->GetGameObjectTemplate(data.id);
+        if (!goInfo)
+            continue;
+
+        int32 const cx = static_cast<int32>(std::floor(data.posX / cellSize));
+        int32 const cy = static_cast<int32>(std::floor(data.posY / cellSize));
+
+        // Fishing pools: every spawn point is open water. Their skill is the one of their area, read below.
+        if (goInfo->type == GAMEOBJECT_TYPE_FISHINGHOLE)
+        {
+            GatherCell& cell = cells[std::make_tuple(uint32(data.mapid), uint32(SKILL_FISHING), cx, cy)];
+            cell.mapId = data.mapid;
+            cell.skillId = SKILL_FISHING;
+            cell.points.push_back({data.posX, data.posY, data.posZ, 1, data.id});
+            ++nodes;
+            continue;
+        }
+        if (goInfo->type != GAMEOBJECT_TYPE_CHEST)
+            continue;
+
+        LockEntry const* lock = sLockStore.LookupEntry(goInfo->GetLockId());
+        if (!lock)
+            continue;
+
+        uint32 skillId = 0;
+        uint32 reqSkill = 0;
+        for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+        {
+            if (lock->Type[i] != LOCK_KEY_SKILL)
+                continue;
+            SkillType const skill = SkillByLockType(LockType(lock->Index[i]));
+            if (skill == SKILL_HERBALISM || skill == SKILL_MINING)
+            {
+                skillId = skill;
+                reqSkill = std::max<uint32>(1, lock->Skill[i]);
+                break;
+            }
+        }
+        if (!skillId)
+            continue;
+
+        GatherCell& cell = cells[std::make_tuple(uint32(data.mapid), skillId, cx, cy)];
+        cell.mapId = data.mapid;
+        cell.skillId = skillId;
+        cell.points.push_back({data.posX, data.posY, data.posZ, reqSkill, data.id});
+        ++nodes;
+    }
+
+    // The hostile creatures of each 200-yard square: an alt sent there must not meet stronger ones.
+    // The beasts to skin go in cells of their own: normal rank, attackable, skinned with Skinning.
+    std::map<std::tuple<uint32, int32, int32>, std::vector<uint32>> hostileLevels;
+    uint32 beasts = 0;
+
+    // The loot entries holding cloth (Linen to Frostweave), directly or through two levels of references; the
+    // humanoids with such loot go in cells of their own, for the cloth missions.
+    std::set<uint32> clothLoot;
+    {
+        std::string const cloth = "2589,2592,4306,4338,14047,14256,21877,33470";
+        std::string refs = cloth;
+        std::set<uint32> refEntries;
+        for (int depth = 0; depth < 3 && !refs.empty(); ++depth)
+        {
+            std::string next;
+            if (QueryResult result = WorldDatabase.Query(
+                    "SELECT DISTINCT Entry FROM reference_loot_template WHERE {} IN ({})",
+                    depth ? "Reference" : "Item", refs))
+                do
+                {
+                    uint32 const entry = result->Fetch()[0].Get<uint32>();
+                    if (refEntries.insert(entry).second)
+                        next += (next.empty() ? "" : ",") + std::to_string(entry);
+                } while (result->NextRow());
+            refs = next;
+        }
+        std::string refList;
+        for (uint32 entry : refEntries)
+            refList += (refList.empty() ? "" : ",") + std::to_string(entry);
+        if (QueryResult result = WorldDatabase.Query(
+                "SELECT DISTINCT Entry FROM creature_loot_template WHERE Item IN ({}) OR Reference IN ({})", cloth,
+                refList.empty() ? "0" : refList))
+            do
+                clothLoot.insert(result->Fetch()[0].Get<uint32>());
+            while (result->NextRow());
+    }
+    clothCreatures.clear();
+    for (auto const& [entry, creature] : *sObjectMgr->GetCreatureTemplates())
+        if (creature.lootid && clothLoot.count(creature.lootid) && creature.type == CREATURE_TYPE_HUMANOID &&
+            creature.rank == CREATURE_ELITE_NORMAL && !creature.npcflag &&
+            !(creature.unit_flags & (UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC)))
+            clothCreatures.insert(entry);
+    uint32 humanoids = 0;
+
+    for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(data.id);
+        if (!creature || creature->npcflag || creature->type == CREATURE_TYPE_CRITTER)
+            continue;
+        int32 const cx = static_cast<int32>(std::floor(data.posX / cellSize));
+        int32 const cy = static_cast<int32>(std::floor(data.posY / cellSize));
+
+        if (creature->SkinLootId && creature->GetRequiredLootSkill() == SKILL_SKINNING &&
+            creature->rank == CREATURE_ELITE_NORMAL && !data.id2 && (data.phaseMask & PHASEMASK_NORMAL) &&
+            !(creature->unit_flags & (UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC)) &&
+            std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), data.mapid) !=
+                sPlayerbotAIConfig.randomBotMaps.end())
+        {
+            GatherCell& cell = cells[std::make_tuple(uint32(data.mapid), uint32(SKILL_SKINNING), cx, cy)];
+            cell.mapId = data.mapid;
+            cell.skillId = SKILL_SKINNING;
+            cell.points.push_back(
+                {data.posX, data.posY, data.posZ, SkinningSkillFor(creature->maxlevel), data.id, creature->maxlevel});
+            ++beasts;
+        }
+
+        if (clothCreatures.count(data.id) && !data.id2 && (data.phaseMask & PHASEMASK_NORMAL) &&
+            std::find(sPlayerbotAIConfig.randomBotMaps.begin(), sPlayerbotAIConfig.randomBotMaps.end(), data.mapid) !=
+                sPlayerbotAIConfig.randomBotMaps.end())
+        {
+            GatherCell& cell = cells[std::make_tuple(uint32(data.mapid), GATHER_CLOTH, cx, cy)];
+            cell.mapId = data.mapid;
+            cell.skillId = GATHER_CLOTH;
+            cell.points.push_back({data.posX, data.posY, data.posZ, 1, data.id, creature->maxlevel});
+            ++humanoids;
+        }
+
+        FactionTemplateEntry const* faction = sFactionTemplateStore.LookupEntry(creature->faction);
+        if (!faction || !faction->IsHostileToPlayers())
+            continue;
+        hostileLevels[std::make_tuple(uint32(data.mapid), cx, cy)].push_back(creature->maxlevel);
+    }
+
+    for (auto& [key, cell] : cells)
+    {
+        auto const hostile = hostileLevels.find(std::make_tuple(std::get<0>(key), std::get<2>(key), std::get<3>(key)));
+        if (hostile != hostileLevels.end() && hostile->second.size() >= 3)
+        {
+            std::vector<uint32>& levels = hostile->second;
+            std::sort(levels.begin(), levels.end());
+            cell.dangerLevel = levels[(levels.size() * 3) / 4];
+        }
+
+        // A lone node is not worth the trip; one pool is (the water stays when the pool is fished out).
+        if (cell.points.size() < (cell.skillId == SKILL_FISHING ? 1u : (cell.skillId == SKILL_SKINNING || cell.skillId == GATHER_CLOTH) ? 4u : 3u))
+            continue;
+
+        float mx = 0.0f;
+        float my = 0.0f;
+        for (GatherPoint const& p : cell.points)
+        {
+            mx += p.x;
+            my += p.y;
+        }
+        mx /= cell.points.size();
+        my /= cell.points.size();
+
+        // Walking order: from the point nearest the middle, always to the nearest point not yet visited.
+        std::vector<GatherPoint> ordered;
+        ordered.reserve(cell.points.size());
+        std::vector<GatherPoint> left = cell.points;
+        float px = mx;
+        float py = my;
+        while (!left.empty())
+        {
+            size_t best = 0;
+            float bestDist = std::numeric_limits<float>::max();
+            for (size_t i = 0; i < left.size(); ++i)
+            {
+                float const d = (left[i].x - px) * (left[i].x - px) + (left[i].y - py) * (left[i].y - py);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = i;
+                }
+            }
+            ordered.push_back(left[best]);
+            px = left[best].x;
+            py = left[best].y;
+            left.erase(left.begin() + best);
+        }
+        cell.points = std::move(ordered);
+        cell.x = cell.points.front().x;
+        cell.y = cell.points.front().y;
+        cell.z = cell.points.front().z;
+
+        Map* map = sMapMgr->FindMap(cell.mapId, 0);
+        if (!map)
+            continue;
+        // The spot's anchor, where a mission teleports and walks to: the first point outdoors. The first point of
+        // all could be in a cave the bot has no path out of (Redridge Mountains, 3.0.1).
+        for (GatherPoint const& p : cell.points)
+        {
+            PositionFullTerrainStatus status;
+            map->GetFullTerrainStatusForPosition(PHASEMASK_NORMAL, p.x, p.y, p.z, 2.0f, status);
+            if (status.outdoors)
+            {
+                cell.x = p.x;
+                cell.y = p.y;
+                cell.z = p.z;
+                break;
+            }
+        }
+        AreaTableEntry const* area = sAreaTableStore.LookupEntry(map->GetAreaId(PHASEMASK_NORMAL, cell.x, cell.y, cell.z));
+        if (!area)
+            continue;
+        cell.zoneId = area->zone ? area->zone : area->ID;
+
+        // Fishing: the skill of the water is the one of its area, else of its zone (as GameObject::Use reads it).
+        if (cell.skillId == SKILL_FISHING)
+            for (GatherPoint& p : cell.points)
+            {
+                p.areaId = map->GetAreaId(PHASEMASK_NORMAL, p.x, p.y, p.z);
+                int32 skill = sObjectMgr->GetFishingBaseSkillLevel(p.areaId);
+                if (!skill)
+                    skill = sObjectMgr->GetFishingBaseSkillLevel(cell.zoneId);
+                p.reqSkill = uint32(std::max<int32>(1, skill));
+            }
+
+        gatherCells.push_back(std::move(cell));
+    }
+
+    LOG_INFO("playerbots", ">> {} gathering nodes, {} beasts to skin, {} humanoids with cloth in {} cells collected for "
+             "the missions.", nodes, beasts, humanoids, gatherCells.size());
+}
+
+namespace
+{
+// How much a node of this skill helps the mission: an orange or yellow one (under 50 points below the skill) raises it
+// at almost every gather, a green one now and then, a grey one never. Fishing and cloth: any spot of the skill does.
+float GatherPointWeight(uint32 skillId, uint32 reqSkill, uint32 skillValue)
+{
+    if (skillId == SKILL_FISHING || skillId == TravelMgr::GATHER_CLOTH)
+        return 1.0f;
+    uint32 const above = skillValue > reqSkill ? skillValue - reqSkill : 0;
+    return above < 50 ? 1.0f : above < 100 ? 0.4f : 0.1f;
+}
+}  // namespace
+
+TravelMgr::GatherCell const* TravelMgr::SelectGatherCell(Player* bot, uint32 skillId, uint32 skillValue,
+                                                         GatherCell const* exclude,
+                                                         std::set<uint32> const* nodes) const
+{
+    if (!bot || !skillValue)
+        return nullptr;
+
+    uint32 const level = bot->GetLevel();
+    std::vector<std::pair<float, GatherCell const*>> candidates;
+
+    for (GatherCell const& cell : gatherCells)
+    {
+        if (&cell == exclude || cell.skillId != skillId || cell.mapId != bot->GetMapId())
+            continue;
+
+        // Only the zones of the bot's level or below: never a zone whose creatures outlevel it. A fisher does not
+        // fight: a few levels more, the creatures of the spot itself still checked below.
+        bool const fishing = skillId == SKILL_FISHING;
+        auto const bracket = zone2LevelBracket.find(cell.zoneId);
+        if (bracket == zone2LevelBracket.end() || bracket->second.low > level + (fishing ? 5 : 0))
+            continue;
+
+        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(cell.zoneId);
+        if (!zone || (zone->flags & AREA_FLAG_CAPITAL))
+            continue;
+        if (zone->team == 4 && bot->GetTeamId() == TEAM_ALLIANCE)
+            continue;
+        if (zone->team == 2 && bot->GetTeamId() == TEAM_HORDE)
+            continue;
+
+        // A node raises the skill until the skill is 100 points over it; yellow ones rank first (GatherPointWeight).
+        // A zone whose creatures may outlevel the bot only if nothing safer is found.
+        float score = 0.0f;
+        uint32 usable = 0;
+        // Creatures of the spot itself: far above the bot, never; a little above, only if nothing safer.
+        if (cell.dangerLevel > level + 3)
+            continue;
+        float risk = bracket->second.high > level + 2 ? 0.3f : 1.0f;
+        if (cell.dangerLevel > level)
+            risk *= 0.1f;
+        for (GatherPoint const& p : cell.points)
+        {
+            if (p.reqSkill > skillValue)
+                continue;
+            // Skinning and cloth: only the creatures it can fight; cloth, not those far below it either (poorer cloth).
+            if (p.level && p.level > level + 1)
+                continue;
+            if (skillId == GATHER_CLOTH && p.level + 8 < level)
+                continue;
+            // Fishing: a catch raises the skill wherever it is made, any water of its skill does.
+            if (nodes)
+                score += (nodes->count(p.entry) || (p.areaId && nodes->count(p.areaId)) ||
+                          (fishing && nodes->count(cell.zoneId)))
+                             ? 1.0f
+                             : 0.0f;
+            else
+            {
+                score += GatherPointWeight(skillId, p.reqSkill, skillValue);
+                ++usable;
+            }
+        }
+        if ((nodes ? score : float(usable)) < (fishing ? 1.0f : 3.0f))
+            continue;
+
+        float const dist = bot->GetExactDist2d(cell.x, cell.y);
+        candidates.emplace_back(risk * score / (1.0f + dist / 3000.0f), &cell);
+    }
+
+    if (candidates.empty())
+        return nullptr;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](auto const& a, auto const& b) { return a.first > b.first; });
+    size_t const pool = std::min<size_t>(5, candidates.size());
+    return candidates[urand(0, uint32(pool - 1))].second;
+}
+
+namespace
+{
+struct NodesOfItem
+{
+    std::set<uint32> nodes;
+    uint32 skillId = 0;
+    uint32 reqSkill = 0;
+};
+std::mutex nodesOfItemLock;
+std::unordered_map<uint32, NodesOfItem> nodesOfItem;
+}  // namespace
+
+// Read once per item: the loot tables do not change while the server runs.
+std::set<uint32> TravelMgr::NodesYielding(uint32 itemId, uint32& skillId, uint32& reqSkill)
+{
+    {
+        std::lock_guard<std::mutex> guard(nodesOfItemLock);
+        auto const it = nodesOfItem.find(itemId);
+        if (it != nodesOfItem.end())
+        {
+            skillId = it->second.skillId;
+            reqSkill = it->second.reqSkill;
+            return it->second.nodes;
+        }
+    }
+    NodesOfItem read;
+    read.nodes = ReadNodesYielding(itemId, read.skillId, read.reqSkill);
+    skillId = read.skillId;
+    reqSkill = read.reqSkill;
+    std::lock_guard<std::mutex> guard(nodesOfItemLock);
+    nodesOfItem.emplace(itemId, read);
+    return read.nodes;
+}
+
+std::set<uint32> TravelMgr::ReadNodesYielding(uint32 itemId, uint32& skillId, uint32& reqSkill)
+{
+    std::set<uint32> nodes;
+    skillId = 0;
+    reqSkill = 0;
+
+    std::set<uint32> lootIds;
+    if (QueryResult result = WorldDatabase.Query("SELECT Entry FROM gameobject_loot_template WHERE Item = {}", itemId))
+        do
+            lootIds.insert(result->Fetch()[0].Get<uint32>());
+        while (result->NextRow());
+    if (lootIds.empty())
+        return nodes;
+
+    for (auto const& [entry, goInfo] : *sObjectMgr->GetGameObjectTemplates())
+    {
+        if (goInfo.type != GAMEOBJECT_TYPE_CHEST || !lootIds.count(goInfo.GetLootId()))
+            continue;
+        LockEntry const* lock = sLockStore.LookupEntry(goInfo.GetLockId());
+        if (!lock)
+            continue;
+        for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+        {
+            if (lock->Type[i] != LOCK_KEY_SKILL)
+                continue;
+            SkillType const skill = SkillByLockType(LockType(lock->Index[i]));
+            if (skill != SKILL_HERBALISM && skill != SKILL_MINING)
+                continue;
+            if (skillId && skill != skillId)
+                break;
+            skillId = skill;
+            uint32 const req = std::max<uint32>(1, lock->Skill[i]);
+            reqSkill = reqSkill ? std::min(reqSkill, req) : req;
+            nodes.insert(entry);
+            break;
+        }
+    }
+    if (!nodes.empty())
+        return nodes;
+
+    // The loot entries of a table that hold the item, directly or through a reference table.
+    auto lootEntries = [itemId](char const* table)
+    {
+        std::set<uint32> entries;
+        if (QueryResult result = WorldDatabase.Query(
+                "SELECT Entry FROM {} WHERE (Item = {} AND Reference = 0) OR Reference IN "
+                "(SELECT Entry FROM reference_loot_template WHERE Item = {} AND Reference = 0)",
+                table, itemId, itemId))
+            do
+                entries.insert(result->Fetch()[0].Get<uint32>());
+            while (result->NextRow());
+        return entries;
+    };
+
+    // Skinning: the beasts whose skin gives it.
+    if (std::set<uint32> const skins = lootEntries("skinning_loot_template"); !skins.empty())
+    {
+        for (auto const& [entry, creature] : *sObjectMgr->GetCreatureTemplates())
+        {
+            if (!creature.SkinLootId || !skins.count(creature.SkinLootId) ||
+                creature.GetRequiredLootSkill() != SKILL_SKINNING || creature.rank != CREATURE_ELITE_NORMAL)
+                continue;
+            uint32 const req = SkinningSkillFor(creature.minlevel);
+            reqSkill = reqSkill ? std::min(reqSkill, req) : req;
+            nodes.insert(entry);
+        }
+        if (!nodes.empty())
+        {
+            skillId = SKILL_SKINNING;
+            return nodes;
+        }
+        reqSkill = 0;
+    }
+
+    // Cloth: the humanoids whose loot has it.
+    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        proto && proto->Class == ITEM_CLASS_TRADE_GOODS && proto->SubClass == ITEM_SUBCLASS_CLOTH)
+    {
+        std::set<uint32> const loot = lootEntries("creature_loot_template");
+        for (uint32 entry : sTravelMgr.clothCreatures)
+            if (CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(entry); creature && loot.count(creature->lootid))
+                nodes.insert(entry);
+        // Deeper references: any humanoid with cloth, its level picks the cloth.
+        if (nodes.empty())
+            nodes = sTravelMgr.clothCreatures;
+        if (!nodes.empty())
+        {
+            skillId = GATHER_CLOTH;
+            reqSkill = 1;
+            return nodes;
+        }
+    }
+
+    // Fishing: the areas whose catch has it, and the pools that give it. Area ids and the gameobject entries of the
+    // pools do not meet (a few thousand against 180000 and more), one set holds both.
+    std::set<uint32> const areas = lootEntries("fishing_loot_template");
+    std::set<uint32> const pools = lootEntries("gameobject_loot_template");
+    for (uint32 area : areas)
+    {
+        nodes.insert(area);
+        int32 const skill = std::max<int32>(1, sObjectMgr->GetFishingBaseSkillLevel(area));
+        reqSkill = reqSkill ? std::min<uint32>(reqSkill, uint32(skill)) : uint32(skill);
+    }
+    if (!pools.empty())
+        for (auto const& [entry, goInfo] : *sObjectMgr->GetGameObjectTemplates())
+            if (goInfo.type == GAMEOBJECT_TYPE_FISHINGHOLE && pools.count(goInfo.GetLootId()))
+            {
+                nodes.insert(entry);
+                reqSkill = reqSkill ? reqSkill : 1;
+            }
+    if (!nodes.empty())
+        skillId = SKILL_FISHING;
+    return nodes;
+}
+
+TravelMgr::GatherCell const* TravelMgr::FindGatherCell(uint32 mapId, uint32 skillId, float x, float y) const
+{
+    for (GatherCell const& cell : gatherCells)
+        if (cell.mapId == mapId && cell.skillId == skillId && std::fabs(cell.x - x) < 1.0f && std::fabs(cell.y - y) < 1.0f)
+            return &cell;
+    std::lock_guard<std::mutex> guard(extraGatherLock);
+    for (GatherCell const& cell : extraGatherCells)
+        if (cell.mapId == mapId && cell.skillId == skillId && std::fabs(cell.x - x) < 1.0f && std::fabs(cell.y - y) < 1.0f)
+            return &cell;
+    return nullptr;
+}
+
+TravelMgr::GatherCell const* TravelMgr::AddFishingCell(uint32 mapId, uint32 zoneId, float x, float y, float z)
+{
+    if (GatherCell const* known = FindGatherCell(mapId, SKILL_FISHING, x, y))
+        return known;
+    std::lock_guard<std::mutex> guard(extraGatherLock);
+    GatherCell& cell = extraGatherCells.emplace_back();
+    cell.mapId = mapId;
+    cell.zoneId = zoneId;
+    cell.skillId = SKILL_FISHING;
+    cell.x = x;
+    cell.y = y;
+    cell.z = z;
+    cell.points.push_back({x, y, z, 1, 0});
+    return &cell;
 }

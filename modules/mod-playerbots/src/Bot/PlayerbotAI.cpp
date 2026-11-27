@@ -5,12 +5,31 @@
  */
 
 #include "PlayerbotAI.h"
+#include "CoaBotRaces.h"
+#include "CoaKeySpells.h"
 
+#include "CoaLive.h"
+#include "CoaCityLife.h"
+#include "CoaChatRules.h"
+#include "CoaPet.h"
+#include "CoaHearthWithMaster.h"
+#include "CoaBotMute.h"
+#include "CoaAltGive.h"
+#include "CoaFishingGear.h"
+#include "CoaSafeMoveRules.h"
+#include "CoaBotWhy.h"
+#include "CoaMoveAudit.h"
+#include "CurrentTargetValue.h"
+
+#include <set>
 #include <functional>
 #include "RaceMgr.h"
 #include "CoaSpecialization.h"
+#include "CoaAltBags.h"
+#include "AutoMaintenanceOnLevelupAction.h"
 #include "CoaWildcard.h"
 #include "CoaReborn.h"
+#include "CoaMissionMgr.h"
 #include "AiFactory.h"
 #include "BudgetValues.h"
 #include "CellImpl.h"
@@ -51,6 +70,10 @@
 #include "PlayerbotOperations.h"
 #include "PlayerbotTextMgr.h"
 #include "PlayerbotWorldThreadProcessor.h"
+#include "CoaPlayerMainTank.h"
+#include "CoaLootPetAction.h"
+#include "CoaTotemRecall.h"
+#include "CoaTankAction.h"
 #include "Playerbots.h"
 #include "PositionValue.h"
 #include "RBAC.h"
@@ -365,6 +388,14 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         bot->GetSession()->isLogingOut() || bot->IsDuringRemoveFromWorld())
         return;
 
+    if (coaTeamTimer > elapsed)
+        coaTeamTimer -= elapsed;
+    else
+    {
+        coaTeamTimer = CoaAltAddon::TEAM_TICK_MS;
+        CoaAltAddon::TickTeam(this, coaTeamCache);
+    }
+
     // A bot left with the taxi flag but no flight (flight path cut short, map change mid-flight) stays
     // mounted and frozen: clean up what the end of the flight should have.
     if (bot->HasUnitFlag(UNIT_FLAG_TAXI_FLIGHT) && !bot->IsInFlight() &&
@@ -375,6 +406,12 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         bot->GetMotionMaster()->MovementExpired();
         bot->CleanupAfterTaxiFlight();
     }
+
+    // Bots send no movement opcodes, so m_lastFallZ stays frozen and Player::IsFalling() (a Z test
+    // against it) blocks LFG teleports and other "falling" checks. Unit::IsFalling() is the flag test, so
+    // real falls keep theirs.
+    if (!bot->Unit::IsFalling())
+        bot->SetFallInformation(0, bot->GetPositionZ());
 
     // Handle cheat options (set bot health and power if cheats are enabled)
     if (bot->IsAlive() &&
@@ -401,6 +438,9 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         YieldThread(bot, GetReactDelay());
         return;
     }
+
+    // The hearthstone used with the master (AiPlayerbot.CoaHearthWithMaster): before the cast wait below.
+    CoaHearthWithMaster::Tick(this);
 
     // Handle a spell that is still in its preparing phase (including channeled spells).
     Spell* currentSpell = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
@@ -538,6 +578,24 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 
     // Update the bot's group status (moved to helper function)
     UpdateAIGroupMaster();
+    // The end of a Main Tank bar order and a stale main tank flag, before the engine runs (RC11).
+    CoaTankOrderTick(this);
+    // The loot pet of an alt (AiPlayerbot.AltLootCompanion).
+    CoaLootCompanionTick(this);
+    // The alt's class and craft books, used by themselves ("pet auto on", CoA Pets).
+    CoaPet::Tick(this);
+    // A fishing pole left in hand gives way to a weapon in a fight or a group (CoaFishingGear).
+    CoaFishingGear::Tick(this);
+    // The night bench of the odd moves (AiPlayerbot.CoaMoveAudit, off by default): a sample of the bot.
+    CoaMoveAudit::Tick(this);
+    // ".squidbots why" (AiPlayerbot.CoaWhy.Enable): where the bot stands still since when.
+    CoaBotWhy::Tick(this);
+    // The CoA talents left by a capped rebuild (AiPlayerbot.CoaLive.TalentsPerUpdate).
+    CoaTalentsTick(bot);
+    // The level-up maintenance spread over the next updates (AiPlayerbot.CoaLive.MaintenanceSpread).
+    AutoMaintenanceOnLevelupAction::Tick(this);
+    // Totems put away after the fight (AiPlayerbot.CoaTotemRecall).
+    CoaTotemRecallTick(this);
 
     // Update internal AI
     UpdateAIInternal(elapsed, minimal);
@@ -685,6 +743,24 @@ void PlayerbotAI::RejoinLfgDungeon()
     }
     sLFGMgr->TeleportPlayer(bot, false);
 }
+// A bot alive when its master released was told to wait there, and only reclaiming the corpse near it
+// brought it back to follow: bots dead by then, or a master raised by a spirit healer, a resurrection or a
+// GM, kept "stay" for good (ladiabale, Road to De Other Side, 24/10). The wait ends once the master lives.
+void PlayerbotAI::ResumeFollowAfterMasterRevive()
+{
+    if (!waitingForMasterRevive)
+        return;
+    if (!HasStrategy("stay", BOT_STATE_NON_COMBAT))
+    {
+        waitingForMasterRevive = false;
+        return;
+    }
+    if (!master || !master->IsInWorld() || !master->IsAlive())
+        return;
+
+    waitingForMasterRevive = false;
+    ChangeStrategy("+follow,-stay", BOT_STATE_NON_COMBAT);
+}
 
 void PlayerbotAI::UpdateAIInternal([[maybe_unused]] uint32 elapsed, bool minimal)
 {
@@ -700,11 +776,15 @@ void PlayerbotAI::UpdateAIInternal([[maybe_unused]] uint32 elapsed, bool minimal
 
     ClearStaleFall();
     RejoinLfgDungeon();
+    ResumeFollowAfterMasterRevive();
 
-    // kinda expensive call to make on every single updateAI, do we really need this information?
-    std::string const mapString = WorldPosition(bot).isOverworld() ? std::to_string(bot->GetMapId()) : "I";
-    PerfMonitorOperation* pmo =
-        sPerfMonitor.start(PERF_MON_TOTAL, "PlayerbotAI::UpdateAIInternal " + mapString);
+    // Only build the metric name when the profiler is enabled; start() returns nullptr otherwise.
+    PerfMonitorOperation* pmo = nullptr;
+    if (sPlayerbotAIConfig.perfMonEnabled)
+    {
+        std::string const mapString = WorldPosition(bot).isOverworld() ? std::to_string(bot->GetMapId()) : "I";
+        pmo = sPerfMonitor.start(PERF_MON_TOTAL, "PlayerbotAI::UpdateAIInternal " + mapString);
+    }
 
     ExternalEventHelper helper(aiObjectContext);
 
@@ -731,13 +811,16 @@ void PlayerbotAI::UpdateAIInternal([[maybe_unused]] uint32 elapsed, bool minimal
     }
 
     HandleCommands();
+    CoaAltBags::Drain(this);
+    // Items given by another alt of the master, stored here (AiPlayerbot.CoaGiveToAlt.Enable).
+    CoaAltGive::Tick(this);
 
     // logout if logout timer is ready or if instant logout is possible
     if (bot->GetSession()->isLogingOut())
     {
         WorldSession* botWorldSessionPtr = bot->GetSession();
         bool logout = botWorldSessionPtr->ShouldLogOut(time(nullptr));
-        if (!master || !master->GetSession()->GetPlayer())
+        if (!master || !master->IsInWorld() || !master->GetSession() || !master->GetSession()->GetPlayer())
             logout = true;
 
         if (bot->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING) || bot->HasUnitState(UNIT_STATE_IN_FLIGHT) ||
@@ -746,7 +829,7 @@ void PlayerbotAI::UpdateAIInternal([[maybe_unused]] uint32 elapsed, bool minimal
             logout = true;
         }
 
-        if (master &&
+        if (master && master->IsInWorld() &&
             (master->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING) || master->HasUnitState(UNIT_STATE_IN_FLIGHT) ||
              (master->GetSession() &&
               master->GetSession()->HasPermission(rbac::RBAC_PERM_INSTANT_LOGOUT))))
@@ -782,6 +865,27 @@ void PlayerbotAI::UpdateAIInternal([[maybe_unused]] uint32 elapsed, bool minimal
 
     if (pmo)
         pmo->finish();
+}
+
+// A command of the master (a real player): a list asked again within 2 s (SquidBots Lite refreshing) came back short,
+// because TellMaster drops a line said less than 2 s before, so the master's list commands start from a clean slate;
+// and a command waited for the next AI update, up to 18 s while the bot eats or drinks (as an invitation did), so the
+// master's commands wake it, at most once a second.
+void PlayerbotAI::OnMasterCommand(std::string const& filtered, Player* fromPlayer)
+{
+    if (!fromPlayer || fromPlayer != master || GET_PLAYERBOT_AI(fromPlayer))
+        return;
+
+    static std::set<std::string> const lists = {"c", "bank", "quests all", "mount ?", "talents ?", "co ?", "nc ?", "stats"};
+    if (lists.contains(filtered))
+        whispers.clear();
+
+    time_t const now = time(nullptr);
+    if (now != lastMasterWakeAt)
+    {
+        lastMasterWakeAt = now;
+        SetNextCheckDelay(0);
+    }
 }
 
 void PlayerbotAI::HandleCommands()
@@ -890,6 +994,18 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const& text, Player& fr
     if (filtered.empty())
         return;
 
+    if (!IsAllowedCommand(filtered) &&
+        !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER,
+                                      &fromPlayer))
+    {
+        if (filtered == "summon")
+            LOG_WARN("playerbots", "coa summon: {} refuses the summon of {} (its master: {})", bot->GetName(),
+                     fromPlayer.GetName(), master ? master->GetName() : std::string("none"));
+        return;
+    }
+
+    // "debug" answers with the bot's AI state: it goes through the same security gate as every other command
+    // (a player at INVITE level read it before).
     if (filtered.substr(0, 6) == "debug ")
     {
         std::string response = HandleRemoteCommand(filtered.substr(6));
@@ -900,10 +1016,7 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const& text, Player& fr
         return;
     }
 
-    if (!IsAllowedCommand(filtered) &&
-        !GetSecurity()->CheckLevelFor(PlayerbotSecurityLevel::PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER,
-                                      &fromPlayer))
-        return;
+    OnMasterCommand(filtered, &fromPlayer);
 
     if (type == CHAT_MSG_RAID_WARNING && filtered.find(bot->GetName()) != std::string::npos &&
         filtered.find("award") == std::string::npos)
@@ -1112,7 +1225,8 @@ void PlayerbotAI::Reset(bool full)
     aiObjectContext->GetValue<ObjectGuid>("pull strategy target")->Set(ObjectGuid::Empty);
     aiObjectContext->GetValue<GuidPosition>("rpg target")->Set(GuidPosition());
     aiObjectContext->GetValue<LootObject>("loot target")->Set(LootObject());
-    aiObjectContext->GetValue<uint32>("lfg proposal")->Set(0);
+    // "lfg proposal" is kept: a bot waiting to accept (in combat, dead, teleported to a graveyard) must still answer.
+    // LfgAcceptAction forgets it once the proposal ends or expires.
     bot->SetTarget();
 
     LastSpellCast& lastSpell = aiObjectContext->GetValue<LastSpellCast&>("last spell cast")->Get();
@@ -1237,6 +1351,12 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const text, Player* fro
     if (filtered.empty())
         return;
 
+    if (!IsAllowedCommand(filtered) &&
+        (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER, fromPlayer)))
+        return;
+
+    // "debug" answers with the bot's AI state: it goes through the same security gate as every other command
+    // (a player at INVITE level read it before).
     if (filtered.substr(0, 6) == "debug ")
     {
         std::string const response = HandleRemoteCommand(filtered.substr(6));
@@ -1246,9 +1366,8 @@ void PlayerbotAI::HandleCommand(uint32 type, std::string const text, Player* fro
         fromPlayer->SendDirectMessage(&data);
         return;
     }
-    if (!IsAllowedCommand(filtered) &&
-        (!GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_ALLOW_ALL, type != CHAT_MSG_WHISPER, fromPlayer)))
-        return;
+
+    OnMasterCommand(filtered, fromPlayer);
 
     if (type == CHAT_MSG_RAID_WARNING && filtered.find(bot->GetName()) != std::string::npos &&
         filtered.find("award") == std::string::npos)
@@ -1436,6 +1555,10 @@ void PlayerbotAI::HearChat(WorldPacket const& packet)
         // do not reply to self but always try to reply to real player
         if (guid1 != bot->GetGUID())
         {
+            // CoA Live answers a stranger's whispers to a random bot from its bank (CoaLive::OnWhisper).
+            if (msgtype == CHAT_MSG_WHISPER && CoaLive::AnswersWhispers(this, guid1))
+                return;
+
             time_t lastChat = GetAiObjectContext()->GetValue<time_t>("last said", "chat")->Get();
             bool isPaused = time(0) < lastChat;
             bool isFromFreeBot = false;
@@ -1455,6 +1578,11 @@ void PlayerbotAI::HearChat(WorldPacket const& packet)
                 return;
 
             if (HasGameClientMaster() && guid1 != GetMaster()->GetGUID())
+                return;
+
+            // Chat off (AiPlayerbot.CoaLive.Chat.Enable = 0), or the living chat speaking without
+            // AiPlayerbot.CoaLive.LegacyChat: no reply to chatter, only to the master.
+            if (!CoaChat::ChatReplyAllowed(CoaLive::LegacyChatOn(), GetMaster() && guid1 == GetMaster()->GetGUID()))
                 return;
 
             auto itemIds = GetChatHelper()->ExtractAllItemIds(message);
@@ -1517,6 +1645,16 @@ void PlayerbotAI::HandleBotOutgoingPacket(WorldPacket const& packet)
     // long for an answer. Take it now; the meal can wait.
     if (packet.GetOpcode() == SMSG_GROUP_INVITE)
         SetNextCheckDelay(0);
+
+    // A real player turned down the bot's invite: a word back (AiPlayerbot.CoaLive.PlayerReplies.Enable).
+    if (packet.GetOpcode() == SMSG_GROUP_DECLINE)
+    {
+        WorldPacket p(packet);
+        p.rpos(0);
+        std::string name;
+        p >> name;
+        CoaLive::InviteDeclined(bot, name);
+    }
 
     switch (packet.GetOpcode())
     {
@@ -1746,6 +1884,15 @@ void PlayerbotAI::ChangeEngine(BotState type)
 
     if (currentEngine != engine)
     {
+        if (CoaLogsTargets(bot))
+        {
+            Unit* target = aiObjectContext->GetValue<Unit*>("current target")->Get();
+            LOG_INFO("playerbots", "coa engine: {} {} -> {} (in combat {}, attackers {}, target {})", bot->GetName(),
+                     currentState == BOT_STATE_COMBAT ? "combat" : currentState == BOT_STATE_DEAD ? "dead" : "non-combat",
+                     type == BOT_STATE_COMBAT ? "combat" : type == BOT_STATE_DEAD ? "dead" : "non-combat",
+                     bot->IsInCombat() ? 1 : 0, aiObjectContext->GetValue<GuidVector>("attackers")->Get().size(),
+                     target ? target->GetName() : "none");
+        }
         currentEngine = engine;
         currentState = type;
         ReInitCurrentEngine();
@@ -1861,6 +2008,13 @@ void PlayerbotAI::DoNextAction(bool min)
         CoaRestoreAncestralCombat(bot);
     }
 
+    // AiPlayerbot.CoaCursedFormUpkeep: a Bloodmage Eternal tank keeps its Cursed Form, looked at every 2 seconds.
+    if (sPlayerbotAIConfig.coaCursedFormUpkeep && GetMSTimeDiffToNow(coaCursedFormCheckedAt) >= 2000)
+    {
+        coaCursedFormCheckedAt = getMSTime();
+        CoaKeepCursedForm(this, bot);
+    }
+
     if (!bot->IsInCombat() && GetMSTimeDiffToNow(coaGearCheckedAt) >= 10000)
     {
         coaGearCheckedAt = getMSTime();
@@ -1887,9 +2041,13 @@ void PlayerbotAI::DoNextAction(bool min)
                     pet->ToggleAutocast(info, !instance);
         }
 
-        // A bot standing still indoors gets off its mount: one stayed mounted in the Scarlet Raven Tavern
-        // (jealous-sound/azerothcore-wotlk-coa#6802).
-        if (bot->IsMounted() && !bot->isMoving() && !bot->IsInFlight() && !bot->GetTransport() && !bot->IsOutdoors())
+        // A bot indoors gets off its mount: one stayed mounted in the Scarlet Raven Tavern
+        // (jealous-sound/azerothcore-wotlk-coa#6802). 3.2.3 (the user: bots riding inside inns): walking too, so it
+        // walks in (CoaSafeMove::IndoorDismount); CheckMountState never mounts it again indoors.
+        // In a dungeon or a raid, still only, as in 3.2.2.
+        if (CoaSafeMove::IndoorDismount(bot->IsMounted(), bot->IsOutdoors(), bot->IsInFlight(), bot->GetTransport(),
+                                        bot->InBattleground()) &&
+            (!bot->GetMap()->Instanceable() || !bot->isMoving()))
             bot->RemoveAurasByType(SPELL_AURA_MOUNTED);
 
         // A bot out of a taxi kept its flying or gravity flag and floated over the flight master: it sends no landing
@@ -1902,6 +2060,31 @@ void PlayerbotAI::DoNextAction(bool min)
             bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FLYING);
             bot->GetMotionMaster()->MoveFall();
         }
+        // 3.1.8 (move audit of 20/11): off a taxi without those flags, a bot still stood at the height of the path's
+        // last node, up to a few yards over the ground, for minutes (Morgan's Vigil, Darkshire, Thelsamar). A still
+        // bot out of flight, out of water and transport, outdoors, over its floor (CoaSafeMove::DropsToFloor) falls.
+        else if (!bot->IsInFlight() && !bot->GetTransport() && !bot->GetVehicle() && !bot->IsInWater() &&
+                 !bot->IsFlying() && !bot->IsFalling() && !bot->isMoving() && bot->IsAlive() &&
+                 !bot->IsBeingTeleported() && !bot->HasAuraType(SPELL_AURA_FLY) &&
+                 // Levitation and hover keep it up on purpose.
+                 !bot->HasAuraType(SPELL_AURA_HOVER) && !bot->HasUnitMovementFlag(MOVEMENTFLAG_HOVER))
+        {
+            // Every 2 s per bot at most: the floor under it is a query. Per map thread, no lock; bounded.
+            static thread_local std::unordered_map<uint64, uint32> nextDropCheck;
+            if (nextDropCheck.size() > 4096)
+                nextDropCheck.clear();
+            uint32 const nowMs = getMSTime();
+            uint32& next = nextDropCheck[bot->GetGUID().GetRawValue()];
+            if (!next || getMSTimeDiff(next, nowMs) < 0x80000000u)
+            {
+                next = nowMs + 2000;
+                float const floorZ = bot->GetFloorZ();
+                LiquidData const& liquid = bot->GetLiquidData();
+                bool const waterBelow = liquid.Level > INVALID_HEIGHT && liquid.Level >= floorZ;
+                if (CoaSafeMove::DropsToFloor(bot->GetPositionZ(), floorZ, bot->IsOutdoors(), waterBelow))
+                    bot->GetMotionMaster()->MoveFall();
+            }
+        }
     }
 
     bool minimal = !this->AllowActivity();
@@ -1910,7 +2093,14 @@ void PlayerbotAI::DoNextAction(bool min)
 
     if (minimal)
     {
-        if (!bot->isAFK() && !bot->InBattleground() && !HasGameClientMaster())
+        // CoA Live (AiPlayerbot.CoaLive.NoAwayFlag): a bot resting its turn of the BotActiveAlone rotation is not
+        // shown <Away>: it still talks (channels, trade, whispers), and the chat was full of <Away> bots.
+        if (sPlayerbotAIConfig.coaLiveNoAwayFlag)
+        {
+            if (bot->isAFK() && !IsSelfBot(bot))
+                bot->ToggleAFK();
+        }
+        else if (!bot->isAFK() && !bot->InBattleground() && !HasGameClientMaster())
             bot->ToggleAFK();
 
         SetNextCheckDelay(sPlayerbotAIConfig.passiveDelay);
@@ -1940,7 +2130,9 @@ void PlayerbotAI::DoNextAction(bool min)
     }
     else if (bot->m_movementInfo.HasMovementFlag(MOVEMENTFLAG_WALKING))
         bot->m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_WALKING);
-    else if ((nextAICheckDelay < 1000) && bot->IsSitState() && !(bot->GetInterruptMask() & AURA_INTERRUPT_FLAG_NOT_SEATED))
+    // CoA 3.2.2 (the user: bots standing on chairs): not out of its City Life seat while it holds it.
+    else if ((nextAICheckDelay < 1000) && bot->IsSitState() && !(bot->GetInterruptMask() & AURA_INTERRUPT_FLAG_NOT_SEATED) &&
+             !CoaCityLife::KeepsSeated(this))
         bot->SetStandState(UNIT_STAND_STATE_STAND);
 
     bool hasMountAura = bot->HasAuraType(SPELL_AURA_MOD_INCREASE_MOUNTED_SPEED) ||
@@ -2009,11 +2201,13 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
 {
     static const std::vector<std::string> allInstanceStrategies =
     {
-        "aq20", "blacktemple", "bwl", "gruulslair", "hyjal", "icc", "karazhan", "magtheridon", "moltencore", "naxx",
-        "onyxia", "rs", "ssc", "tbc-ac", "tbc-mech", "tbc-mgt", "tbc-seth", "tbc-ub", "tempestkeep", "ulduar",
-        "vanilla-rfc", "vanilla-sfk", "vanilla-sm", "voa", "wotlk-an", "wotlk-cos", "wotlk-dtk", "wotlk-eoe",
+        "aq20", "aq40", "blacktemple", "bwl", "coa-other-side", "coa-vaults", "gruulslair", "hyjal", "icc", "karazhan", "magtheridon", "moltencore", "naxx",
+        "onyxia", "rs", "ssc", "sunwell", "tbc-ac", "tbc-mech", "tbc-mgt", "tbc-seth", "tbc-ub", "tempestkeep", "ulduar",
+        "vanilla-bfd", "vanilla-brd", "vanilla-brs", "vanilla-dm", "vanilla-mara", "vanilla-rfc", "vanilla-rfd", "vanilla-rfk",
+        "vanilla-scholo", "vanilla-sfk", "vanilla-sm", "vanilla-st", "vanilla-strat", "vanilla-ulda", "vanilla-wc", "voa", "wotlk-an",
+        "wotlk-cos", "wotlk-dtk", "wotlk-eoe",
         "wotlk-fos", "wotlk-gd", "wotlk-hol", "wotlk-hos", "wotlk-nex", "wotlk-occ", "wotlk-ok", "wotlk-os",
-        "wotlk-pos", "wotlk-toc", "wotlk-uk", "wotlk-up", "wotlk-vh", "zulaman"
+        "wotlk-pos", "wotlk-toc", "wotlk-uk", "wotlk-up", "wotlk-vh", "zulaman", "zulgurub"
     };
 
     for (std::string const& strat : allInstanceStrategies)
@@ -2028,11 +2222,47 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
         case 33:
             strategyName = "vanilla-sfk";  // Shadowfang Keep
             break;
+        case 43:
+            strategyName = "vanilla-wc";  // Wailing Caverns
+            break;
+        case 47:
+            strategyName = "vanilla-rfk";  // Razorfen Kraul
+            break;
+        case 48:
+            strategyName = "vanilla-bfd";  // Blackfathom Deeps
+            break;
+        case 70:
+            strategyName = "vanilla-ulda";  // Uldaman
+            break;
+        case 109:
+            strategyName = "vanilla-st";  // Sunken Temple
+            break;
+        case 129:
+            strategyName = "vanilla-rfd";  // Razorfen Downs
+            break;
         case 189:
             strategyName = "vanilla-sm";  // Scarlet Monastery
             break;
+        case 229:
+            strategyName = "vanilla-brs";  // Blackrock Spire
+            break;
+        case 230:
+            strategyName = "vanilla-brd";  // Blackrock Depths
+            break;
         case 249:
             strategyName = "onyxia";  // Onyxia's Lair
+            break;
+        case 289:
+            strategyName = "vanilla-scholo";  // Scholomance
+            break;
+        case 309:
+            strategyName = "zulgurub";  // Zul'Gurub
+            break;
+        case 329:
+            strategyName = "vanilla-strat";  // Stratholme
+            break;
+        case 349:
+            strategyName = "vanilla-mara";  // Maraudon
             break;
         case 389:
             strategyName = "vanilla-rfc";  // Ragefire Chasm
@@ -2040,11 +2270,17 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
         case 409:
             strategyName = "moltencore";  // Molten Core
             break;
+        case 429:
+            strategyName = "vanilla-dm";  // Dire Maul
+            break;
         case 469:
             strategyName = "bwl";  // Blackwing Lair
             break;
         case 509:
             strategyName = "aq20";  // Ruins of Ahn'Qiraj
+            break;
+        case 531:
+            strategyName = "aq40";  // Temple of Ahn'Qiraj
             break;
         case 532:
             strategyName = "karazhan";  // Karazhan
@@ -2096,6 +2332,9 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
             break;
         case 578:
             strategyName = "wotlk-occ";  // The Oculus
+            break;
+        case 580:
+            strategyName = "sunwell";  // The Sunwell Plateau
             break;
         case 585:
             strategyName = "tbc-mgt";  // Magisters' Terrace
@@ -2150,6 +2389,12 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
             break;
         case 724:
             strategyName = "rs";  // Ruby Sanctum
+            break;
+        case 936:
+            strategyName = "coa-vaults";  // Vaults of the Inquisition
+            break;
+        case 937:
+            strategyName = "coa-other-side";  // Road to De Other Side
             break;
         default:
             break;
@@ -2245,6 +2490,8 @@ bool PlayerbotAI::PlaySound(uint32 emote)
 
 bool PlayerbotAI::PlayEmote(uint32 emote)
 {
+    if (!CoaLive::GroupEmoteAllowed(bot))
+        return false;
     WorldPacket data(SMSG_TEXT_EMOTE);
     data << (TextEmotes)emote;
     data << EmoteAction::GetNumberOfEmoteVariants((TextEmotes)emote, bot->getRace(), bot->getGender());
@@ -2299,7 +2546,7 @@ bool PlayerbotAI::IsRanged(Player* player, bool bySpec)
         return botAi->ContainsStrategy(STRATEGY_TYPE_RANGED);
 
     if (IsCoaBot(player))
-        return GetCoaStyle(player) != CoaStyle::Melee;
+        return !IsCoaMeleeHealer(player) && GetCoaStyle(player) != CoaStyle::Melee;
 
     if (IsRebornBot(player))
         return IsWcrRanged(player);
@@ -2469,13 +2716,14 @@ bool PlayerbotAI::HasAggro(Unit* unit)
     if (!IsValidUnit(unit))
         return false;
 
-    bool isMT = IsExplicitMainTank(bot);
+    // A player main tank ("tank main on") holds what is on the player, in any spec and even when the group's main
+    // tank flag is on a bot; under the rescue health, the bots take it back (06/11 review, points 2 and 3).
     Unit* victim = unit->GetVictim();
-    if (victim && (victim->GetGUID() == bot->GetGUID() || (!isMT && victim->ToPlayer() && IsTank(victim->ToPlayer()))))
-    {
-        return true;
-    }
-    return false;
+    if (!victim)
+        return false;
+    Player* victimPlayer = victim->ToPlayer();
+    return CoaHasAggro(victim->GetGUID() == bot->GetGUID(), CoaPlayerMainTank::Hold(bot, unit),
+                       victimPlayer && IsTank(victimPlayer), IsExplicitMainTank(bot));
 }
 
 bool PlayerbotAI::IsMovementImpaired(Unit* unit)
@@ -2873,11 +3121,27 @@ ObjectGuid PlayerbotAI::GetMainTankGuid(Group* group)
     if (!group)
         return ObjectGuid::Empty;
 
+    // CoA Combat, the player leads (AiPlayerbot.CoaCombat.PlayerLed.Enable, CoaPlayerLedRule::ChooseMainTank): the
+    // player who opened the Main Tank bar is the main tank, as for CoaGroupTank::Reference; then the stock order.
+    if (sPlayerbotAIConfig.coaCombatPlayerLedEnable)
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (member && member->IsAlive() && member->IsInWorld() && CoaPlayerMainTank::IsSet(member))
+                return member->GetGUID();
+        }
+
     Group::MemberSlotList const& slots = group->GetMemberSlots();
     for (Group::member_citerator itr = slots.begin(); itr != slots.end(); ++itr)
     {
+        // A main tank set by the raid frame but dead stayed main tank: nobody took Maulgar after she died and he
+        // roamed 2:50, his Arcing Smash on the damage dealers (ladiabale, Gruul 2.5). The next living tank takes over.
         if (itr->flags & MEMBER_FLAG_MAINTANK)
-            return itr->guid;
+        {
+            Player* flagged = ObjectAccessor::FindPlayer(itr->guid);
+            if (flagged && flagged->IsAlive())
+                return itr->guid;
+        }
     }
 
     for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
@@ -3295,6 +3559,8 @@ void PlayerbotAI::LogChat(std::string_view how, std::string const& msg) const
 
 bool PlayerbotAI::SayToGuild(std::string const& msg)
 {
+    if (!CoaChat::ChannelLineAllowed(CoaLive::ChatOn()))  // AiPlayerbot.CoaLive.Chat.Enable = 0
+        return false;
     if (msg.empty())
     {
         return false;
@@ -3319,6 +3585,8 @@ bool PlayerbotAI::SayToGuild(std::string const& msg)
 
 bool PlayerbotAI::SayToWorld(std::string const& msg)
 {
+    if (!CoaChat::ChannelLineAllowed(CoaLive::ChatOn()))  // AiPlayerbot.CoaLive.Chat.Enable = 0
+        return false;
     if (msg.empty())
         return false;
 
@@ -3328,6 +3596,8 @@ bool PlayerbotAI::SayToWorld(std::string const& msg)
 
 bool PlayerbotAI::SayToWorldNow(std::string const& msg)
 {
+    if (!CoaChat::ChannelLineAllowed(CoaLive::ChatOn()))  // AiPlayerbot.CoaLive.Chat.Enable = 0
+        return false;
     if (msg.empty())
     {
         return false;
@@ -3353,6 +3623,8 @@ bool PlayerbotAI::SayToWorldNow(std::string const& msg)
 
 bool PlayerbotAI::SayToChannel(std::string const& msg, ChatChannelId const& chanId)
 {
+    if (!CoaChat::ChannelLineAllowed(CoaLive::ChatOn()))  // AiPlayerbot.CoaLive.Chat.Enable = 0
+        return false;
     if (msg.empty())
         return false;
 
@@ -3363,6 +3635,8 @@ bool PlayerbotAI::SayToChannel(std::string const& msg, ChatChannelId const& chan
 
 bool PlayerbotAI::SayToChannelNow(std::string const& msg, ChatChannelId chanId)
 {
+    if (!CoaChat::ChannelLineAllowed(CoaLive::ChatOn()))  // AiPlayerbot.CoaLive.Chat.Enable = 0
+        return false;
     // Checks whether the message or ChannelMgr is valid
     if (msg.empty())
         return false;
@@ -3571,6 +3845,9 @@ bool PlayerbotAI::TellError(std::string const text, PlayerbotSecurityLevel secur
 // greetings reach a real master.
 bool PlayerbotAI::MasterWantsThis()
 {
+    // Muted by its master (AiPlayerbot.CoaMute.Enable): only the answers to his commands, no greeting.
+    if (CoaBotMute::IsMuted(bot))
+        return time(nullptr) - lastCommandAt <= 10;
     if (sPlayerbotAIConfig.botsWhisperPublic || greeting)
         return true;
     Player* master = GetMaster();
@@ -3849,6 +4126,10 @@ bool PlayerbotAI::CanCastSpell(uint32 spellid, Unit* target, bool checkHasSpell,
     if (uint32 const replacement = bot->GetTemporarySpellReplacement(spellid); replacement && replacement != spellid)
         spellid = replacement;
 
+    // CoA: a spell whose cooldown the player keeps (addon key spells bar) is cast on a "cast" whisper only.
+    if (!coaCastOrdered && CoaKeySpells::Kept(this, spellid))
+        return false;
+
     if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
     {
         if (!sPlayerbotAIConfig.logInGroupOnly || (bot->GetGroup() && HasGameClientMaster()))
@@ -4005,6 +4286,16 @@ bool PlayerbotAI::CanCastSpell(uint32 spellid, Unit* target, bool checkHasSpell,
 
         return false;
     }
+
+    // CoA: no cast bar while standing in an enemy ground effect the bot can step out of: "avoid aoe" goes first.
+    // Healers stood in raid ground effects to cast slow heals (Yeh, 21/10).
+    if (CastingTime && sPlayerbotAIConfig.autoAvoidAoe && bot->GetGroup())
+        if (Aura* ground = GetAiObjectContext()->GetValue<Aura*>("area debuff")->Get())
+            if (ground->GetType() == DYNOBJ_AURA_TYPE && !ground->IsRemoved())
+                if (DynamicObject* area = ground->GetDynobjOwner(); area && area->IsInWorld() && area->GetRadius() > 0.0f &&
+                    area->GetRadius() <= sPlayerbotAIConfig.maxAoeAvoidRadius &&
+                    !sPlayerbotAIConfig.aoeAvoidSpellWhitelist.count(ground->GetId()))
+                    return false;
 
     if (!itemTarget)
     {
@@ -4317,6 +4608,10 @@ bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget)
     // bot->ClearUnitState(UNIT_STATE_CHASE);
     // bot->ClearUnitState(UNIT_STATE_FOLLOW);
 
+    // CoA 3.2.2 (bench of 3606e5be: 3 seat holders of 4 stood up): out of a fight, a bot seated at its City Life
+    // station casts nothing (its buffs wait for the end of its stay) instead of standing up for the spell.
+    if (!bot->IsInCombat() && !bot->IsStandState() && CoaCityLife::KeepsSeated(this))
+        return false;
     bool failWithDelay = false;
     if (!bot->IsStandState())
     {
@@ -4572,6 +4867,10 @@ bool PlayerbotAI::CastSpell(uint32 spellId, float x, float y, float z, Item* ite
     // bot->ClearUnitState(UNIT_STATE_CHASE);
     // bot->ClearUnitState(UNIT_STATE_FOLLOW);
 
+    // CoA 3.2.2 (bench of 3606e5be: 3 seat holders of 4 stood up): out of a fight, a bot seated at its City Life
+    // station casts nothing (its buffs wait for the end of its stay) instead of standing up for the spell.
+    if (!bot->IsInCombat() && !bot->IsStandState() && CoaCityLife::KeepsSeated(this))
+        return false;
     bool failWithDelay = false;
     if (!bot->IsStandState())
     {
@@ -4666,7 +4965,9 @@ bool PlayerbotAI::CanCastVehicleSpell(uint32 spellId, Unit* target)
     if (!spellId)
         return false;
 
-    if (!IsValidUnit(target))
+    // No target is allowed: a siege weapon aims at the vehicle's own spot or at the "bg siege" position (a gate is a
+    // game object, not a unit). Only a target that is gone stops the cast (CoA Combat, Isle of Conquest).
+    if (target && !IsValidUnit(target))
         return false;
 
     Vehicle* vehicle = bot->GetVehicle();
@@ -4751,7 +5052,9 @@ bool PlayerbotAI::CastVehicleSpell(uint32 spellId, Unit* target)
     if (!spellId)
         return false;
 
-    if (!IsValidUnit(target))
+    // No target is allowed: a siege weapon aims at the vehicle's own spot or at the "bg siege" position (a gate is a
+    // game object, not a unit). Only a target that is gone stops the cast (CoA Combat, Isle of Conquest).
+    if (target && !IsValidUnit(target))
         return false;
 
     Vehicle* vehicle = bot->GetVehicle();
@@ -4998,7 +5301,10 @@ bool PlayerbotAI::HasAuraToDispel(Unit* target, uint32 dispelType)
     if (!IsValidPlayer(bot))
         return false;
 
-    bool isFriend = bot->IsFriendlyTo(target);
+    // A group member under an enemy's mind control (Dominate Mind 20604 at Lucifron, 14515 in Razorgore's room)
+    // is still dispelled as a friend, as the core does (Unit::GetDispellableAuraList, original faction).
+    bool isFriend =
+        bot->IsFriendlyTo(target) || (target->IsCharmed() && target->GetReactionTo(bot, true) >= REP_FRIENDLY);
 
     Unit::VisibleAuraMap const* visibleAuras = target->GetVisibleAuras();
     if (!visibleAuras)
@@ -5103,8 +5409,9 @@ bool IsAlliance(uint8 race)
     if (race <= RACE_DRAENEI)
         return false;
 
+    // The server's AiPlayerbot.BotRace.<id> line may set the side of an added race (side=alliance or side=horde).
     ChrRacesEntry const* entry = sChrRacesStore.LookupEntry(race);
-    return entry && entry->TeamID == 7;
+    return CoaBotRace::IsAllianceWith(CoaBotRaces::Get(race), race, entry && entry->TeamID == 7);
 }
 
 Player* PlayerbotAI::FindNewMaster()
@@ -5147,7 +5454,7 @@ Player* PlayerbotAI::FindNewMaster()
             return member;
 
         if (bot->InBattleground() && bot->GetBattleground() &&
-            bot->GetBattleground()->GetBgTypeID() == BATTLEGROUND_AV && !GET_PLAYERBOT_AI(member) &&
+            bot->GetBattleground()->GetBgTypeID(true) == BATTLEGROUND_AV && !GET_PLAYERBOT_AI(member) &&
             member->InBattleground() && bot->GetMapId() == member->GetMapId())
         {
             // Skip if same BG but same subgroup or lower level
@@ -5304,6 +5611,10 @@ bool PlayerbotAI::AllowActive(ActivityType activityType)
     if (activityType == PACKET_ACTIVITY)
         return true;
 
+    // CoA World (SlowIdleTriggers): forced active unless the rotation below decides.
+    if (activityType == ALL_ACTIVITY)
+        coaForcedActive = true;
+
     // all bots forced active, no rotation or scaling needed
     if (sPlayerbotAIConfig.botActiveAlone >= 100 && !sPlayerbotAIConfig.botActiveAloneSmartScale)
         return true;
@@ -5329,6 +5640,14 @@ bool PlayerbotAI::AllowActive(ActivityType activityType)
 
     // bot is waiting in a BG queue — stay active to speed up join
     if (bot->InBattlegroundQueue())
+        return true;
+
+    // a dungeon finder proposal is pending: the bot must answer before it expires
+    if (sLFGMgr->GetState(bot->GetGUID()) == lfg::LFG_STATE_PROPOSAL)
+        return true;
+
+    // bot is gathering on a mission — far from any player, it still has to walk and gather
+    if (sCoaMissionMgr.IsOnMission(bot))
         return true;
 
     // bot is in a guild that contains a real player
@@ -5454,6 +5773,10 @@ bool PlayerbotAI::AllowActive(ActivityType activityType)
                 return true;
         }
     }
+
+    // CoA World (SlowIdleTriggers): nothing above forces this bot to stay active.
+    if (activityType == ALL_ACTIVITY)
+        coaForcedActive = false;
 
     // pathfinding only runs for bots forced active by the rules above —
     // skip it for bots that would only be active via random rotation

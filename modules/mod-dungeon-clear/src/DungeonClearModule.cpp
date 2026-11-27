@@ -1,0 +1,1474 @@
+/*
+ * mod-dungeon-clear — DungeonClearModule.cpp
+ *
+ * MASTER SWITCH: everything below is gated on `DungeonClear.Enable` (conf,
+ * default 1), latched once on the first world tick — see DcModuleEnable.h. With
+ * it off the module is compiled in but completely inert: the registrar returns
+ * before appending a single context, so NO strategy, action, trigger or value
+ * ever reaches a bot's engine, and every hook in this file returns immediately.
+ *
+ * Drop-in glue against STOCK mod-playerbots. Two scripts:
+ *
+ *  1. WorldScript — on the first world-update tick (guaranteed after
+ *     playerbots' OnBeforeWorldInitialized -> PlayerbotAIConfig::Initialize ->
+ *     AiObjectContext::BuildAllSharedContexts has built every shared context),
+ *     append the four DungeonClear contexts into the engine's shared
+ *     registries. Doing it on the first tick (not in our own
+ *     OnBeforeWorldInitialized) sidesteps any module hook-ordering race.
+ *
+ *     CRITICAL: playerbots does NOT use one global registry. Each bot is built
+ *     by AiFactory from a PER-CLASS context (WarriorAiObjectContext, …), and
+ *     each of those declares its OWN shared static lists. The base
+ *     AiObjectContext lists are only the fallback for class 0 (no real bot).
+ *     So we must append into all ten class registries — appending into the
+ *     base alone reaches no bot (that was the "dc on: unknown action" bug).
+ *     The per-class lists are PUBLIC statics, so we touch them directly; only
+ *     the base lists are private, reached via AiObjectContextAccess.h.
+ *
+ *  2. PlayerScript — on login, apply the single "dungeon clear" strategy to a
+ *     bot's non-combat engine. It bundles the party-chat keyword listener
+ *     (`dc on`, …), the driving advance/engage/stall ladder, and the
+ *     follow-tank trigger. Resident on ALL bots but inert unless that bot's own
+ *     "dungeon clear enabled" flag is set — every driving trigger and the
+ *     multiplier gate on the flag, and follow-tank no-ops on the tank itself.
+ *     Keeping it on every bot (mirroring the AiFactory add stock playerbots
+ *     used to carry) is what lets non-tank party bots redirect their follow
+ *     target to the tank while a tank has DC enabled, and revert to the player
+ *     when it's off — driven purely by the tank's flag (see
+ *     DungeonClearPartyTankValue / DungeonClearFollowTankTrigger).
+ *
+ *     This login hook is a zero-config convenience for bots present at login.
+ *     The reliable universal path — and the ONLY one that reaches a self-bot
+ *     created mid-session via `.playerbots bot self`, OR survives a
+ *     ResetStrategies() (master/group change, talent change, instance entry) —
+ *     is having the strategy in the playerbots default strategy set. The
+ *     registrar above now injects "+dungeon clear" into that set in code (the
+ *     four sPlayerbotAIConfig strategy strings), so no manual
+ *     `Playerbots.NonCombatStrategies = "+dungeon clear"` conf line is needed.
+ *     The `.dc` slash command (DungeonClearCommand.cpp) needs neither, since it
+ *     dispatches the action directly.
+ */
+
+#include "ScriptMgr.h"
+#include "AllCreatureScript.h"
+#include "Cell.h"
+#include "CellImpl.h"
+#include "Creature.h"
+#include "CreatureAI.h"
+#include "DBCStructure.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "GlobalScript.h"
+#include "Log.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "GameTime.h"
+#include "Group.h"
+#include "ObjectAccessor.h"
+#include "RandomPlayerbotMgr.h"
+#include "Spell.h"
+#include "SpellInfo.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcRun.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcRealRunTracker.h"
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
+#include "PlayerScript.h"
+#include "UnitScript.h"
+
+#include "Playerbots.h"
+#include "PlayerbotAI.h"
+
+#include "AiObjectContextAccess.h"
+#include "DcModuleEnable.h"
+#include "TestRun/DcSelfFoundPlanner.h"
+#include "DcStrategyGate.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcPetStance.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcBreathGuard.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcLeaderSignal.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcPlayerLed.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcPlayerLedDecision.h"
+
+// The combat guards that move from Dungeon Clear to the playerbots module (07/11:
+// "DC is the autorun in the dungeon, the strategies are in playerbots"). On a
+// module without them DC simply keeps every guard itself.
+// The playerbots module reports at startup, and to the addon, which Dungeon Clear
+// version is built into the server. Without its header DC simply says nothing.
+#if __has_include("CoaDungeonClearLink.h")
+#include "CoaDungeonClearLink.h"
+#define DC_HAS_COA_LINK 1
+#else
+#define DC_HAS_COA_LINK 0
+#endif
+
+// The release this tree ships as (the tag is v<version>).
+constexpr char const* kDungeonClearVersion = "3.3.0";
+
+#if __has_include("CoaGroupTank.h") && __has_include("CoaHealEscort.h")
+#include "CoaGroupTank.h"
+#include "CoaHealEscort.h"
+#define DC_HAS_COA_GARDES 1
+#else
+#define DC_HAS_COA_GARDES 0
+#endif
+#include "Ai/Dungeon/DungeonClear/Util/DcModuleCombat.h"
+#if DC_HAS_COA_COMBAT
+#include "CoaCombatGroupTank.h"
+#endif
+#if DC_MODULE_OWNS_ROOM_BOSS_CHASE || DC_MODULE_OWNS_COMBAT_REGROUP
+#include "CoaGardesRunHooks.h"
+#endif
+#if DC_MODULE_OWNS_STUCK_COMBAT_BREAKER
+#include "CoaStuckCombat.h"
+#endif
+#if DC_MODULE_OWNS_TARGET_EXCLUSION && DC_MODULE_OWNS_COMBAT_PURGE
+#include "CoaCombatPurge.h"
+#endif
+#if DC_MODULE_OWNS_BOSS_STAND_DOWN
+#include "CoaBossStandDown.h"
+#include <vector>
+#endif
+#if DC_MODULE_OWNS_TARGET_EXCLUSION
+#include "CoaTargetExclusion.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcCombatPurge.h"
+#include <unordered_set>
+#endif
+#include "Ai/Dungeon/DungeonClear/Util/DcPlayerbotCompat.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcRunTravelGuard.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcTargeting.h"
+#include "Ai/Dungeon/DungeonClear/Data/DungeonBossInfo.h"
+#include "Ai/Dungeon/DungeonClear/DcValueKeys.h"
+#include <optional>
+#include "Group.h"
+#include "Map.h"
+#include "InstanceSaveMgr.h"
+
+// Per-class context registries — each owns its own shared static lists.
+#include "DKAiObjectContext.h"
+#include "DruidAiObjectContext.h"
+#include "HunterAiObjectContext.h"
+#include "MageAiObjectContext.h"
+#include "PaladinAiObjectContext.h"
+#include "PriestAiObjectContext.h"
+#include "RogueAiObjectContext.h"
+#include "ShamanAiObjectContext.h"
+#include "WarlockAiObjectContext.h"
+#include "WarriorAiObjectContext.h"
+#include "CoaAiObjectContext.h"
+
+#include "BgQueueFill/DcBgQueueFillManager.h"
+#include "DungeonQueueFill/DcDungeonQueueFillManager.h"
+#include "Util/DcProvisionBudget.h"
+#include "Util/DcSpectator.h"
+#include "Ai/Dungeon/DungeonClear/Settings/DcSettings.h"
+#include "Ai/Dungeon/DungeonClear/DungeonClearActionContext.h"
+#include "Ai/Dungeon/DungeonClear/DungeonClearStrategyContext.h"
+#include "Ai/Dungeon/DungeonClear/DungeonClearTriggerContext.h"
+#include "Ai/Dungeon/DungeonClear/DungeonClearValueContext.h"
+#include "Ai/Dungeon/DungeonClear/Data/Events/BlackrockDepthsLyceum.h"
+#include "Ai/Dungeon/DungeonClear/Data/Events/DungeonEventTables.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcCombatPurge.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcPathWorker.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcFirstContact.h"
+#include "Ai/Dungeon/DungeonClear/Util/DcPullBrake.h"
+#include "Ai/Dungeon/DungeonClear/Util/DungeonClearUtil.h"
+#include "TestRun/DcTestDriver.h"
+#include "TestRun/DcTestDungeonRegistry.h"
+#include "TestRun/DcTestPlanManager.h"
+#include "Lab/DcLabManager.h"
+#include "TestRun/DcTestRunManager.h"
+#include "TestRun/DcTestRunStats.h"
+
+namespace
+{
+    // Completed-but-uncollected async path results older than this are swept
+    // from DcPathWorker's mailbox. Far longer than a normal poll cadence (the
+    // owning bot drains its result on its very next AI tick), so this only ever
+    // catches results orphaned by a logout / dc-off mid-build.
+    constexpr uint32 DC_ASYNC_PATH_RESULT_TTL_MS = 30 * 1000;
+
+    // How often the dungeon-gate correctness sweep re-asserts the
+    // strategy-install invariant across all bots (see DcStrategyGate). Well under
+    // any human-perceptible activation delay — a tank still has to walk in and
+    // `dc on` — and the per-bot cost is two HasStrategy reads, so this is cheap
+    // even on a large realm. This is the net that restores the triggers after a
+    // ResetStrategies() fired mid-dungeon (group/talent/LFG/reset), which is why
+    // it MUST keep running and not depend on any entry event.
+    constexpr uint32 DC_STRATEGY_GATE_SWEEP_MS = 3 * 1000;
+}
+
+namespace
+{
+    // Append a fresh set of DungeonClear contexts into one class's public
+    // shared static lists. Each context carries its own creator map, merged
+    // into that list's `creators` on Add(); every per-bot NamedObjectContextList
+    // holds those by reference, so existing and future bots of this class see
+    // the new actions/strategies/triggers/values immediately.
+    template <class Ctx>
+    void RegisterClassContexts()
+    {
+        Ctx::sharedStrategyContexts.Add(new DungeonClearStrategyContext());
+        Ctx::sharedActionContexts.Add(new DungeonClearActionContext());
+        Ctx::sharedTriggerContexts.Add(new DungeonClearTriggerContext());
+        Ctx::sharedValueContexts.Add(new DungeonClearValueContext());
+    }
+}
+
+// Spectator AI-mover window, opening half. Playerbots drives every bot's AI
+// (including a self-bot's) from its PlayerScript::OnPlayerAfterUpdate, and many
+// bot actions are injected into core packet handlers (HandleUseItemOpcode,
+// HandleGameObjectUseOpcode, …) that silently drop when the session's m_mover
+// isn't the player — exactly the state spectate creates (the mover is the
+// camera dummy). Net effect: a spectating warlock self-bot could not soulstone
+// itself, use a healthstone, potion, or eat/drink. Fix: bracket playerbots'
+// hook with a scoped swap of m_mover back to the player.
+//
+// ORDERING CONTRACT (what makes the bracket work): hooks run in script
+// registration order (ScriptRegistry::EnabledHooks appends in AddScript
+// order), and the generated module loader registers mod-dungeon-clear before
+// mod-playerbots (alphabetical) — so this Begin script, registered in
+// AddSC_dungeon_clear_module(), fires BEFORE playerbots' UpdateAI. The End
+// script is registered on the first world tick from
+// DungeonClearRegistrarWorldScript, which lands it after every load-time
+// script, closing the window AFTER playerbots. All three hooks run
+// back-to-back on the player's map thread; client movement packets for the
+// dummy are processed in the session phases, never inside the window.
+class DungeonClearSpectatorMoverBeginScript : public PlayerScript
+{
+public:
+    DungeonClearSpectatorMoverBeginScript()
+        : PlayerScript("DungeonClearSpectatorMoverBeginScript", {
+            PLAYERHOOK_ON_AFTER_UPDATE
+        }) {}
+
+    void OnPlayerAfterUpdate(Player* player, uint32 /*p_time*/) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        DcSpectator::BeginBotAiMoverWindow(player);
+        DcPetStance::Tick(player);
+    }
+};
+
+// Closing half of the mover window — see DungeonClearSpectatorMoverBeginScript
+// for the full story. NOT registered in AddSC_dungeon_clear_module(): it must
+// be instantiated on the first world tick so it sorts after playerbots' hook.
+//
+// This is also where the spectator camera's own slow tick runs (pending-arrival
+// start + follow-target re-resolution). It must sit AFTER the window closes,
+// never between Begin and End: the tick can Stop a live camera, and tearing a
+// possession down inside the bracket would leave the mover swap half-applied.
+class DungeonClearSpectatorMoverEndScript : public PlayerScript
+{
+public:
+    DungeonClearSpectatorMoverEndScript()
+        : PlayerScript("DungeonClearSpectatorMoverEndScript", {
+            PLAYERHOOK_ON_AFTER_UPDATE
+        }) {}
+
+    void OnPlayerAfterUpdate(Player* player, uint32 p_time) override
+    {
+        // Registered only while the module is enabled (the registrar returns
+        // before instantiating this script otherwise), so no gate is needed —
+        // and the window must never be left half-open by one.
+        DcSpectator::EndBotAiMoverWindow(player);
+        DcSpectator::Tick(player, p_time);
+    }
+};
+
+// Ghost probe (2.9.5, diagnostic asked by the Pilote for bissakov's ghost fix).
+// Once a minute, on the world thread (OnUpdate runs before the map updates, so no
+// map thread touches a player while this reads it), every player that has been a
+// ghost for 10 minutes gets ONE line: who (random bot, party bot or human), where,
+// and the bot's last state; a second line when it comes back. Cheap: one pass
+// over the online players a minute, a line only past the 10 minutes.
+class DungeonClearGhostProbeWorldScript : public WorldScript
+{
+public:
+    DungeonClearGhostProbeWorldScript() : WorldScript("DungeonClearGhostProbeWorldScript") {}
+
+    void OnUpdate(uint32 diff) override
+    {
+        _elapsedMs += diff;
+        if (_elapsedMs < kTickMs)
+            return;
+        _elapsedMs = 0;
+        if (!DcModule::IsEnabled())
+            return;
+
+        time_t const now = GameTime::GetGameTime().count();
+        std::unordered_set<uint64> ghosts;
+        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+        {
+            if (!player || !player->IsInWorld())
+                continue;
+            uint64 const key = guid.GetRawValue();
+            auto it = _since.find(key);
+            if (!player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+            {
+                if (it != _since.end())
+                {
+                    if (it->second.reported)
+                        LOG_INFO("playerbots.dungeonclear", "[GHOST] {} ({}) back after {}s as a ghost",
+                                 player->GetName(), Kind(player), now - it->second.since);
+                    _since.erase(it);
+                }
+                continue;
+            }
+            ghosts.insert(key);
+            if (it == _since.end())
+            {
+                _since.emplace(key, Entry{ now, false });
+                continue;
+            }
+            if (it->second.reported || now - it->second.since < kReportAfterS)
+                continue;
+            it->second.reported = true;
+            PlayerbotAI* ai = GET_PLAYERBOT_AI(player);
+            Player* master = ai ? ai->GetMaster() : nullptr;
+            Group* group = player->GetGroup();
+            LOG_INFO("playerbots.dungeonclear",
+                     "[GHOST] {} ({}) a ghost for {}s: map {} zone {} area {} at ({:.1f},{:.1f},{:.1f}) "
+                     "instance {} | group {} | master {} | bot state {}",
+                     player->GetName(), Kind(player), now - it->second.since, player->GetMapId(),
+                     player->GetZoneId(), player->GetAreaId(), player->GetPositionX(),
+                     player->GetPositionY(), player->GetPositionZ(), player->GetInstanceId(),
+                     group ? group->GetMembersCount() : 0u,
+                     master && master != player ? master->GetName() : std::string("-"),
+                     ai ? static_cast<int>(ai->GetState()) : -1);
+        }
+        // Logged out (or deleted) while a ghost: forget it.
+        for (auto it = _since.begin(); it != _since.end();)
+            it = ghosts.count(it->first) ? std::next(it) : _since.erase(it);
+    }
+
+private:
+    static constexpr uint32 kTickMs = 60000;
+    static constexpr time_t kReportAfterS = 600;
+
+    struct Entry
+    {
+        time_t since;
+        bool reported;
+    };
+
+    static char const* Kind(Player* player)
+    {
+        if (!GET_PLAYERBOT_AI(player))
+            return "human";
+        return sRandomPlayerbotMgr.IsRandomBot(player) ? "random bot" : "party bot";
+    }
+
+    uint32 _elapsedMs = 0;
+    std::unordered_map<uint64, Entry> _since;
+};
+
+class DungeonClearRegistrarWorldScript : public WorldScript
+{
+public:
+    DungeonClearRegistrarWorldScript()
+        : WorldScript("DungeonClearRegistrarWorldScript") {}
+
+    void OnUpdate(uint32 /*diff*/) override
+    {
+        if (_registered)
+            return;
+        _registered = true;
+
+        // Master switch, resolved and latched here — the first world tick is
+        // the earliest point at which the module config is certainly loaded,
+        // and it is still before any bot exists. Everything below (and every
+        // hook in this file) is downstream of the latched answer, so a disabled
+        // module registers nothing at all rather than registering and then
+        // refusing to act. See DcModuleEnable.h.
+        DcModule::LatchFromConf();
+        if (!DcModule::IsEnabled())
+            return;
+
+        // All ten class registries — these are what real bots actually use.
+        RegisterClassContexts<WarriorAiObjectContext>();
+        RegisterClassContexts<PaladinAiObjectContext>();
+        RegisterClassContexts<DruidAiObjectContext>();
+        RegisterClassContexts<DKAiObjectContext>();
+        RegisterClassContexts<HunterAiObjectContext>();
+        RegisterClassContexts<MageAiObjectContext>();
+        RegisterClassContexts<PriestAiObjectContext>();
+        RegisterClassContexts<RogueAiObjectContext>();
+        RegisterClassContexts<ShamanAiObjectContext>();
+        RegisterClassContexts<WarlockAiObjectContext>();
+        RegisterClassContexts<CoaAiObjectContext>();
+
+        // Base registry — only the class-0 fallback uses it, kept for parity.
+        dc_access::SharedStrategyContexts()->Add(new DungeonClearStrategyContext());
+        dc_access::SharedActionContexts()->Add(new DungeonClearActionContext());
+        dc_access::SharedTriggerContexts()->Add(new DungeonClearTriggerContext());
+        dc_access::SharedValueContexts()->Add(new DungeonClearValueContext());
+
+        // NOTE: the DC strategies are deliberately NOT injected into the
+        // playerbots default strategy set anymore. They used to be appended to
+        // the four sPlayerbotAIConfig strategy strings so they survived a
+        // ResetStrategies() and rode along on every bot — but that made every bot
+        // in the realm pay the DC trigger ladder (36 non-combat + 8 combat
+        // triggers, checkInterval=1) every AI tick, dungeon-bound or not. The
+        // install is now gated on Map::IsDungeon() via DcStrategyGate (see the
+        // login / map-changed / world-sweep drivers below), which both removes the
+        // overworld idle cost AND keeps the invariant ("any bot in a dungeon has
+        // the triggers active") through every ResetStrategies path via the sweep.
+
+        // Closing half of the spectator AI-mover window. Registered HERE (first
+        // world tick, not AddSC) so its hook sorts after playerbots' UpdateAI
+        // hook — see DungeonClearSpectatorMoverEndScript. Safe to register now:
+        // map threads only run inside sMapMgr->Update, never concurrently with
+        // this world-thread hook.
+        new DungeonClearSpectatorMoverEndScript();
+
+        // The dashboard's test-plan start form needs the dungeon catalogue +
+        // caps; publish them once the config is final (first world tick).
+        DcTestDungeonRegistry::WriteSidecar();
+
+        LOG_INFO("module", "mod-dungeon-clear: registered DungeonClear contexts "
+                           "(strategy/action/trigger/value) into all class "
+                           "registries of mod-playerbots.");
+    }
+
+    // Stop + join the async pathfinding worker before maps unload (this fires
+    // during the world shutdown sequence, ahead of OnAfterUnloadAllMaps). After
+    // join, the worker's queue and mailbox are cleared, releasing every navmesh
+    // shared_ptr it held — so no worker thread can touch a map being torn down.
+    // Idempotent and safe even if the worker was never started.
+    void OnShutdown() override
+    {
+        DcPathWorker::Instance().Stop();
+    }
+
+    // DcSettings caches each tunable's conf-resolved value per thread so the
+    // per-tick reads during a run don't re-walk the config map (and don't re-log
+    // sConfigMgr's "Missing property" warning every call). Drop those caches when
+    // an admin reloads the config so an edited conf value takes effect live. The
+    // `reload` flag is true only for `.reload config`; the initial load needs no
+    // invalidation (nothing cached yet), but bumping then is harmless.
+    void OnAfterConfigLoad(bool /*reload*/) override
+    {
+        DcSettings::InvalidateConfCache();
+        // The one tunable a reload CANNOT apply: say so rather than leaving an
+        // admin to wonder why the module is still running (or still absent).
+        DcModule::WarnIfConfDiffersFromLatch();
+    }
+
+private:
+    bool _registered = false;
+};
+
+// Dungeon-gate drivers. The DC strategies ("dungeon clear" non-combat +
+// "dungeon clear combat" combat) are installed on a bot iff it is on a
+// dungeon/raid map — see DcStrategyGate for the why (removing the realm-wide
+// idle cost) and the invariant guarantee. This script provides the two
+// responsive drivers; the world-tick sweep (DungeonClearReaperScript) is the
+// correctness net behind them.
+//   * OnPlayerLogin    — a bot that logs in already inside an instance gets the
+//                        strategies immediately.
+//   * OnPlayerMapChanged — install on dungeon entry, strip on exit, within a
+//                        frame of the map change.
+// Reconcile() is idempotent and no-ops on real players and on already-compliant
+// bots, and runs the dc-off teardown when it strips (so `enabled` can't survive
+// to auto-resume on the next entry, and no follower keeps a stale MoveFollow).
+class DungeonClearLoginPlayerScript : public PlayerScript
+{
+public:
+    DungeonClearLoginPlayerScript()
+        : PlayerScript("DungeonClearLoginPlayerScript", {
+            PLAYERHOOK_ON_LOGIN,
+            PLAYERHOOK_ON_MAP_CHANGED,
+            PLAYERHOOK_ON_LOGOUT
+        }) {}
+
+    // Both drivers go through DcStrategyGate::Reconcile, which is itself gated
+    // on the master switch — a disabled module installs nothing on any bot.
+    void OnPlayerLogin(Player* player) override
+    {
+        DcStrategyGate::Reconcile(player);
+        DcStrategyGate::ApplyEntryDefaults(player);
+    }
+
+    void OnPlayerMapChanged(Player* player) override
+    {
+        DcStrategyGate::Reconcile(player);
+        DcStrategyGate::ApplyEntryDefaults(player);
+        DcPlayerLed::Forget(player);  // a Main Tank's lead clock belongs to the map he left
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        DcPlayerLed::Forget(player);
+    }
+};
+
+// The pull walk-in's brake, wired to the combat flag itself.
+//
+// This is the one thing in the pull FSM that CANNOT be an AI action, because the
+// whole defect is that an AI action arrives too late: the bot is still on the
+// non-combat engine when its pack notices it, so a flip has to happen before the
+// drag-back can run, and the MotionMaster walks the tank further into the formation
+// for the whole of that gap. OnPlayerEnterCombat fires from
+// CombatManager::UpdateOwnerCombatState in the same statement that raises
+// UNIT_FLAG_IN_COMBAT — earlier than any tick, by construction. See DcPullBrake.h.
+class DungeonClearPullBrakeScript : public PlayerScript
+{
+public:
+    DungeonClearPullBrakeScript()
+        : PlayerScript("DungeonClearPullBrakeScript", {
+            PLAYERHOOK_ON_PLAYER_ENTER_COMBAT
+        }) {}
+
+    void OnPlayerEnterCombat(Player* player, Unit* enemy) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+
+        DcPullBrake::OnEnterCombat(player);
+        // Same 0->1 edge: a new fight restarts the threat-lead clock.
+        DcLeaderSignal::NoteLeaderEnterCombat(player);
+        // Same hook, second reader: `enemy` was discarded here for as long as this
+        // script has existed, and it is the only record anywhere of what STARTED a
+        // fight. See DcFirstContact.h for what that cost.
+        DcFirstContact::OnEnterCombat(player, enemy);
+    }
+};
+
+// Bench probe for the escape leap ban (3.0, CoA Combat A1): every Blink or
+// Disengage a run member casts is counted on the run record (extras
+// `escapeLeaps`), and every creature that engages that member within 6 s of the
+// leap is counted too (`escapeLeapJoins`, the packs a leap lands in). Matched by
+// spell name so CoA's own ranks and twins count. Map thread only: the member,
+// its run owner and the creature all live on one map.
+namespace DcEscapeLeapProbe
+{
+    constexpr uint32 kJoinWindowMs = 6000;
+    thread_local std::unordered_map<ObjectGuid::LowType, uint32> lastLeap;
+
+    DcRunState* RunOf(Player* member)
+    {
+        Player* owner = member ? DcLeaderSignal::FindRunOwner(member) : nullptr;
+        PlayerbotAI* ai = owner ? GET_PLAYERBOT_AI(owner) : nullptr;
+        if (!ai)
+            return nullptr;
+        DcRunState& st = DcRun::Of(ai->GetAiObjectContext());
+        return st.enabled ? &st : nullptr;
+    }
+
+    void OnCast(Player* player, Spell* spell)
+    {
+        SpellInfo const* info = spell ? spell->GetSpellInfo() : nullptr;
+        char const* name = info ? info->SpellName[0] : nullptr;
+        if (!name || (std::strcmp(name, "Blink") != 0 && std::strcmp(name, "Disengage") != 0))
+            return;
+        DcRunState* st = RunOf(player);
+        if (!st)
+            return;
+        st->AddTestExtra("escapeLeaps");
+        lastLeap[player->GetGUID().GetCounter()] = getMSTime();
+        DC_PULL_INFO("[DC:{}] escape leap cast: {} ({})", player->GetName(), name, info->Id);
+    }
+
+    void OnEngage(Unit* victim)
+    {
+        Player* player = victim ? victim->ToPlayer() : nullptr;
+        if (!player)
+            return;
+        auto it = lastLeap.find(player->GetGUID().GetCounter());
+        if (it == lastLeap.end() || getMSTimeDiff(it->second, getMSTime()) > kJoinWindowMs)
+            return;
+        if (DcRunState* st = RunOf(player))
+            st->AddTestExtra("escapeLeapJoins");
+    }
+}
+
+class DungeonClearEscapeLeapProbeScript : public PlayerScript
+{
+public:
+    DungeonClearEscapeLeapProbeScript()
+        : PlayerScript("DungeonClearEscapeLeapProbeScript", {
+            PLAYERHOOK_ON_SPELL_CAST
+        }) {}
+
+    void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        DcEscapeLeapProbe::OnCast(player, spell);
+    }
+};
+
+// A creature engaging a run member mid-fight. The player-side hook above only
+// fires on a player's 0->1 transition, so an add joining a running fight is
+// otherwise unrecorded. See DcFirstContact::OnCreatureEngage.
+class DungeonClearLateJoinerScript : public UnitScript
+{
+public:
+    DungeonClearLateJoinerScript()
+        : UnitScript("DungeonClearLateJoinerScript", true, {
+            UNITHOOK_ON_UNIT_ENTER_COMBAT
+        }) {}
+
+    void OnUnitEnterCombat(Unit* unit, Unit* victim) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        if (Creature* creature = unit ? unit->ToCreature() : nullptr)
+        {
+            DcFirstContact::OnCreatureEngage(creature, victim);
+            DcEscapeLeapProbe::OnEngage(victim);
+        }
+    }
+};
+
+// Spectator-camera teardown safety net. A leaked possession leaves the human
+// controlling nothing (their mover is a despawning/orphaned dummy), and only we
+// can clean it up — so every exit path below calls DcSpectator::Stop, which is
+// idempotent and free to over-call. Note `dc off`/pause deliberately do NOT end
+// spectate: the feature is independent of the DC run (useful for watching any
+// bot activity, or nothing at all) — don't "fix" that by adding teardown there.
+class DungeonClearSpectatorPlayerScript : public PlayerScript
+{
+public:
+    DungeonClearSpectatorPlayerScript()
+        : PlayerScript("DungeonClearSpectatorPlayerScript", {
+            PLAYERHOOK_ON_BEFORE_TELEPORT,
+            PLAYERHOOK_ON_PLAYER_JUST_DIED,
+            PLAYERHOOK_ON_BEFORE_LOGOUT
+        }) {}
+
+    // Covers hearth, instance exit, summons, `.tele`, AND near-teleports —
+    // a near-teleport during spectate would hang un-acked in playerbots
+    // (its ack path does bot->m_mover->ToPlayer(), null while the mover is
+    // the camera dummy). Never vetoes the teleport.
+    bool OnPlayerBeforeTeleport(Player* player, uint32 /*mapid*/, float /*x*/,
+                                float /*y*/, float /*z*/, float /*orientation*/,
+                                uint32 /*options*/, Unit* /*target*/) override
+    {
+        if (!DcModule::IsEnabled())
+            return true;
+        DcSpectator::Stop(player);
+        return true;
+    }
+
+    // Body death while the camera is away: release control back so the normal
+    // ghost/release flow works. Core may also break the charm itself — Stop is
+    // idempotent either way.
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        DcSpectator::Stop(player);
+    }
+
+    // Despawn the dummy before the session goes away; never let the
+    // TempSummon outlive its possessor.
+    //
+    // The second call is the crash guard for the OTHER side of a follow
+    // camera: this hook fires for every logging-out player, bots included
+    // (PlayerbotHolder::LogoutPlayerBot -> WorldSession::LogoutPlayer, whose
+    // very first act is this hook), and a watched bot that is deleted without
+    // clearing its viewers leaves their m_seer dangling. See
+    // DcSpectator::NotifyWatchedLoggingOut.
+    void OnPlayerBeforeLogout(Player* player) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        DcSpectator::Stop(player);
+        DcSpectator::NotifyWatchedLoggingOut(player);
+        DcTestRunManager::Instance().NoteMemberLogout(player);
+    }
+};
+
+// Spectator-camera death guard. THE crash fix for "body dies while spectating":
+// spectate possesses the camera dummy via a direct SetCharmedBy(player,
+// CHARM_TYPE_POSSESS) — an *aura-less* possession. When the player body (the
+// charmer) dies, Unit::setDeathState(JustDied) -> Unit::RemoveAllControlled ->
+// Player::StopCastingCharm runs FIRST, deep inside Unit::Kill and long before
+// Player::KillPlayer fires OnPlayerJustDied. StopCastingCharm only knows how to
+// undo possession by removing the possess AURA (Player.cpp RemoveAurasByType
+// SPELL_AURA_MOD_POSSESS); with no such aura, GetCharmGUID() stays set and the
+// function hits its ABORT() — a hard server crash. The existing OnPlayerJustDied
+// -> Stop net cannot prevent it; it runs too late.
+//
+// Fix: catch the lethal blow at the OnDamage chokepoint (Unit::DealDamage, fired
+// with the final post-absorb damage and the victim's health NOT yet reduced —
+// well before the `health <= damage` Kill at Unit.cpp). If a spectating player's
+// body is about to die, tear the possession down cleanly here. DcSpectator::Stop
+// runs the proper RemoveCharmedBy, so by the time setDeathState reaches
+// StopCastingCharm there is no charm left to choke on, and the body dies into the
+// normal ghost/release flow. Stop is idempotent; the OnPlayerJustDied/teardown
+// nets stay as backstops for the rare non-DealDamage instakill paths.
+class DungeonClearSpectatorDeathGuardScript : public UnitScript
+{
+public:
+    DungeonClearSpectatorDeathGuardScript()
+        : UnitScript("DungeonClearSpectatorDeathGuardScript", true, {
+            UNITHOOK_ON_DAMAGE
+        }) {}
+
+    void OnDamage(Unit* /*attacker*/, Unit* victim, uint32& damage) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        if (!victim || !victim->IsPlayer())
+            return;
+        // Only a lethal blow matters — a survivable hit must not eject the human
+        // from spectate. health is still the pre-damage value at this point.
+        if (damage < victim->GetHealth())
+            return;
+
+        Player* player = victim->ToPlayer();
+        if (DcSpectator::IsActive(player))
+            DcSpectator::Stop(player);
+    }
+};
+
+// Threat lead: stamp the DC leader's first hit of each fight, which the damage
+// hold for DPS followers measures from (DcLeaderSignal::NoteLeaderHit). Cheap for
+// every other hit in the world: a player check, an AI lookup, one flag test.
+class DungeonClearLeaderFirstHitScript : public UnitScript
+{
+public:
+    DungeonClearLeaderFirstHitScript()
+        : UnitScript("DungeonClearLeaderFirstHitScript", true, {
+            UNITHOOK_ON_DAMAGE
+        }) {}
+
+    void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override
+    {
+        if (!damage || !attacker || !victim || victim->IsPlayer() || !DcModule::IsEnabled())
+            return;
+        if (Player* player = attacker->ToPlayer())
+            DcLeaderSignal::NoteLeaderHit(player);
+    }
+};
+
+// Drives the orphaned-follow reaper once per world tick. A non-tank DC follower
+// installs a persistent MoveFollow generator to chase the tank; its own
+// follow-tank action tears that down when the DC tank goes away — but only while
+// the follower's PlayerbotAI is still ticking. A self-bot that leaves bot mode
+// (`.playerbots bot self` off) has its PlayerbotAI deleted outright, so the
+// teardown never runs and the now-human player stays glued to the tank. The
+// reaper detects that orphaned generator and clears it, returning movement
+// control to the player. The world tick fires regardless of whether the
+// affected player still has an AI (it is a global tick, not a per-bot one),
+// which is exactly what we need since the player we must fix no longer has a
+// bot AI. (This was PlayerbotScript::OnPlayerbotUpdate until mod-playerbots
+// #2765 retired that hook; it ran just before session/map updates, this runs
+// just after them, which is the same place in the cyclic order.)
+class DungeonClearReaperScript : public WorldScript
+{
+public:
+    DungeonClearReaperScript()
+        : WorldScript("DungeonClearReaperScript", {
+            WORLDHOOK_ON_UPDATE,
+        }) {}
+
+    void OnUpdate(uint32 diff) override
+    {
+        // Re-arm the realm-wide one-PlayerbotFactory-roll-per-tick ration
+        // shared by every provisioning subsystem (the `.dc test` harness and
+        // the RDF queue fill). Unconditional, and first: a Reset() skipped
+        // because the module happened to be off would leave the flag stuck
+        // false and stall the next provisioner that runs.
+        DcProvisionBudget::Reset();
+
+        // RDF instant queue fill: one state machine per player who just used
+        // the dungeon finder. Ticked BEFORE the module gate on purpose — a
+        // fill in flight owns logged-in bots sitting in a queue, and the
+        // manager's own first act when the module (or the feature) is off is
+        // to release them. Gating it would strand exactly the state that most
+        // needs unwinding.
+        //
+        // It therefore also gets first claim on the tick's provisioning
+        // ration, ahead of the `.dc test` harness. That is the right way
+        // round: a live player is waiting on the fill, and nobody is waiting
+        // on a background test plan. Cheap no-op (an empty vector test)
+        // whenever nobody is queueing.
+        DcDungeonQueueFillManager::Instance().Tick(diff);
+
+        // Battleground instant queue fill: same shape, same reasons for
+        // running ahead of the module gate — it too releases what it holds
+        // when switched off, and it too gets a live player's claim on the
+        // provisioning ration ahead of the test harness.
+        DcBgQueueFillManager::Instance().Tick(diff);
+
+        // The Lyceum's room hold (BRD pets passive, torches looted in combat).
+        // Ahead of the gate for the queue fills' reason: what it holds — pets it
+        // put passive — it must hand back when the module goes off.
+        DcLyceum::Tick(diff, DcModule::IsEnabled());
+
+        if (!DcModule::IsEnabled())
+            return;
+
+        DcFollowerLifecycle::ReapOrphanedFollows();
+        // Authoritative advanced-pull passive teardown: release any follower DC
+        // put passive once its leader is no longer mid-pull (released / dc off /
+        // paused / death / gone), and trip the camp-safety valve for a held,
+        // passive follower taking damage. Runs on the global tick so it fires even
+        // for a follower whose own engines are passive-locked in combat.
+        DcFollowerLifecycle::ReapStrandedPassives();
+        // Drop async path results that were never collected (the bot logged out
+        // or toggled dc off before polling). Bounds the mailbox; cheap no-op
+        // when empty.
+        DcPathWorker::Instance().Sweep(DC_ASYNC_PATH_RESULT_TTL_MS);
+        // Event-driven status: recompute each clearing tank's status and emit a
+        // STATUS/BOSS packet only on change (replaces the addon's old poll).
+        // Internally throttled; a cheap no-op when no tank is clearing. Runs on
+        // the global tick (not a per-bot one) so it keeps firing through boss
+        // fights, when the bot's non-combat strategy engine is dormant.
+        DcStatusPublisher::TickStatusPushes(diff);
+        // Real-run log: sample boss kills of the player-started runs and close
+        // any whose leader vanished (runs.jsonl). Throttled to 1 Hz inside.
+        DcRealRunTracker::Tick(diff);
+
+        // Unreachable-holder combat purge: break a run out of a fight that can
+        // never end — a registered mob stranded off the navmesh holding the party
+        // flagged with nothing killable. Global tick, not a trigger, for the same
+        // reason as the ZF stray-summon despawner below: the deadlock parks the
+        // bots on the COMBAT engine, where the clear's non-combat triggers never
+        // get one. Internally throttled and gated on the map having a row, so it
+        // is a handful of integer compares on every other map.
+        DcCombatPurge::Tick(diff);
+
+        // `.dc test` harness state machine (spawn -> gear -> group -> teleport
+        // -> dc on -> watchdogs -> record). Cheap no-op while no test run is
+        // active; global tick for the same reason as the status pusher.
+        // Headless-driver login poll first (a console start may be waiting on
+        // it), then the plan scheduler (a launch it makes this tick enters the
+        // run manager's tick loop immediately below).
+        DcTestDriver::Tick();
+        DcTestPlanManager::Instance().Tick(diff);
+        DcTestRunManager::Instance().Tick(diff);
+        // Self-found groups (AiPlayerbot.CoaSelfFoundBotsPercent): now and then a
+        // party of self-found random bots is sent through a dungeon of its level,
+        // as a hand-picked test run. Cheap no-op while the share is 0.
+        DcSelfFoundPlanner::Tick(diff);
+        // Pull Lab scheduler: launches warm lab parties through the run
+        // manager above (they tick there); this only fills free capacity.
+        DcLabManager::Instance().Tick(diff);
+
+        // Dungeon-gate correctness net: re-assert "DC strategies installed iff in
+        // a dungeon" across all bots on a throttled cadence. The login and
+        // map-changed hooks apply/strip responsively on entry/exit; this sweep
+        // covers the cases those hooks can't see — a ResetStrategies() that wiped
+        // the strategy WHILE the bot is inside an instance (group/talent/LFG/
+        // master change, `.playerbots reset`), and self-bots created in-place via
+        // `.playerbots bot self`. Without it, the requirement "any bot in a
+        // dungeon has the triggers active" would not hold across resets.
+        _gateSweepAccumMs += diff;
+        if (_gateSweepAccumMs >= DC_STRATEGY_GATE_SWEEP_MS)
+        {
+#if !DC_MODULE_OWNS_BREATH_GUARD  // the module's CoA Combat B2 ticks it itself
+            DcBreathGuard::Tick(_gateSweepAccumMs);
+#endif
+            _gateSweepAccumMs = 0;
+            DcStrategyGate::ReconcileAllBots();
+        }
+    }
+
+private:
+    uint32 _gateSweepAccumMs = 0;
+};
+
+// WORKAROUND for an upstream Zul'Farrak core-script typo (fixed on branch
+// fix/zf-sezziz-summon-coords): Shadowpriest Sezz'ziz's summon table lists
+// several add coords as x=895 instead of 1895, so during his fight he summons
+// Sandfury Acolytes/Zealots ~1000yd OUTSIDE the temple. There they are
+// unreachable and never die, holding the whole party in combat indefinitely —
+// which freezes the DungeonClear temple event, whose end gossips (open the door,
+// then fight Bly) run on the NON-combat engine and so never get a tick. We can't
+// fix that in SQL (the coords are hardcoded in C++), so until the core fix is
+// deployed this hook despawns the stray adds the instant they spawn, letting
+// combat end and the event finish.
+//
+// Surgical: only Sandfury Acolyte/Zealot SUMMONS on the Zul'Farrak map that
+// appear far WEST of the temple (x < 1500; the temple sits at x~1873-1902, so no
+// legitimate creature is there). The pyramid-wave summons of the same entries
+// spawn at the correct x (>1873) and are untouched. Despawn is deferred a beat so
+// it can't dangle the pointer the summon caller uses right after SummonCreature
+// (Sezz'ziz calls AttackStart on the fresh add); 1000yd away, the few-hundred-ms
+// of phantom threat before despawn is harmless.
+class DungeonClearZfStraySummonScript : public AllCreatureScript
+{
+public:
+    DungeonClearZfStraySummonScript() : AllCreatureScript("DungeonClearZfStraySummonScript") {}
+
+    void OnCreatureAddWorld(Creature* creature) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+        if (!creature || creature->GetMapId() != 209 /*Zul'Farrak*/)
+            return;
+        uint32 const entry = creature->GetEntry();
+        if (entry != 8876 /*Sandfury Acolyte*/ && entry != 8877 /*Sandfury Zealot*/)
+            return;
+        if (!creature->IsSummon() || creature->GetPositionX() >= 1500.0f)
+            return;  // a real wave spawn / static trash at the temple — leave it
+
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC] despawning stray Sezz'ziz summon {} (entry {}) at x={:.1f} "
+                 "(ZF coord-typo workaround)",
+                 creature->GetGUID().ToString(), entry, creature->GetPositionX());
+        creature->DespawnOrUnsummon(Milliseconds(200));
+    }
+};
+
+// WORKAROUND for Stratholme's (map 329) gate-trap critters falling out of the
+// world. instance_stratholme's DoSpawnPlaguedCritters summons 30 Plagued Rats /
+// Insects / Maggots at random points within 8yd of the triggering player, at the
+// player's z+1, with no ground check. They are summoned already attacking, so
+// when one drops through the floor the tank chases it and the party follows.
+// Both gate traps have such a gap:
+// - Scarlet side, the alley at (3612,-3335): some land inside wall geometry and
+//   drop ~66yd onto a floor under Festival Lane, and the run ends trapped ~70yd
+//   under Hearthsinger Forresten ("Stuck near" / "route dead-ends" — five of
+//   five such failures in sk-20261003-174711 started with a critter 66-68yd
+//   below its summon point).
+// - Undead side, the trap at portcullis 175354 (around 3917,-3556): in
+//   tr-20261011-100956-1 a rat dropped there, and by the time it was 20yd down
+//   the tank had already followed it through the floor (z 132 -> 45).
+//
+// Surgical: only these three critter entries on map 329, and only once one sits
+// more than STRAT_CRITTER_FALL_YD (6yd) below its home (= summon point), low
+// enough that it should be gone before the tank follows it down. There is
+// nothing to fight down there, and despawning a critter that merely walked
+// down a slope costs nothing: the trap gates reopen on a timer, not on critter
+// kills.
+class DungeonClearStratFallenCritterScript : public AllCreatureScript
+{
+public:
+    DungeonClearStratFallenCritterScript() : AllCreatureScript("DungeonClearStratFallenCritterScript") {}
+
+    void OnAllCreatureUpdate(Creature* creature, uint32 /*diff*/) override
+    {
+        if (!creature || creature->GetMapId() != 329 /*Stratholme*/)
+            return;
+        uint32 const entry = creature->GetEntry();
+        if (entry != 10441 /*Plagued Rat*/ && entry != 10461 /*Plagued Insect*/ &&
+            entry != 10536 /*Plagued Maggot*/)
+            return;
+        if (!creature->IsSummon() || !creature->IsAlive() || !DcModule::IsEnabled())
+            return;
+        constexpr float STRAT_CRITTER_FALL_YD = 6.0f;
+        float const homeZ = creature->GetHomePosition().GetPositionZ();
+        if (creature->GetPositionZ() >= homeZ - STRAT_CRITTER_FALL_YD)
+            return;
+
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC] despawning fallen Stratholme critter {} (entry {}) at "
+                 "({:.1f},{:.1f},{:.1f}), {:.1f}yd below its summon point",
+                 creature->GetGUID().ToString(), entry, creature->GetPositionX(),
+                 creature->GetPositionY(), creature->GetPositionZ(),
+                 homeZ - creature->GetPositionZ());
+        creature->DespawnOrUnsummon();
+    }
+};
+
+// WORKAROUND for Blackrock Depths' (map 230) Ironhand Guardians holding the party
+// in combat for the rest of the run. Stock AC's statue (8982) carries
+// CREATURE_FLAG_EXTRA_CANNOT_ENTER_COMBAT (0x2000): CombatManager::CanBeginCombat
+// refuses any combat involving it, so its Gout of Flame burns without flagging
+// anyone. mod-individual-progression replaces all six with 108982 (SmartAI,
+// casting out of combat forever — IP PR #890) whose flags_extra is 2 (CIVILIAN)
+// and has lost the 0x2000. So every statue that burns a member enters combat with
+// it, and an unattackable, rooted creature in an instance never leaves: the bot
+// stays combat-flagged long after the hall (live: refs held from 130-240yd), the
+// rest gates never let a healer drink, and the DC driver goes blind (combat with
+// no attackers). As a side effect the IP statue stops firing once it is in
+// combat, because its only cast is an out-of-combat event.
+//
+// Put the stock flag back on the live creature and end whatever combat it already
+// holds. Both entries, in case a data set restores the stock one without the
+// flag. Per-update rather than on add-to-world so a respawn (UpdateEntry resets
+// the flag from the template) and a statue spawned before the module came up are
+// covered too; past the first update it costs a map compare.
+class DungeonClearIronHallGuardianScript : public AllCreatureScript
+{
+public:
+    DungeonClearIronHallGuardianScript() : AllCreatureScript("DungeonClearIronHallGuardianScript") {}
+
+    void OnAllCreatureUpdate(Creature* creature, uint32 /*diff*/) override
+    {
+        if (!creature || creature->GetMapId() != DcBlackrockDepths::MAP_ID)
+            return;
+        uint32 const entry = creature->GetEntry();
+        if (entry != DcBlackrockDepths::NPC_IRONHAND_GUARDIAN &&
+            entry != DcBlackrockDepths::NPC_IRONHAND_GUARDIAN_IP)
+            return;
+        if (creature->IsCombatDisallowed() || !DcModule::IsEnabled())
+            return;
+
+        bool const wasInCombat = creature->IsInCombat();
+        creature->SetIsCombatDisallowed(true);
+        creature->GetCombatManager().EndAllCombat();
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC] Ironhand Guardian {} (entry {}) set CANNOT_ENTER_COMBAT{} "
+                 "(IP 108982 data lost stock 8982's flags_extra 0x2000)",
+                 creature->GetGUID().ToString(), entry,
+                 wasInCombat ? ", its combat ended" : "");
+    }
+};
+
+// WORKAROUND for the Sunken Temple (map 109) Shade of Eranikus event holding the
+// party in combat forever — the same class of bug as the Zul'Farrak stray-summon
+// hook above, and likewise unfixable for us in core. instance_sunken_temple.cpp's
+// SetData(DATA_ERANIKUS_FIGHT) throws EVERY loaded dragonkin in the temple into
+// combat with the whole zone via Creature::SetInCombatWithZone(). The scattered
+// ones that can't path to the party never reach it and never trip their home
+// leash, so once the Shade is dead they keep a combat reference on every party
+// member indefinitely — killing the adds that DID reach the party never clears the
+// stranded ones, and the DungeonClear run then freezes on its "party not ready /
+// resting" gate. The core instance script never resets these minions on the
+// Shade's own death (its OnUnitDeath handles only Jammal'an), and we can't patch
+// core, so do that cleanup here: when the Shade of Eranikus dies, evade every
+// still-stranded awakened dragonkin so the party drops combat and the run
+// continues. Scoped strictly to the Shade's death on map 109; universal (helps
+// real players too), not gated on DungeonClear.
+class DungeonClearEranikusCombatReleaseScript : public UnitScript
+{
+public:
+    DungeonClearEranikusCombatReleaseScript()
+        : UnitScript("DungeonClearEranikusCombatReleaseScript", true, {
+            UNITHOOK_ON_UNIT_DEATH
+        }) {}
+
+    void OnUnitDeath(Unit* unit, Unit* /*killer*/) override
+    {
+        if (!DcModule::IsEnabled())
+            return;
+
+        constexpr uint32 NPC_SHADE_OF_ERANIKUS = 5709;
+        constexpr uint32 MAP_SUNKEN_TEMPLE = 109;
+        if (!unit || !unit->IsCreature() || unit->GetEntry() != NPC_SHADE_OF_ERANIKUS)
+            return;
+        if (unit->GetMapId() != MAP_SUNKEN_TEMPLE)
+            return;
+
+        // Sweep the temple around the Shade's corpse for the awakened dragonkin.
+        // The radius spans the inner sanctum plus the surrounding ring where the
+        // SetInCombatWithZone'd dragonkin patrol or strand; the grid visitor is
+        // 2D-cell based so it returns them across the event's vertical levels too.
+        // One-shot on a boss death, so the broad sweep is cheap.
+        constexpr float SWEEP = 400.0f;
+        std::list<Creature*> nearby;
+        Acore::AnyUnitInObjectRangeCheck check(unit, SWEEP);
+        Acore::CreatureListSearcher<Acore::AnyUnitInObjectRangeCheck> searcher(unit, nearby, check);
+        Cell::VisitObjects(unit, searcher, SWEEP);
+
+        uint32 released = 0;
+        for (Creature* c : nearby)
+        {
+            if (!c || c == unit || !c->IsAlive() || !c->IsInCombat())
+                continue;
+            if (c->GetCreatureType() != CREATURE_TYPE_DRAGONKIN)
+                continue;
+            if (c->GetEntry() == NPC_SHADE_OF_ERANIKUS)
+                continue;  // the Shade itself / any second copy — never our target
+            if (CreatureAI* ai = c->AI())
+            {
+                ai->EnterEvadeMode();
+                ++released;
+            }
+        }
+
+        if (released)
+            LOG_INFO("playerbots.dungeonclear",
+                     "[DC] Shade of Eranikus died — evaded {} stranded awakened "
+                     "dragonkin to release the party from combat "
+                     "(SetInCombatWithZone workaround).", released);
+    }
+};
+
+// Kill credit in an instance with no InstanceScript (CoA's Vaults 936 and Road
+// to De Other Side 937: instance_template script ''). Map::UpdateEncounterState
+// sets the completed bit only through the script, so there it is dropped; but
+// the hook after it still fires, with the encounter list. Latch the bit per
+// instance id for DcTargeting::CompletedEncounterMask: Road's final boss, the
+// Chimeric Embryo, is summoned by the Quimera Portal and has no spawn whose
+// corpse or respawn timer could tell his kill otherwise. Recorded whether or
+// not DC is on, so a run started after the kill still reads it.
+class DungeonClearScriptlessCreditScript : public GlobalScript
+{
+public:
+    DungeonClearScriptlessCreditScript()
+        : GlobalScript("DungeonClearScriptlessCreditScript", {
+            GLOBALHOOK_ON_AFTER_UPDATE_ENCOUNTER_STATE,
+            GLOBALHOOK_ON_INSTANCEID_REMOVED
+        }) {}
+
+    void OnAfterUpdateEncounterState(Map* map, EncounterCreditType type, uint32 creditEntry,
+                                     Unit* /*source*/, Difficulty /*difficulty_fixed*/,
+                                     std::list<DungeonEncounter const*> const* encounters,
+                                     uint32 /*dungeonCompleted*/, bool /*updated*/) override
+    {
+        InstanceMap* instance = map ? map->ToInstanceMap() : nullptr;
+        if (!instance || instance->GetInstanceScript() || !encounters)
+            return;
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->dbcEntry && encounter->creditType == type &&
+                encounter->creditEntry == creditEntry)
+                DcTargeting::NoteScriptlessCredit(map->GetInstanceId(),
+                                                  encounter->dbcEntry->encounterIndex);
+    }
+
+    void OnInstanceIdRemoved(uint32 instanceId) override
+    {
+        DcTargeting::ForgetScriptlessCredits(instanceId);
+    }
+};
+
+// Keeps an all-bot party in its dungeon while the run is on. See
+// DcRunTravelGuard.h for the runs that ended on "the tank left the instance".
+class DungeonClearRunTravelGuardScript : public PlayerScript
+{
+public:
+    DungeonClearRunTravelGuardScript()
+        : PlayerScript("DungeonClearRunTravelGuardScript", {
+            PLAYERHOOK_ON_BEFORE_TELEPORT,
+            PLAYERHOOK_CAN_JOIN_IN_BATTLEGROUND_QUEUE,
+            PLAYERHOOK_CAN_JOIN_IN_ARENA_QUEUE,
+            PLAYERHOOK_CAN_BATTLEFIELD_PORT
+        }) {}
+
+    bool OnPlayerBeforeTeleport(Player* player, uint32 mapid, float /*x*/, float /*y*/,
+                                float /*z*/, float /*orientation*/, uint32 /*options*/,
+                                Unit* /*target*/) override
+    {
+        if (!DcModule::IsEnabled() || !player)
+            return true;
+        uint32 const fromMap = player->GetMapId();
+        bool const allowed = DcRunTravelGuard::AllowScope::Active();
+        if (fromMap == mapid || allowed)
+            return true;
+        if (InstanceDiscarded(player))
+        {
+            LOG_INFO("playerbots.dungeonclear",
+                     "[DC:{}] travel guard: let a teleport from map {} to map {} through, the instance was reset",
+                     player->GetName(), fromMap, mapid);
+            return true;
+        }
+        if (!DcRunTravelGuard::VetoTeleport(Facts(player), fromMap, mapid, allowed))
+            return true;
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC:{}] travel guard: refused a teleport from map {} to map {} during the run",
+                 player->GetName(), fromMap, mapid);
+        return false;
+    }
+
+    bool OnPlayerCanJoinInBattlegroundQueue(Player* player, ObjectGuid /*battlemasterGuid*/,
+                                            BattlegroundTypeId /*bgTypeId*/, uint8 /*joinAsGroup*/,
+                                            GroupJoinBattlegroundResult& err) override
+    {
+        return !RefuseQueue(player, err);
+    }
+
+    bool OnPlayerCanJoinInArenaQueue(Player* player, ObjectGuid /*battlemasterGuid*/, uint8 /*arenaslot*/,
+                                     BattlegroundTypeId /*bgTypeId*/, uint8 /*joinAsGroup*/,
+                                     uint8 /*isRated*/, GroupJoinBattlegroundResult& err) override
+    {
+        return !RefuseQueue(player, err);
+    }
+
+    bool OnPlayerCanBattleFieldPort(Player* player, uint8 /*arenaType*/, BattlegroundTypeId /*bgTypeId*/,
+                                    uint8 action) override
+    {
+        if (!DcModule::IsEnabled() || !player)
+            return true;
+        if (!DcRunTravelGuard::VetoBattlefieldPort(Facts(player), action))
+            return true;
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC:{}] travel guard: refused to enter a battleground during the run",
+                 player->GetName());
+        return false;
+    }
+
+private:
+    // The daily Heroic/Mythic reset unbinds everyone, then sends them to the
+    // graveyard and later home (Map::RemoveAllPlayers). Refusing those leaves the
+    // map undestroyable and the party frozen, so a player whose bind no longer
+    // points at the instance they stand in is let out.
+    static bool InstanceDiscarded(Player* player)
+    {
+        Map* map = player->GetMap();
+        if (!map || !map->IsDungeon())
+            return false;
+        InstanceSave* save = sInstanceSaveMgr->GetInstanceSave(map->GetInstanceId());
+        if (!save)
+            return true;
+        InstancePlayerBind* bind = sInstanceSaveMgr->PlayerGetBoundInstance(
+            player->GetGUID(), map->GetId(), Difficulty(map->GetSpawnMode()));
+        return !bind || bind->save != save;
+    }
+
+    static DcRunTravelGuard::Facts Facts(Player* player)
+    {
+        DcRunTravelGuard::Facts f;
+        f.isBot = GET_PLAYERBOT_AI(player) && !DcPlayerbotCompat::IsHumanControlled(player);
+        f.alive = player->IsAlive() && !player->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+        f.partyAllBots = true;
+        if (Group* group = player->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                if (Player* member = ref->GetSource();
+                    member && DcPlayerbotCompat::IsHumanControlled(member))
+                    f.partyAllBots = false;
+        }
+        Map* map = player->FindMap();
+        if (map && map->IsDungeon() && f.isBot && f.alive && f.partyAllBots)
+        {
+            Player* owner = DcLeaderSignal::FindRunOwner(player);
+            f.runOnThisMap = owner && owner->GetMapId() == player->GetMapId() &&
+                             owner->GetInstanceId() == player->GetInstanceId();
+        }
+        return f;
+    }
+
+    static bool RefuseQueue(Player* player, GroupJoinBattlegroundResult& err)
+    {
+        if (!DcModule::IsEnabled() || !player)
+            return false;
+        if (!DcRunTravelGuard::VetoBattlegroundQueue(Facts(player)))
+            return false;
+        err = ERR_BATTLEGROUND_JOIN_FAILED;
+        LOG_INFO("playerbots.dungeonclear",
+                 "[DC:{}] travel guard: refused a battleground queue during the run",
+                 player->GetName());
+        return true;
+    }
+};
+
+namespace
+{
+    // The module guards Dungeon Clear STILL runs itself, by the module's names.
+    // While a member is in a DC run (or player-led mode, which DC also covers),
+    // the module's guard of the same name stands down, so no guard acts twice.
+    // Cutting a guard out of DC drops its name here IN THE SAME CHANGE.
+    char const* const kGuardsStillInDungeonClear[] = {
+        // Builder's lot
+#if !DC_MODULE_OWNS_HEAL_REPOSITION
+        "heal reposition",
+#endif
+#if !DC_MODULE_OWNS_TOP_OFF_PARTY
+        "top off party",
+#endif
+#if !DC_MODULE_OWNS_THREAT_LEAD
+        "threat lead",
+#endif
+#if !DC_MODULE_OWNS_TANK_FIGHT_ASSIST
+        "tank fight assist",
+#endif
+        // DC's lot
+#if !DC_MODULE_OWNS_COMBAT_REGROUP
+        "combat regroup",
+#endif
+#if !DC_MODULE_OWNS_ESCAPE_LEAP
+        "escape leap ban",
+#endif
+#if !DC_MODULE_OWNS_ROOM_BOSS_CHASE
+        "room boss chase",
+#endif
+#if !DC_MODULE_OWNS_LYCEUM_CLOSE_UP
+        "lyceum close up",
+#endif
+#if !DC_MODULE_OWNS_IRON_HALL
+        "iron hall",
+#endif
+#if !DC_MODULE_OWNS_GROUND_HAZARDS
+        "ground hazards",
+#endif
+#if !DC_MODULE_OWNS_TARGET_EXCLUSION
+        "target exclusion",
+#endif
+#if !DC_MODULE_OWNS_BOSS_STAND_DOWN
+        "boss stand down",
+#endif
+        nullptr,  // ends the list, which is empty once the module owns every guard
+    };
+
+    // The reference tank of a member in a DC run, or of a player-led party:
+    // exactly what DC's party-tank value resolves (DcPlayerLed::PartyTankFor),
+    // so the module's guards and DC's rungs always agree on the tank.
+    // Read from the map threads for every member the module asks about: gated
+    // on DcModule::IsEnabled() first (an atomic), because with DC disabled no
+    // DC value is registered and the run-state reads below would crash.
+    Player* DcRunTankFor(Player const* member)
+    {
+        Player* const m = const_cast<Player*>(member);
+        if (!DcModule::IsEnabled() || !m)
+            return nullptr;
+        Player* const tank = DcPlayerLed::PartyTankFor(m);
+        Player* const owner = tank ? nullptr : DcLeaderSignal::FindRunOwner(m);
+        switch (DcPlayerLedDecision::ProvideToModule(true, tank != nullptr, owner != nullptr))
+        {
+            case DcPlayerLedDecision::ModuleProvide::PartyTank:
+                return tank;
+            case DcPlayerLedDecision::ModuleProvide::RunOwner:
+                return owner;
+            default:
+                return nullptr;
+        }
+    }
+
+    void WireModuleCombatGuards()
+    {
+#if DC_HAS_COA_COMBAT
+        CoaCombatGroupTank::SetRunTankProvider([](Player* bot) -> Player* { return DcRunTankFor(bot); });
+#endif
+#if DC_HAS_COA_GARDES
+        CoaGroupTank::SetProvider([](Player const* member) -> Player* { return DcRunTankFor(member); });
+        // The NPC an event of the run is escorting, for the module's healers.
+        CoaHealEscort::SetProvider([](Player const* member) -> Unit*
+        {
+            if (!DcModule::IsEnabled() || !member)
+                return nullptr;
+            return DcLeaderSignal::GetLeaderEscortee(const_cast<Player*>(member));
+        });
+#if DC_MODULE_OWNS_ROOM_BOSS_CHASE
+        // A2: the sleeping room-aggro boss whose room the run's tank is clearing
+        // (the run's next boss, while its room clear is active), or nullptr.
+        CoaGardesRunHooks::SetRoomClearBoss([](Player* tank) -> Creature*
+        {
+            if (!DcModule::IsEnabled() || !tank)
+                return nullptr;
+            PlayerbotAI* const tankAI = GET_PLAYERBOT_AI(tank);
+            AiObjectContext* const ctx = tankAI ? tankAI->GetAiObjectContext() : nullptr;
+            if (!ctx || !DcTargeting::IsRoomClearActive(tank, ctx))
+                return nullptr;
+            std::optional<DungeonBossInfo> const next =
+                ctx->GetValue<std::optional<DungeonBossInfo>>(DcKey::NextDungeonBoss)->Get();
+            return next.has_value() ? DcTargeting::GetLiveBoss(tank, ctx, next->entry) : nullptr;
+        });
+#endif
+#if DC_MODULE_OWNS_COMBAT_REGROUP
+        // A9: the run holds this member passive at the leader's advanced-pull
+        // camp (Forming / Advancing / Returning); the camp owns it there.
+        CoaGardesRunHooks::SetCampHoldPassive([](Player* member) -> bool
+        {
+            if (!DcModule::IsEnabled() || !member)
+                return false;
+            Position camp;
+            bool passive = false;
+            return DcLeaderSignal::GetLeaderCampHold(member, camp, passive) && passive;
+        });
+#endif
+#if DC_MODULE_OWNS_TARGET_EXCLUSION
+        // A6: the creatures a combat purge has just barred for the run (Gundrak's
+        // raiders), and the bosses the operator skipped with `dc skip` (BWL:
+        // Broodlord skipped lifts the drake hall's bar).
+        CoaTargetExclusion::RunHooks exclusionHooks;
+        exclusionHooks.purgeBarred = [](Player* bot, uint32 entry) -> bool
+        {
+            if (!DcModule::IsEnabled() || !bot)
+                return false;
+#if DC_MODULE_OWNS_COMBAT_PURGE
+            // B4: the module purges (and bars) the CoA rows; DC still the others.
+            if (CoaCombatPurge::IsBarred(bot, entry))
+                return true;
+#endif
+            return DcCombatPurge::IsBarred(bot, entry);
+        };
+        exclusionHooks.bossSkipped = [](Player* bot, uint32 bossEntry) -> bool
+        {
+            if (!DcModule::IsEnabled() || !bot)
+                return false;
+            PlayerbotAI* const botAI = GET_PLAYERBOT_AI(bot);
+            AiObjectContext* const ctx = botAI ? botAI->GetAiObjectContext() : nullptr;
+            if (!ctx)
+                return false;
+            std::unordered_set<uint32> const& skipped =
+                ctx->GetValue<std::unordered_set<uint32>&>(DcKey::Skipped)->Get();
+            return skipped.find(bossEntry) != skipped.end();
+        };
+        CoaTargetExclusion::SetRunHooks(std::move(exclusionHooks));
+#endif
+#if DC_MODULE_OWNS_STUCK_COMBAT_BREAKER
+        // B3: the breaker may clear this member's combat only in a live, unpaused
+        // run led by a bot tank (RungsFor(...).breakStuckCombat; a paused run has
+        // no party tank) and never during Karazhan's chess game.
+        CoaStuckCombat::SetRunAllows([](Player* member) -> bool
+        {
+            if (!DcModule::IsEnabled() || !member)
+                return false;
+            PlayerbotAI* const memberAI = GET_PLAYERBOT_AI(member);
+            AiObjectContext* const ctx = memberAI ? memberAI->GetAiObjectContext() : nullptr;
+            if (!ctx)
+                return false;
+            Player* const runTank = ctx->GetValue<Player*>(DcKey::PartyTank)->Get();
+            if (!DcPlayerLedDecision::RungsFor(runTank != nullptr, runTank == member,
+                                               DcPlayerLed::IsHumanTank(runTank)).breakStuckCombat)
+                return false;
+            return !DcKarazhan::ChessIsOn(member);
+        });
+#endif
+#if DC_MODULE_OWNS_BOSS_STAND_DOWN
+        // A12: is `entry` a boss (kind Boss) of the run's roster? Read off the
+        // run leader's roster, as DC's own no-script fallback did. A human-led
+        // party has no roster: nothing counts, the instance script decides.
+        CoaBossStandDown::SetRosterBossProvider([](Player* at, uint32 entry) -> bool
+        {
+            if (!DcModule::IsEnabled() || !at)
+                return false;
+            Player* leader = DcLeaderSignal::FindRunOwner(at);
+            if (!leader)
+                leader = DcPlayerLed::Leader(at);
+            PlayerbotAI* const leaderAI = leader ? GET_PLAYERBOT_AI(leader) : nullptr;
+            AiObjectContext* const ctx = leaderAI ? leaderAI->GetAiObjectContext() : nullptr;
+            if (!ctx)
+                return false;
+            std::vector<DungeonBossInfo> const& bosses =
+                ctx->GetValue<std::vector<DungeonBossInfo>>(DcKey::DungeonBosses)->Get();
+            for (DungeonBossInfo const& info : bosses)
+                if (info.kind == DungeonAnchorKind::Boss && info.entry == entry)
+                    return true;
+            return false;
+        });
+#endif
+        for (char const* guard : kGuardsStillInDungeonClear)
+            if (guard)
+                CoaGroupTank::SetHandledByDungeonClear(guard, true);
+#endif
+    }
+}
+
+void AddSC_dungeon_clear_module()
+{
+#if DC_HAS_COA_LINK
+    CoaDungeonClearLink::Announce(kDungeonClearVersion);
+#endif
+    // Before any map updates: the providers and the guard list are read from the
+    // map threads afterwards and never change again.
+    WireModuleCombatGuards();
+    new DungeonClearRunTravelGuardScript();
+    AddSC_dc_test_run_stats();
+    new DungeonClearRegistrarWorldScript();
+    new DungeonClearGhostProbeWorldScript();
+    new DungeonClearLoginPlayerScript();
+    new DungeonClearPullBrakeScript();
+    new DungeonClearLateJoinerScript();
+    new DungeonClearEscapeLeapProbeScript();
+    // Opening half only — the End script registers on the first world tick so
+    // it sorts after playerbots' AI-update hook (see the ordering contract).
+    new DungeonClearSpectatorMoverBeginScript();
+    new DungeonClearSpectatorPlayerScript();
+    new DungeonClearSpectatorDeathGuardScript();
+    new DungeonClearLeaderFirstHitScript();
+    new DungeonClearReaperScript();
+    new DungeonClearZfStraySummonScript();
+    new DungeonClearStratFallenCritterScript();
+    new DungeonClearIronHallGuardianScript();
+    new DungeonClearEranikusCombatReleaseScript();
+    new DungeonClearScriptlessCreditScript();
+
+    // `.dc test` harness: receive each changed STATUS frame for the monitored
+    // tank (addon messages only reach real players in the bot's group, and the
+    // test-run GM deliberately isn't one). Registered here, once, before any
+    // run can exist.
+    DcStatusPublisher::SetStatusObserver(
+        [](ObjectGuid tank, std::string const& payload)
+        {
+            DcTestRunManager::Instance().OnStatusPayload(tank, payload);
+        });
+}

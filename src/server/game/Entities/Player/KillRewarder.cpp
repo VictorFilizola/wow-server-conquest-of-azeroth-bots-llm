@@ -24,6 +24,7 @@
 #include "ScriptMgr.h"
 #include "SpellAuraDefines.h"
 #include "SpellAuraEffects.h"
+#include "World.h"
 
 namespace
 {
@@ -115,7 +116,7 @@ void KillRewarder::_InitGroupData()
                         // different level for each of them, so one member's scaled kill can be another
                         // member's gray kill. Without a view this is the object's own level.
                         uint32 grayLevel = Acore::XP::GetGrayLevel(lvl);
-                        if (_victim->getLevelForTarget(member) > grayLevel && (!_maxNotGrayMember || _maxNotGrayMemberLevel < lvl))
+                        if (_victim->getRewardLevelForTarget(member) > grayLevel && (!_maxNotGrayMember || _maxNotGrayMemberLevel < lvl))
                         {
                             _maxNotGrayMember = member;
                             _maxNotGrayMemberLevel = lvl;
@@ -181,7 +182,7 @@ void KillRewarder::_RewardXP(Player* player, float rate)
         {
             uint8 const referenceLevel = _group ? _maxLevel : player->GetLevel();
             uint8 const highestLevel = creature->GetHighestPlayerAttackerLevel();
-            if (highestLevel > referenceLevel && creature->getLevelForTarget(player) <= Acore::XP::GetGrayLevel(highestLevel))
+            if (highestLevel > referenceLevel && creature->getRewardLevelForTarget(player) <= Acore::XP::GetGrayLevel(highestLevel))
                 xp = xp / 2 + 1;
         }
 
@@ -320,6 +321,9 @@ void KillRewarder::Reward()
         // 3.2. Reward single killer (not group case).
         // 3.2.1. Initialize initial XP amount based on killer's level.
         _InitXP(_killer);
+        if (Creature const* creature = _victim->ToCreature())
+            if (sWorld->getBoolConfig(CONFIG_SOLO_KILL_REQUIRES_PLAYER_HIT) && !creature->WasAttackedDirectlyBy(_killer->GetGUID()))
+                _xp = 0;
         // To avoid unnecessary calculations and calls,
         // proceed only if XP is not ZERO or player is not on battleground
         // (battleground rewards only XP, that's why).
@@ -331,7 +335,8 @@ void KillRewarder::Reward()
 
     // 5. Credit instance encounter.
     if (Creature* victim = _victim->ToCreature())
-        if (victim->IsDungeonBoss())
+        if (victim->IsDungeonBoss() ||
+            (!victim->GetOwnerGUID().IsPlayer() && sObjectMgr->IsRaidEncounterKillCredit(victim->GetEntry())))
             if (Map* map = _victim->FindMap())
                 map->UpdateEncounterState(ENCOUNTER_CREDIT_KILL_CREATURE, _victim->GetEntry(), _victim);
 }

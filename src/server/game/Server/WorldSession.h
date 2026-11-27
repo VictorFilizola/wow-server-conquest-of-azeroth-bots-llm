@@ -521,6 +521,13 @@ public:
     // (loopback or CoA.AllowRemoteClients, and CoA.Enable).
     bool IsAscensionCompatEnabled() const { return _ascensionCompatEnabled; }
     void SetAscensionCompatEnabled(bool enabled) { _ascensionCompatEnabled = enabled; }
+    // The client behind this connection holds the streamed spell visual and sound rows.
+    bool HasAscensionSpellVisualRows() const { return _ascensionSpellVisualRows; }
+    void SetAscensionSpellVisualRows() { _ascensionSpellVisualRows = true; }
+    // The character whose display patch rows this connection's client received (0: none). A reconnect to a
+    // character still in the world gets a new session, so its client is streamed again.
+    uint32 GetAscensionPatchStreamGuid() const { return _ascensionPatchStreamGuid; }
+    void SetAscensionPatchStreamGuid(uint32 guid) { _ascensionPatchStreamGuid = guid; }
     void SetPlayer(Player* player);
     uint8 Expansion() const { return m_expansion; }
 
@@ -699,8 +706,11 @@ public:
     bool ValidateRecruitAFriendSummon(ObjectGuid guid, bool agree);
     void ClearRecruitAFriendRequests();
     void UpdateRecruitAFriendRewards(bool force = false);
+    bool RecordRecoveryItem(Item* item, uint32 count = 0);
     bool HandleRecruitAFriendRewardsCommand(std::string const& command);
-    void RecoverRecruitAFriendRewards();
+    void UpdateRecruitMilestoneRewards();
+    void RecoverRecruitAFriendRewards(bool recruit = false);
+    void DeliverRecruitAFriendRewards(PreparedQueryResult rows, bool recruit);
 
     // Packets cooldown
     time_t GetCalendarEventCreationCooldown() const { return _calendarEventCreationCooldown; }
@@ -1009,6 +1019,7 @@ public:                                                 // opcodes handlers
     void HandleQuestgiverCancel(WorldPacket& recvData);
     void HandleQuestLogSwapQuest(WorldPackets::Quest::QuestLogSwapQuest& packet);
     void HandleQuestLogRemoveQuest(WorldPackets::Quest::QuestLogRemoveQuest& packet);
+    void AbandonQuestLogSlot(uint16 slot);
     void HandleQuestConfirmAccept(WorldPackets::Quest::QuestConfirmAcceptClient& packet);
     void HandleQuestgiverCompleteQuest(WorldPacket& recvData);
     void HandleQuestgiverQuestAutoLaunch(WorldPackets::Quest::QuestGiverQuestAutoLaunch& packet);
@@ -1284,6 +1295,11 @@ public:                                                 // opcodes handlers
         return _isBot;
     }
 
+    [[nodiscard]] bool IsHeadlessBot() const
+    {
+        return _isBot && !m_Socket && !_socketlessPacketObserver;
+    }
+
 private:
     void ProcessQueryCallbacks();
 
@@ -1328,8 +1344,6 @@ private:
 
     bool CanUseBank(ObjectGuid bankerGUID = ObjectGuid::Empty) const;
 
-    bool recoveryItem(Item* pItem);
-
     // logging helper
     void LogUnexpectedOpcode(WorldPacket* packet, char const* status, char const* reason);
     void LogUnprocessedTail(WorldPacket* packet);
@@ -1350,6 +1364,8 @@ private:
     std::function<void(WorldPacket const&)> _socketlessPacketObserver;
     std::string m_Address;
     bool _ascensionCompatEnabled = false;
+    bool _ascensionSpellVisualRows = false;
+    uint32 _ascensionPatchStreamGuid = 0;
 
     AccountTypes _security;
     bool _skipQueue;

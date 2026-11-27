@@ -10,7 +10,9 @@
 #include "Action.h"
 #include "BossAuraActions.h"
 #include "MCActions.h"
+#include "MCHelpers.h"
 #include "NamedObjectContext.h"
+#include "RaidBossScripts.h"
 
 class RaidMcActionContext : public NamedObjectContext<Action>
 {
@@ -25,6 +27,9 @@ public:
         creators["mc move from group"] = &RaidMcActionContext::check_should_move_from_group;
         creators["mc move from baron geddon"] = &RaidMcActionContext::move_from_baron_geddon;
         creators["mc shazzrah move away"] = &RaidMcActionContext::shazzrah_move_away;
+        creators["mc move from shazzrah reflection"] = &RaidMcActionContext::move_from_shazzrah_reflection;
+        creators["mc shazzrah tank move from reflection"] = &RaidMcActionContext::shazzrah_tank_move_from_reflection;
+        creators["mc attack sacrificial chains"] = &RaidMcActionContext::attack_sacrificial_chains;
         creators["mc sulfuron harbinger fire resistance"] = &RaidMcActionContext::sulfuron_harbinger_fire_resistance;
         creators["mc golemagg fire resistance"] = &RaidMcActionContext::golemagg_fire_resistance;
         creators["mc golemagg mark boss"] = &RaidMcActionContext::golemagg_mark_boss;
@@ -36,6 +41,20 @@ public:
         creators["mc move from lava"] = &RaidMcActionContext::move_from_lava;
         creators["mc golemagg back off"] = &RaidMcActionContext::golemagg_back_off;
         creators["mc golemagg healer position"] = &RaidMcActionContext::golemagg_healer_position;
+        creators["mc majordomo stop attack"] = &RaidMcActionContext::majordomo_stop_attack;
+        creators["mc magmadar backup taunt"] = &RaidMcActionContext::magmadar_backup_taunt;
+        creators["mc move from ground effect"] = &RaidMcActionContext::move_from_ground_effect;
+        creators["mc gehennas mark"] = &RaidMcActionContext::gehennas_mark;
+        creators["mc lucifron mark"] = &RaidMcActionContext::lucifron_mark;
+        creators["mc ragnaros sons mark"] = &RaidMcActionContext::ragnaros_sons_mark;
+        creators["mc garr firesworn mark"] = &RaidMcActionContext::garr_firesworn_mark;
+        creators["mc raid dispel"] = &RaidMcActionContext::raid_dispel;
+        creators["mc garr move from firesworn"] = &RaidMcActionContext::garr_move_from_firesworn;
+        creators["mc sulfuron mark"] = &RaidMcActionContext::sulfuron_mark;
+        creators["mc magmadar mark"] = &RaidMcActionContext::magmadar_mark;
+        creators["mc gehennas clear flame orb spawn"] = &RaidMcActionContext::gehennas_clear_flame_orb_spawn;
+        creators["mc gehennas move from flame orb"] = &RaidMcActionContext::gehennas_move_from_flame_orb;
+        creators["mc shazzrah backup taunt"] = &RaidMcActionContext::shazzrah_backup_taunt;
     }
 
 private:
@@ -47,6 +66,9 @@ private:
     static Action* check_should_move_from_group(PlayerbotAI* botAI) { return new McMoveFromGroupAction(botAI); }
     static Action* move_from_baron_geddon(PlayerbotAI* botAI) { return new McMoveFromBaronGeddonAction(botAI); }
     static Action* shazzrah_move_away(PlayerbotAI* botAI) { return new McShazzrahMoveAwayAction(botAI); }
+    static Action* move_from_shazzrah_reflection(PlayerbotAI* botAI) { return new McMoveFromShazzrahReflectionAction(botAI); }
+    static Action* shazzrah_tank_move_from_reflection(PlayerbotAI* botAI) { return new McShazzrahTankMoveFromReflectionAction(botAI); }
+    static Action* attack_sacrificial_chains(PlayerbotAI* botAI) { return new McAttackSacrificialChainsAction(botAI); }
     static Action* sulfuron_harbinger_fire_resistance(PlayerbotAI* botAI) { return new BossFireResistanceAction(botAI, "sulfuron harbinger"); }
     static Action* golemagg_fire_resistance(PlayerbotAI* botAI) { return new BossFireResistanceAction(botAI, "golemagg the incinerator"); }
     static Action* golemagg_mark_boss(PlayerbotAI* botAI) { return new McGolemaggMarkBossAction(botAI); }
@@ -58,6 +80,48 @@ private:
     static Action* move_from_lava(PlayerbotAI* botAI) { return new McMoveFromLavaAction(botAI); }
     static Action* golemagg_back_off(PlayerbotAI* botAI) { return new McGolemaggBackOffAction(botAI); }
     static Action* golemagg_healer_position(PlayerbotAI* botAI) { return new McGolemaggHealerPositionAction(botAI); }
+    static Action* majordomo_stop_attack(PlayerbotAI* botAI) { return new McMajordomoStopAttackAction(botAI); }
+    static Action* magmadar_backup_taunt(PlayerbotAI* botAI) { return new RaidBackupTauntAction(botAI, "mc magmadar backup taunt", "magmadar"); }
+    static Action* move_from_ground_effect(PlayerbotAI* botAI) { return new RaidMoveFromGroundEffectAction(botAI, "mc move from ground effect"); }
+    static Action* magmadar_mark(PlayerbotAI* botAI)
+    {
+        return new RaidKillOrderMarkAction(botAI, "mc magmadar mark", "magmadar", {});
+    }
+    static Action* gehennas_mark(PlayerbotAI* botAI)
+    {
+        return new RaidKillOrderMarkAction(botAI, "mc gehennas mark", "gehennas", { MoltenCoreHelpers::NPC_FLAMEWAKER });
+    }
+    static Action* ragnaros_sons_mark(PlayerbotAI* botAI) { return new McRagnarosSonsMarkAction(botAI); }
+    static Action* garr_firesworn_mark(PlayerbotAI* botAI) { return new McGarrFireswornMarkAction(botAI); }
+    static Action* raid_dispel(PlayerbotAI* botAI) { return new McRaidDispelAction(botAI); }
+    static Action* garr_move_from_firesworn(PlayerbotAI* botAI) { return new McGarrMoveFromFireswornAction(botAI); }
+    // CoA Combat: the Shadow first (it gives Lucifron +39 % shadow damage), then the Protectors (Dominate Mind).
+    static Action* lucifron_mark(PlayerbotAI* botAI)
+    {
+        return new RaidKillOrderMarkAction(botAI, "mc lucifron mark", "lucifron",
+                                           { MoltenCoreHelpers::NPC_SHADOW_OF_LUCIFRON,
+                                             MoltenCoreHelpers::NPC_FLAMEWAKER_PROTECTOR });
+    }
+    // CoA Combat: Sulfuron's healers and cursers before him (they heal each other and stack -51 % healing, +99 %).
+    static Action* sulfuron_mark(PlayerbotAI* botAI)
+    {
+        return new RaidKillOrderMarkAction(botAI, "mc sulfuron mark", "sulfuron harbinger",
+                                           { MoltenCoreHelpers::NPC_FLAMEWAKER_PRIEST,
+                                             MoltenCoreHelpers::NPC_COA_EBON_THE_CRUEL,
+                                             MoltenCoreHelpers::NPC_COA_CULL_THE_DESTROYER,
+                                             MoltenCoreHelpers::NPC_COA_PROXIMA_THE_OPRESSOR });
+    }
+    static Action* gehennas_clear_flame_orb_spawn(PlayerbotAI* botAI)
+    {
+        return new RaidStandoffAction(botAI, "mc gehennas clear flame orb spawn", "gehennas",
+                                      MoltenCoreHelpers::FLAME_ORB_CAST_CLEAR_DISTANCE);
+    }
+    static Action* gehennas_move_from_flame_orb(PlayerbotAI* botAI)
+    {
+        return new RaidMoveFromCreatureAction(botAI, "mc gehennas move from flame orb", MoltenCoreHelpers::NPC_COA_GEHENNAS_FLAME_ORB,
+                                              MoltenCoreHelpers::FLAME_ORB_AVOID_DISTANCE);
+    }
+    static Action* shazzrah_backup_taunt(PlayerbotAI* botAI) { return new RaidBackupTauntAction(botAI, "mc shazzrah backup taunt", "shazzrah"); }
 };
 
 #endif

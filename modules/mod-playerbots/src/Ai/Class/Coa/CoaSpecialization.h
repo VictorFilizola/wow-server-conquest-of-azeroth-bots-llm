@@ -7,6 +7,7 @@
 #ifndef _PLAYERBOT_COASPECIALIZATION_H
 #define _PLAYERBOT_COASPECIALIZATION_H
 
+#include "CoaClassNames.h"
 #include "Define.h"
 #include "ObjectGuid.h"
 
@@ -64,6 +65,8 @@ CoaArmorProficiency const* GetCoaArmorProficiency(uint8 playerClass);
 
 // Role of a Conquest of Azeroth character, from its active specialization. Dps when it has none.
 CoaRole GetCoaRole(Player const* player);
+// A healer of AiPlayerbot.CoaMeleeHealerSpecs: heals from melee range (Cultist Heretic).
+bool IsCoaMeleeHealer(Player const* player);
 
 // Whether a CoA healer holding its mana back for heals should leave this spell alone: it costs mana
 // and the healer is under its reserve. For the authored rotations' "can cast" lines, which would
@@ -124,13 +127,26 @@ bool EnsureCoaSpecialization(Player* bot);
 // would: one ability essence at every even level from 10 (class tree), one talent essence at every
 // odd level from 11 (specialization tree), in the order of the ascensionsidekick.com level build.
 // Returns the number of entries raised.
-uint32 ApplyCoaTalents(Player* bot);
+// maxRaises 0: all at once (as before); else at most that many now, the rest on the bot's next updates
+// (CoaTalentsTick), in the same order, to the same end.
+uint32 ApplyCoaTalents(Player* bot, uint32 maxRaises = 0);
+// AiPlayerbot.CoaLive.TalentsPerUpdate (0: off, all at once).
+uint32 CoaTalentsPerUpdate();
+// The bot's update: the raises left by a capped ApplyCoaTalents, a few at a time.
+void CoaTalentsTick(Player* bot);
+// The entries the build wants at the bot's level that it holds below their rank (0: complete). For the check
+// command ".bot coatalents".
+uint32 CoaTalentsMissing(Player* bot);
 
 // The Character Advancement entry `entryId`, or null.
 AscensionCompatData::CoATalentEntry const* FindCoaEntry(uint32 entryId);
 
-// The paid entries of the bot's class it may hold now: its class tree and its active specialization's tree.
+// The entries of the bot's class it may hold now, in its class tree and its active specialization's tree: paid, or a
+// free choice of a support specialization.
 bool CoaEntryOffered(Player* bot, AscensionCompatData::CoATalentEntry const& entry);
+
+// The free-choice group of an entry (no cost, one entry of the group at a time), or 0.
+uint32 CoaFreeGroupOf(uint32 entryId);
 
 // Class tree points (AE) and specialization tree points (TE): available at the bot's level, and spent.
 struct CoaPoints
@@ -157,30 +173,75 @@ bool SpendAltBotTalentPoints(Player* bot);
 // Brings the nearest free random bot able to fill `role` into the master's group: raised to
 // the master's level, given a specialization of that role, teleported next to the master.
 // Returns false with the reason in `message` when no bot can be recruited.
-// Name of one of the 21 CoA classes, or nullptr.
-char const* CoaClassName(uint8 classId);
+// CoaClassName, FindCoaClass: CoaClassNames.h.
 
-// A CoA class from its name as typed in a command: case, spaces and apostrophes do not matter, and a
-// beginning shared by no other class is enough ("sun" is Sun Cleric). 0 when none, or several, match.
-uint8 FindCoaClass(std::string const& name);
+// A raid, or a heroic or mythic dungeon: where the master is, or what its group and dungeon difficulty set it up for.
+bool CoaHardContent(Player* master);
+// A bot tanking with a specialization of AiPlayerbot.CoaTankNormalDungeonOnly (normal dungeons only).
+bool CoaTankNormalDungeonOnly(Player* bot);
+
+// A Bloodmage Eternal tank in its Cursed Form (Eternal Curse, 800157): cast again when it is off (after a death, a
+// mount), with AiPlayerbot.CoaCursedFormUpkeep.
+void CoaKeepCursedForm(PlayerbotAI* botAI, Player* bot);
 
 // Recruits a free random bot for the role, of that class when classId is not 0.
-bool RecruitCoaBot(Player* master, CoaRole role, std::string& message, uint8 classId = 0);
+// onlyGuildId: only a bot of that guild (0: any); noInstance: never a bot standing in a dungeon, raid or battleground.
+bool RecruitCoaBot(Player* master, CoaRole role, std::string& message, uint8 classId = 0, uint32 onlyGuildId = 0,
+                   bool noInstance = false);
+// A CoA bot that joined the player's group by an invitation tells the player its role, as a recruit does
+// (SquidBots Lite reads "<name> joins as <role>" to know a bot and its specialization).
+void CoaAnnounceJoin(Player* bot, Player* master);
 
 // Turns the master's group into a raid of `size` (25 when 0, 6 to 40) filled with recruited bots:
-// `tanks` tanks and `heals` healers (from the size when 0: 3 and 6 for 25), the rest damage dealers,
+// `tanks` tanks and `heals` healers (from the size when 0, see CoaRaidRoles: 2 and 4 for 25), the rest damage dealers,
 // the classes taken in turn. Members already there count. The outcome is told in `message`.
-bool RecruitCoaRaid(Player* master, uint32 size, uint32 tanks, uint32 heals, std::string& message);
+// preferGuildId (0: as before): the bots of that guild first, then random bots to complete; neither one standing in
+// a dungeon, raid or battleground (the guild activities of CoA World).
+bool RecruitCoaRaid(Player* master, uint32 size, uint32 tanks, uint32 heals, std::string& message,
+                    uint32 preferGuildId = 0);
+// The main tank flag follows the roles (CoaMainTankFlagHolder): a bot holder no longer a tank hands it to the first
+// living tank, or nobody; with assignIfNone a group without it gets one. Raid bots' group roles follow their role.
+// World thread only: CoaQueueMainTankSync queues it from a bot's map update. Not for LFG or battleground groups.
+void CoaSyncMainTankFlag(Group* group, bool assignIfNone);
+// Whether the group is a raid built by ".playerbots coa raid" (the only groups whose flag and roles are kept in step).
+bool CoaIsBuiltRaid(Group const* group);
+// "summon" said by the real-player leader of a built raid (world thread, RC11c): every bot of the raid not beside the
+// leader is brought there, across maps and into the leader's instance; a far teleport stuck over 10 s is finished
+// first. Returns how many teleports were sent; nothing outside a built raid.
+uint32 CoaRegroupRaid(Player* leader);
+// Teleports a bot to the leader (world thread): into the leader's instance, or, when the instance refuses it (a raid in
+// a 5-player dungeon), to that dungeon's door outside; a bot already at the door is left there. WARN on each fallback.
+enum class CoaBringResult
+{
+    Sent,
+    ToDoor,
+    AtDoor,
+    Refused
+};
+CoaBringResult CoaBringBotToLeader(Player* bot, Player* leader, char const* what, bool forceFar = false);
+// The raid check after ".playerbots coa raid" or bots logged in again: CoaRegroupRaid 5 and 15 seconds later.
+void CoaScheduleRegroup(ObjectGuid group, ObjectGuid leader);
+void CoaRegroupUpdate();
+bool CoaQueueMainTankSync(Player* bot);
 
 // The free random bot best placed to play `role` for `master` (same faction, on its map, already of
 // the role, nearest level), of that class when classId is not 0, none of those in `skip`. chosenFits
 // tells whether it already holds a specialization of the role.
-Player* FindCoaRecruit(Player* master, CoaRole role, uint8 classId, std::set<ObjectGuid> const& skip, bool& chosenFits);
+// With AiPlayerbot.CoaSelfFound, only a bot within levelTolerance of the master's level is taken.
+Player* FindCoaRecruit(Player* master, CoaRole role, uint8 classId, std::set<ObjectGuid> const& skip, bool& chosenFits,
+                       uint32 levelTolerance = 0, uint32 onlyGuildId = 0, bool noInstance = false);
 
 // Makes the chosen bot ready to play `role` beside `master`: rebuilt at the master's level when more
 // than levelTolerance levels away, given a specialization of the role and its gear, talents spent.
 bool PrepareCoaRecruit(Player* master, Player* chosen, CoaRole role, bool chosenFits, uint32 levelTolerance,
                        std::string& message);
+
+// Whether the bot's class has a specialization of `role` it could switch to (a Wildcard Hero never does here).
+bool CoaCanSwitchRole(Player* bot, CoaRole role);
+// Moves the bot to a specialization of `role` as the addon recruit does (talents spent, strategies reset), its gear
+// left as it is: for Dungeon Clear's self-found parties, whose low-level bots rarely carry a healer or tank
+// specialization. True when the bot now plays the role.
+bool CoaSwitchRole(Player* bot, CoaRole role);
 
 // "lfg bot heal" and the like, said by a player in a listened chat channel: free bots whisper offers.
 void CoaLfgHeard(Player* player, std::string const& message, Channel* channel);

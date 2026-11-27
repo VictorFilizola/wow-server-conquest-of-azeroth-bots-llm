@@ -18,10 +18,26 @@
 #include "RandomItemMgr.h"
 #include "ServerFacade.h"
 #include "StatsWeightCalculator.h"
+#include "CoaGearScore.h"
 
 #include <algorithm>
 #include <string_view>
 #include <vector>
+
+namespace
+{
+// BotCanUseItem does not check the weapon or armor skill the item needs: the core then refuses to equip it
+// (EQUIP_ERR_NO_REQUIRED_PROFICIENCY) and the bot says "I don't have the necessary skill". Same exception as
+// Player::CanEquipItem for heirloom armor.
+InventoryResult BotCanEquipItem(Player* bot, ItemTemplate const* proto)
+{
+    uint32 const skill = proto->GetSkill();
+    bool const heirloomArmor = proto->Quality == ITEM_QUALITY_HEIRLOOM && proto->Class == ITEM_CLASS_ARMOR;
+    if (skill && !heirloomArmor && !bot->GetSkillValue(skill))
+        return EQUIP_ERR_NO_REQUIRED_PROFICIENCY;
+    return bot->BotCanUseItem(proto);
+}
+}  // namespace
 
 ItemUsage ItemUsageValue::Calculate()
 {
@@ -212,7 +228,7 @@ ItemUsage ItemUsageValue::QueryItemUsageForLookahead(ItemTemplate const* proto, 
             return;
         if (botAI->FindEquipSlot(other, NULL_SLOT, true) != slot)
             return;
-        InventoryResult use = bot->BotCanUseItem(other);
+        InventoryResult use = BotCanEquipItem(bot, other);
         if (use != EQUIP_ERR_OK && use != EQUIP_ERR_CANT_EQUIP_LEVEL_I)
             return;
         float const otherScore =
@@ -234,7 +250,7 @@ ItemUsage ItemUsageValue::QueryItemUsageForLookahead(ItemTemplate const* proto, 
 ItemUsage ItemUsageValue::QueryItemUsageForEquip(ItemTemplate const* itemProto, int32 randomPropertyId, bool lookahead)
 {
     // With lookahead, a too-high required level is the one failure allowed.
-    InventoryResult canUse = bot->BotCanUseItem(itemProto);
+    InventoryResult canUse = BotCanEquipItem(bot, itemProto);
     if (canUse != EQUIP_ERR_OK && !(lookahead && canUse == EQUIP_ERR_CANT_EQUIP_LEVEL_I))
         return ITEM_USAGE_NONE;
 
@@ -315,9 +331,13 @@ ItemUsage ItemUsageValue::QueryItemUsageForEquip(ItemTemplate const* itemProto, 
 
     if (itemProto->Class == ITEM_CLASS_WEAPON && !sRandomItemMgr.CanEquipWeapon(itemProto, bot->getClass()))
         shouldEquip = false;
+    // A self-found bot wears what it finds: a lighter armor beats the grey or empty slot it would keep, the score
+    // below decides (levels 10-15 of a self-found server stood at item level 7 with greens of cloth and leather in
+    // their bags).
+    bool const selfFound = PlayerbotFactory::SelfFoundAt(bot->GetLevel()) || PlayerbotFactory::IsSelfFoundBot(bot);
     if (itemProto->Class == ITEM_CLASS_ARMOR &&
         !sRandomItemMgr.CanEquipArmor(itemProto, bot->getClass(),
-                                      lookahead ? uint32(itemProto->RequiredLevel) : bot->GetLevel()))
+                                      lookahead ? uint32(itemProto->RequiredLevel) : bot->GetLevel(), selfFound))
         shouldEquip = false;
 
     uint8 possibleSlots = 1;
@@ -404,11 +424,19 @@ ItemUsage ItemUsageValue::QueryItemUsageForEquip(ItemTemplate const* itemProto, 
 
         ItemTemplate const* oldItemProto = oldItem->GetTemplate();
         float oldScore = calculator.CalculateItem(oldItemProto->ItemId, oldItem->GetInt32Value(ITEM_FIELD_RANDOM_PROPERTIES_ID));
+        // CoA Combat, gear score: each side gets the set bonuses it unlocks in this slot (AiPlayerbot.CoaCombat.GearScore).
+        float slotItemScore = itemScore;
+        if (sPlayerbotAIConfig.coaCombatGearScoreEnable)
+        {
+            int32 const slotIndex = int32((dest + i) & 0xFF);
+            slotItemScore += CoaGearScore::SetBonusMarginal(bot, itemProto, slotIndex);
+            oldScore += CoaGearScore::SetBonusMarginal(bot, oldItemProto, slotIndex);
+        }
         if (oldItem)
         {
             // uint32 oldStatWeight = sRandomItemMgr.GetLiveStatWeight(bot, oldItemProto->ItemId);
-            if (itemScore || oldScore)
-                shouldEquipInSlot = itemScore > oldScore * sPlayerbotAIConfig.equipUpgradeThreshold;
+            if (slotItemScore || oldScore)
+                shouldEquipInSlot = slotItemScore > oldScore * sPlayerbotAIConfig.equipUpgradeThreshold;
         }
 
         // Bigger quiver
@@ -433,7 +461,7 @@ ItemUsage ItemUsageValue::QueryItemUsageForEquip(ItemTemplate const* itemProto, 
 
         // Compare items based on item level, quality or itemId.
         bool isBetter = false;
-        if (itemScore > oldScore)
+        if (slotItemScore > oldScore)
             isBetter = true;
         // else if (newItemPower == oldScore && itemProto->Quality > oldItemProto->Quality)
         //     isBetter = true;
@@ -491,7 +519,7 @@ ItemUsage ItemUsageValue::QueryItemUsageForEquip(ItemTemplate const* itemProto, 
 
 ItemUsage ItemUsageValue::QueryItemUsageForAmmo(ItemTemplate const* proto)
 {
-    if (bot->getClass() != CLASS_HUNTER || bot->getClass() != CLASS_ROGUE || bot->getClass() != CLASS_WARRIOR)
+    if (bot->getClass() != CLASS_HUNTER && bot->getClass() != CLASS_ROGUE && bot->getClass() != CLASS_WARRIOR)
         return ITEM_USAGE_NONE;
 
     Item* rangedWeapon = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);

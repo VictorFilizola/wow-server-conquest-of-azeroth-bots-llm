@@ -36,11 +36,20 @@
 #include "AscensionRunemasterZenith.h"
 #include "AscensionTemplarLibrams.h"
 #include "AscensionHealingStatSelectors.h"
+#include "AscensionNightmareDamageTaken.h"
+#include "AscensionHeroWarrior.h"
 #include "AscensionGuardianResources.h"
 #include "AscensionSpellProgressionData.h"
+#include "AscensionHeroHunter.h"
+#include "AscensionHeroRogue.h"
+#include "AscensionHeroPriest.h"
+#include "AscensionHeroWarlock.h"
+#include "AscensionHeroPaladin.h"
 #include "AscensionWarcraftRebornDruid.h"
 #include "AscensionWarcraftRebornHunter.h"
 #include "AscensionWarcraftRebornMage.h"
+#include "AscensionWarcraftRebornShaman.h"
+#include "AscensionDummyFixes.h"
 #include "AscensionWarcraftRebornPaladin.h"
 #include "AscensionWarcraftRebornPriest.h"
 #include "AscensionWarcraftRebornRogue.h"
@@ -92,6 +101,7 @@ constexpr uint32 SPELL_GUARDIAN_REPRISAL = 800316;
 constexpr uint32 SPELL_GUARDIAN_REPRISAL_READY = 504885;
 constexpr uint32 SPELL_GUARDIAN_CENTURION_SWORD_ATTACKS = 807967;
 constexpr uint8 GUARDIAN_CENTURION_SWORD_EVENT = 16;
+constexpr uint8 GUARDIAN_CENTURION_POLEARM_EVENT = 22;
 constexpr uint32 SPELL_GUARDIAN_CENTURION_AXE_EFFECTS = 542238;
 constexpr uint32 SPELL_GUARDIAN_CENTURION_MACE_EFFECTS = 542265;
 constexpr uint32 SPELL_GUARDIAN_RAISE_SHIELD = 500168;
@@ -172,6 +182,7 @@ constexpr uint32 SPELL_RANGER_HUNTING_QUIVER = 800262;
 constexpr uint32 SPELL_RANGER_SKIRMISHERS_QUIVER = 801069;
 constexpr uint32 SPELL_RANGER_SEARING_QUIVER_DAMAGE = 681109;
 constexpr uint32 SPELL_RANGER_POISON_QUIVER_DAMAGE = 500104;
+constexpr uint32 SPELL_RANGER_QUICK_WITTED_STAB = 704314;
 constexpr uint32 SPELL_RANGER_BOUNTY_HUNTER = 803114;
 constexpr uint32 SPELL_RANGER_BOUNTY_HUNTER_DEBUFF = 560722;
 constexpr uint32 SPELL_RANGER_RUSTY_SHIV_DAMAGE = 681459;
@@ -958,6 +969,10 @@ void HandleRangerAdvantageSpent(Player* player, uint8 amount)
                     SPELL_RANGER_SNIPERS_FOCUS_ENERGIZE, true);
     }
 
+}
+
+void HandleRangerMaximumPower(Player* player, uint8 amount)
+{
     if (amount == 5 && player->HasAura(SPELL_RANGER_MAXIMUM_POWER) &&
         player->HasAura(SPELL_RANGER_SKIRMISH))
     {
@@ -1098,6 +1113,7 @@ void ApplyAscensionClassMechanics(SpellInfo* spellInfo)
     ApplyAscensionClassMechanics19To25(spellInfo);
     ApplyAscensionBarbarianSpellChanges(spellInfo);
     ApplyAscensionWarcraftRebornWarriorContracts(spellInfo);
+    ApplyAscensionHeroWarriorContracts(spellInfo);
     ApplyAscensionWarcraftRebornPaladinContracts(spellInfo);
     ApplyAscensionWarcraftRebornHunterContracts(spellInfo);
     ApplyAscensionWarcraftRebornRogueContracts(spellInfo);
@@ -1105,6 +1121,24 @@ void ApplyAscensionClassMechanics(SpellInfo* spellInfo)
     ApplyAscensionWarcraftRebornMageContracts(spellInfo);
     ApplyAscensionWarcraftRebornWarlockContracts(spellInfo);
     ApplyAscensionWarcraftRebornDruidContracts(spellInfo);
+    ApplyAscensionWarcraftRebornShamanContracts(spellInfo);
+    ApplyAscensionDummyFixDeathKnightContracts(spellInfo);
+    ApplyAscensionDummyFixDruidContracts(spellInfo);
+    ApplyAscensionDummyFixGenericContracts(spellInfo);
+    ApplyAscensionDummyFixHunterContracts(spellInfo);
+    ApplyAscensionDummyFixMageContracts(spellInfo);
+    ApplyAscensionDummyFixPaladinContracts(spellInfo);
+    ApplyAscensionDummyFixPriestContracts(spellInfo);
+    ApplyAscensionDummyFixRogueContracts(spellInfo);
+    ApplyAscensionDummyFixShamanContracts(spellInfo);
+    ApplyAscensionDummyFixWarlockContracts(spellInfo);
+    ApplyAscensionDummyFixWarriorContracts(spellInfo);
+    ApplyAscensionDummySystemMeleeContracts(spellInfo);
+    ApplyAscensionDummySystemCasterContracts(spellInfo);
+    ApplyAscensionDummySystemTimeContracts(spellInfo);
+    ApplyAscensionDummySystemHealingContracts(spellInfo);
+    ApplyAscensionHeroHunterContracts(spellInfo);
+    ApplyAscensionHeroRogueContracts(spellInfo); ApplyAscensionHeroPriestContracts(spellInfo); ApplyAscensionHeroWarlockContracts(spellInfo); ApplyAscensionHeroPaladinContracts(spellInfo);
     ApplyTinkerScrapResourceContract(spellInfo);
     ApplyTinkerScrapperContract(spellInfo);
     ApplyRangerFixedDurationContract(spellInfo);
@@ -1141,6 +1175,7 @@ void ApplyAscensionClassMechanics(SpellInfo* spellInfo)
     ApplyAscensionRunemasterZenithContracts(spellInfo);
     ApplyAscensionTemplarLibramContracts(spellInfo);
     ApplyAscensionHealingStatSelectorContracts(spellInfo);
+    ApplyAscensionNightmareDamageTakenContracts(spellInfo);
     ApplyAdditionalTargetContracts(spellInfo);
     ApplyRangerOffensiveSpellContracts(spellInfo);
     ApplyRangerForestDwellerContract(spellInfo);
@@ -1198,10 +1233,20 @@ void ApplyAscensionClassMechanics(SpellInfo* spellInfo)
         }
     }
 
+    if (spellInfo->Id == 704624 || spellInfo->Id == 707867)
+    {
+        if (spellInfo->SpellFamilyName == uint32(CLASS_SON_OF_ARUGAL) + 6)
+        {
+            spellInfo->Stances = 0;
+            spellInfo->Attributes &= ~SPELL_ATTR0_NOT_SHAPESHIFTED;
+        }
+    }
+
     spellInfo->IsDeprecatedForPlayers =
         HasDeprecatedWord(spellInfo->SpellName[0]) || HasDeprecatedWord(spellInfo->Rank[0]);
     ApplyClientSpellCharges(spellInfo);
     AscensionTinker::ApplyBeaconChargePool(spellInfo);
+    AscensionTinker::ApplyReplenishmentFieldAura(spellInfo);
 
     if (IsCustomClassFamily(spellInfo->SpellFamilyName))
         spellInfo->EquippedItemInventoryTypeMask = int32(RepairedRangedInventoryMask(spellInfo->EquippedItemClass,
@@ -1283,19 +1328,6 @@ void HandleAscensionClassMechanicsCalculatedTarget(Spell* spell, Player* player,
 
     HandleAscensionClassMechanics12To17CalculatedTarget(spell, player, target,
         targetInfo);
-
-    if (player->getClass() == CLASS_GUARDIAN &&
-        IsGuardianCenturionStrike(spell->GetSpellInfo()->Id) &&
-        GetMainHandWeaponSubclass(player) == ITEM_SUBCLASS_WEAPON_POLEARM)
-    {
-        Unit* primary = spell->GetOriginalTarget();
-        if (!primary || targetInfo.targetGUID != primary->GetGUID())
-            return;
-
-        targetInfo.damage *= 2;
-        targetInfo.damageBeforeTakenMods *= 2;
-        return;
-    }
 }
 
 void HandleAscensionClassMechanicsHit(Spell* spell, Player* player,
@@ -1317,7 +1349,11 @@ void HandleAscensionClassMechanicsHit(Spell* spell, Player* player,
 
     uint32 spellId = spell->GetSpellInfo()->Id;
     if (player->getClass() == CLASS_RANGER)
+    {
         HandleRangerBountyHunterHit(player, target, spellId, damage);
+        if (spellId == SPELL_RANGER_QUICK_WITTED_STAB && spell->IsTriggered())
+            HandleRangerQuiverHit(player, target, spell->GetSpellInfo(), damage);
+    }
 
     if (spell->IsTriggered())
         return;
@@ -1331,6 +1367,19 @@ void HandleAscensionClassMechanicsHit(Spell* spell, Player* player,
         {
             player->CastSpell(player,
                 SPELL_GUARDIAN_CENTURION_SWORD_ATTACKS, true);
+        }
+
+        if (IsGuardianCenturionStrike(spellId) && damage &&
+            GetMainHandWeaponSubclass(player) == ITEM_SUBCLASS_WEAPON_POLEARM &&
+            target == spell->GetOriginalTarget() &&
+            spell->TryMarkScriptEventHandled(GUARDIAN_CENTURION_POLEARM_EVENT))
+        {
+            SpellInfo const* centurion = spell->GetSpellInfo();
+            uint32 const struck = Unit::DealDamage(player, target, damage,
+                nullptr, SPELL_DIRECT_DAMAGE, centurion->GetSchoolMask(),
+                centurion, false);
+            player->SendSpellNonMeleeDamageLog(target, centurion, struck,
+                centurion->GetSchoolMask(), 0, 0, true, 0, critical);
         }
 
         if (!damage)
@@ -1396,6 +1445,12 @@ void HandleAscensionClassMechanicsCast(Spell* spell)
         return;
 
     SpellInfo const* info = spell->GetSpellInfo();
+    if (player->getClass() == CLASS_WARLOCK && info->Id == 217364 &&
+        !player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+    {
+        if (Unit* target = spell->GetOriginalTarget())
+            player->CastSpell(target, 281295, true);
+    }
     if (player->getClass() == CLASS_RANGER)
         HandleRangerAdvantageCast(spell, player);
 
@@ -1408,14 +1463,16 @@ void HandleAscensionClassMechanicsCast(Spell* spell)
         HandleAscensionRangerStonemason(spell, player);
         HandleAscensionRangerPhoenixPlumes(spell, player);
 
+        uint8 spent = 0;
+        if (Aura const* advantage = player->GetAura(SPELL_RANGER_ADVANTAGE))
+            spent = advantage->GetStackAmount();
+        HandleRangerMaximumPower(player, spent);
+
         float consumeChance = 100.0f;
         player->ApplySpellMod(SPELL_RANGER_ADVANTAGE_DECREMENT_PASSIVE,
             SPELLMOD_CHANCE_OF_SUCCESS, consumeChance, spell);
         if (roll_chance_f(consumeChance))
         {
-            uint8 spent = 0;
-            if (Aura const* advantage = player->GetAura(SPELL_RANGER_ADVANTAGE))
-                spent = advantage->GetStackAmount();
             player->CastSpell(player, SPELL_RANGER_ADVANTAGE_DECREMENT, true);
             HandleRangerAdvantageSpent(player, spent);
         }

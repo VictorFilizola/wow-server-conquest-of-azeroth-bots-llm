@@ -41,7 +41,8 @@ void ApplyContracts(SpellInfo* info)
         info->SpellFamilyFlags = flag96();
         info->StackAmount = 1;
         info->DurationEntry = sSpellDurationStore.LookupEntry(21);
-        info->Attributes |= SPELL_ATTR0_DO_NOT_DISPLAY;
+        info->Attributes |= SPELL_ATTR0_PASSIVE | SPELL_ATTR0_DO_NOT_DISPLAY;
+        info->AttributesCu |= SPELL_ATTR0_CU_AURA_CANNOT_BE_SAVED;
     }
     auto dummy = [info](uint8 slot)
     {
@@ -91,6 +92,20 @@ void ApplyContracts(SpellInfo* info)
             info->ManaCostPercentage = base->ManaCostPercentage;
         }
     }
+    if (id == 505160)
+    {
+        info->EquippedItemClass = -1;
+        info->EquippedItemSubClassMask = 0;
+        info->EquippedItemInventoryTypeMask = 0;
+        info->AttributesEx3 &= ~SPELL_ATTR3_REQUIRES_MAIN_HAND_WEAPON;
+        info->DmgClass = SPELL_DAMAGE_CLASS_RANGED;
+    }
+    if (id == 505161)
+    {
+        info->EquippedItemClass = -1;
+        info->EquippedItemSubClassMask = 0;
+        info->EquippedItemInventoryTypeMask = 0;
+    }
     if (Named(info,500232) || id == 504667 || id == 500612)
     {
         info->Effects[1].ApplyAuraName = SPELL_AURA_PERIODIC_DUMMY;
@@ -109,7 +124,10 @@ void ApplyContracts(SpellInfo* info)
         info->ProcFlags = 0;
     }
     if (Named(info,801709))
+    {
         info->Effects[EFFECT_0].ApplyAuraName = SPELL_AURA_PERIODIC_DUMMY;
+        info->SpellLevel = 0;
+    }
     if (id == 573054)
     {
         info->Effects[EFFECT_0].TargetA = SpellImplicitTargetInfo(TARGET_UNIT_TARGET_ENEMY);
@@ -184,7 +202,7 @@ void ApplyContracts(SpellInfo* info)
         info->Effects[1].MiscValue = SPELL_SCHOOL_MASK_ALL;
         dummy(2);
     }
-    if (id == 707278 || id == 578323 || id == 805519 || id == 706698)
+    if (id == 707278 || id == 578323 || id == 805519 || id == 706698 || id == 505161)
         for (auto& effect : info->Effects)
         {
             if (!effect.Effect)
@@ -286,6 +304,19 @@ void ApplyBeaconChargePool(SpellInfo* info)
     for (uint32 beacon : TinkerBeacons)
         if (info->Id == beacon)
             info->ChargeRecoveryKey = TinkerBeaconChargeRoot;
+}
+void ApplyReplenishmentFieldAura(SpellInfo* info)
+{
+    if (!info || info->Id != TinkerReplenishmentFieldAura)
+        return;
+    for (SpellEffectInfo& effect : info->Effects)
+        if (effect.Effect == SPELL_EFFECT_PERSISTENT_AREA_AURA)
+        {
+            effect.Effect = SPELL_EFFECT_APPLY_AURA;
+            effect.TargetA = SpellImplicitTargetInfo(TARGET_UNIT_TARGET_ALLY);
+            effect.TargetB = SpellImplicitTargetInfo();
+        }
+    info->_InitializeExplicitTargetMask();
 }
 }
 namespace

@@ -17,7 +17,6 @@
 
 #include "AscensionFreepick.h"
 #include "AscensionWarcraftReborn.h"
-#include "Chat.h"
 #include "Config.h"
 #include "Creature.h"
 #include "Player.h"
@@ -35,7 +34,6 @@ namespace Worldforged
 namespace
 {
     constexpr uint32 INVISIBLE_GOSSIP_ICON = 34;
-    constexpr uint8 HEIRLOOM_LEVEL = 60;
     constexpr uint32 GENERAL_GOODS = 9781000;
     constexpr uint32 HEIRLOOMS = 9781001;
     constexpr uint32 ALTARS = 9781012;
@@ -161,12 +159,6 @@ public:
                 player->GetSession()->SendListInventory(creature->GetGUID(), GENERAL_GOODS);
                 return true;
             case ACTION_HEIRLOOMS:
-                if (player->GetLevel() < HEIRLOOM_LEVEL)
-                {
-                    ChatHandler(player->GetSession()).SendSysMessage("You must be level 60 to buy heirlooms.");
-                    SendMainMenu(player, creature);
-                    return true;
-                }
                 CloseGossipMenuFor(player);
                 player->GetSession()->SendListInventory(creature->GetGUID(), HEIRLOOMS);
                 return true;

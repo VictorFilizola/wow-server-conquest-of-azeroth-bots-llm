@@ -42,7 +42,12 @@ class aura_ascension_xoroth_event : public AuraScript
                 return autoAttack;
             if (id == 520662)
                 return info && (info->SchoolMask & SPELL_SCHOOL_MASK_FIRE) && Chance(player, 500578);
-            if (id == 800443 || id == 562029)
+            if (id == 800443)
+            {
+                SpellInfo const* reprimand = sSpellMgr->GetSpellInfo(706565);
+                return reprimand && player->HasSpell(706565) && roll_chance_i(reprimand->ProcChance);
+            }
+            if (id == 562029)
                 return Chance(player, 706565);
             return (id == 802603 || id == 802604 || id == 802605) && roll_chance_i(GetSpellInfo()->ProcChance);
         }
@@ -173,6 +178,8 @@ class aura_ascension_xoroth_event : public AuraScript
             Gain(player, 1);
             break;
         case 800997:
+            if (player->HasAura(524922))
+                player->EnergizeBySpell(player, 524922, Amount(524922), POWER_RAGE);
             Blood(player);
             break;
         case 801065:

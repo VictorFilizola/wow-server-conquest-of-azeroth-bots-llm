@@ -4,10 +4,15 @@
  * or (at your option) any later version.
  */
 
+#include "CoaPopulationRules.h"
 #include "PlayerbotAIConfig.h"
 #include "BisListMgr.h"
 #include "CoaBotNames.h"
+#include "CoaBotRaces.h"
+#include "CoaLive.h"
+#include "CoaSpecialization.h"
 #include "Config.h"
+#include "ItemTemplate.h"
 #include "NewRpgInfo.h"
 #include "PlayerbotDungeonRepository.h"
 #include "PlayerbotFactory.h"
@@ -16,8 +21,10 @@
 #include "RandomItemMgr.h"
 #include "RandomPlayerbotFactory.h"
 #include "RandomPlayerbotMgr.h"
+#include "StringConvert.h"
 #include "Talentspec.h"
 #include "TravelMgr.h"
+#include <algorithm>
 #include <cctype>
 #include <iostream>
 #include <sstream>
@@ -64,6 +71,46 @@ void LoadListString(std::string const value, T& list)
 
 // Parses a comma-separated, whitespace-tolerant bot name list (as used by both
 // AiPlayerbot.LevelBrackets.ExcludeNames and AiPlayerbot.ResetBotLevel.ExcludeNames) into out.
+// "Tinker:250, Ranger:160" or "28:250": a class (name or id) or a specialization id, and the percent of its damage.
+static void LoadDamagePct(std::string const& value, std::unordered_map<uint32, uint32>& out, bool classes)
+{
+    std::stringstream entries(value);
+    std::string entry;
+    while (std::getline(entries, entry, ','))
+    {
+        size_t const colon = entry.find(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string key = entry.substr(0, colon);
+        key.erase(0, key.find_first_not_of(" \t"));
+        key.erase(key.find_last_not_of(" \t") + 1);
+        uint32 const pct = uint32(std::strtoul(entry.c_str() + colon + 1, nullptr, 10));
+        uint32 id = 0;
+        if (!key.empty() && std::all_of(key.begin(), key.end(), [](unsigned char c) { return std::isdigit(c); }))
+            id = uint32(std::strtoul(key.c_str(), nullptr, 10));
+        else if (classes)
+            id = FindCoaClass(key);
+        if (!id || !pct || pct > 1000)
+        {
+            LOG_ERROR("playerbots", "AiPlayerbot.CoaBotDamageBy{}: \"{}\" ignored (a {} and a percent from 1 to 1000)",
+                      classes ? "Class" : "Spec", entry, classes ? "class name or id" : "specialization id");
+            continue;
+        }
+        if (pct != 100)
+            out[id] = pct;
+    }
+}
+
+// AiPlayerbot.CoaBotDamageByClass / BySpec / VsPlayers; also called on ".reload config" by CoaBotDamageScale.cpp.
+void LoadCoaBotDamageConfig(PlayerbotAIConfig& config)
+{
+    config.coaBotDamagePctByClass.clear();
+    LoadDamagePct(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaBotDamageByClass", ""), config.coaBotDamagePctByClass, true);
+    config.coaBotDamagePctBySpec.clear();
+    LoadDamagePct(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaBotDamageBySpec", ""), config.coaBotDamagePctBySpec, false);
+    config.coaBotDamageVsPlayers = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaBotDamageVsPlayers", false);
+}
+
 static void ParseLevelMgrExcludeNames(std::string const& csv, std::vector<std::string>& out)
 {
     out.clear();
@@ -75,6 +122,24 @@ static void ParseLevelMgrExcludeNames(std::string const& csv, std::vector<std::s
         if (!s.empty())
             out.push_back(s);
     }
+}
+
+// A setting that was a switch and became a level: "true" and "false" written by a server still read as 1 and 0.
+static uint32 GetSwitchLevel(char const* name, uint32 def, uint32 max)
+{
+    std::string value = sConfigMgr->GetOption<std::string>(name, std::to_string(def), false);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (value == "true" || value == "yes")
+        return 1;
+    if (value == "false" || value == "no")
+        return 0;
+    Optional<uint32> level = Acore::StringTo<uint32>(value);
+    if (!level)
+    {
+        LOG_ERROR("server.loading", "{} = {}: not a number, {} used.", name, value, def);
+        return def;
+    }
+    return std::min(*level, max);
 }
 
 // urand(min, max) asserts max >= min: a pair of settings written the wrong way round (MaxRandomBots lowered
@@ -277,6 +342,7 @@ bool PlayerbotAIConfig::Initialize()
     maxRandomBotReviveTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotReviveTime", 5 * MINUTE);
     minRandomBotTeleportInterval = sConfigMgr->GetOption<int32>("AiPlayerbot.MinRandomBotTeleportInterval", 1 * HOUR);
     maxRandomBotTeleportInterval = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxRandomBotTeleportInterval", 5 * HOUR);
+    refreshClearsInventory = sConfigMgr->GetOption<bool>("AiPlayerbot.RefreshClearsInventory", true);
     permanentlyInWorldTime =
         sConfigMgr->GetOption<int32>("AiPlayerbot.PermanentlyInWorldTime", 1 * YEAR);
     randomBotTeleportDistance = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotTeleportDistance", 100);
@@ -493,7 +559,7 @@ bool PlayerbotAIConfig::Initialize()
     commandServerBind = sConfigMgr->GetOption<std::string>("AiPlayerbot.CommandServerBind", "127.0.0.1");
     perfMonEnabled = sConfigMgr->GetOption<bool>("AiPlayerbot.PerfMonEnabled", false);
 
-    useGroundMountAtMinLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.UseGroundMountAtMinLevel", 20);
+    useGroundMountAtMinLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.UseGroundMountAtMinLevel", 5);
     useFastGroundMountAtMinLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.UseFastGroundMountAtMinLevel", 40);
     useFlyMountAtMinLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.UseFlyMountAtMinLevel", 60);
     useFastFlyMountAtMinLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.UseFastFlyMountAtMinLevel", 70);
@@ -693,6 +759,20 @@ bool PlayerbotAIConfig::Initialize()
 
     autoGearCommand = sConfigMgr->GetOption<int32>("AiPlayerbot.AutoGearCommand", 1);
     autoGearCommandAltBots = sConfigMgr->GetOption<int32>("AiPlayerbot.AutoGearCommandAltBots", 1);
+    coaSelfFound = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaSelfFound", false);
+    coaSelfFoundMaxLevel = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaSelfFoundMaxLevel", 80);
+    int32 const coaSelfFoundBotsPercentOption = sConfigMgr->GetOption<int32>("AiPlayerbot.CoaSelfFoundBotsPercent", -1);
+    coaSelfFoundBotsPercent = coaSelfFoundBotsPercentOption < 0 ? (coaSelfFound ? 20 : 0)
+                                                                : std::min<uint32>(uint32(coaSelfFoundBotsPercentOption), 100);
+    randomBotTransmog = sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotTransmog", true);
+    randomBotTransmogPercent = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotTransmogPercent", 50), 100);
+    randomBotTransmogMinLevel = sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotTransmogMinLevel", 10);
+    randomBotTransmogCosmeticSets =
+        std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotTransmogCosmeticSets", 50), 100);
+    playerMainTankRescueHealth =
+        std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.PlayerMainTankRescueHealth", 10), 100);
+    coaTankOrdersSay = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaTankOrdersSay", true, false);
+    gearRollRandomSuffix = GetSwitchLevel("AiPlayerbot.GearRollRandomSuffix", 0, 2);
     autoGearBisCommand = sConfigMgr->GetOption<int32>("AiPlayerbot.AutoGearBisCommand", 0);
     autoGearQualityLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.AutoGearQualityLimit", 3);
     autoGearScoreLimit = sConfigMgr->GetOption<int32>("AiPlayerbot.AutoGearScoreLimit", 0);
@@ -700,6 +780,14 @@ bool PlayerbotAIConfig::Initialize()
     randomBotXPRate = sConfigMgr->GetOption<float>("AiPlayerbot.RandomBotXPRate", 1.0);
     randomBotAllianceRatio = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotAllianceRatio", 50);
     randomBotHordeRatio = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotHordeRatio", 50);
+    // Both at 0 divides by zero when the random bots are added (RandomPlayerbotMgr) and stops the server.
+    if (!randomBotAllianceRatio && !randomBotHordeRatio)
+    {
+        LOG_ERROR("server.loading",
+                  "AiPlayerbot.RandomBotAllianceRatio and AiPlayerbot.RandomBotHordeRatio are both 0. Using 50/50.");
+        randomBotAllianceRatio = 50;
+        randomBotHordeRatio = 50;
+    }
     disableDeathKnightLogin = sConfigMgr->GetOption<bool>("AiPlayerbot.DisableDeathKnightLogin", 0);
     limitTalentsExpansion = sConfigMgr->GetOption<bool>("AiPlayerbot.LimitTalentsExpansion", 0);
     botActiveAlone = sConfigMgr->GetOption<int32>("AiPlayerbot.BotActiveAlone", 10);
@@ -717,7 +805,7 @@ bool PlayerbotAIConfig::Initialize()
 
     randombotsWalkingRPG = sConfigMgr->GetOption<bool>("AiPlayerbot.RandombotsWalkingRPG", false);
     randombotsWalkingRPGInDoors = sConfigMgr->GetOption<bool>("AiPlayerbot.RandombotsWalkingRPG.InDoors", false);
-    minEnchantingBotLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.MinEnchantingBotLevel", 60);
+    minEnchantingBotLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.MinEnchantingBotLevel", 20);
     limitEnchantExpansion = sConfigMgr->GetOption<int32>("AiPlayerbot.LimitEnchantExpansion", 1);
     limitGearExpansion = sConfigMgr->GetOption<int32>("AiPlayerbot.LimitGearExpansion", 1);
     randombotStartingLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.RandombotStartingLevel", 1);
@@ -728,9 +816,18 @@ bool PlayerbotAIConfig::Initialize()
                  randombotStartingLevel, randomBotMaxLevel, randomBotMaxLevel);
         randombotStartingLevel = randomBotMaxLevel;
     }
+    // Self-found: a bot's level comes from the experience it earns, never from a roll.
+    if (coaSelfFound)
+    {
+        disableRandomLevels = true;
+        LOG_INFO("server.loading", "AiPlayerbot.CoaSelfFound = 1: up to level {}, bots wear only what they find and level by playing.",
+                 coaSelfFoundMaxLevel);
+    }
     enablePeriodicOnlineOffline = sConfigMgr->GetOption<bool>("AiPlayerbot.EnablePeriodicOnlineOffline", false);
     enableRandomBotTrading = sConfigMgr->GetOption<int32>("AiPlayerbot.EnableRandomBotTrading", 1);
-    periodicOnlineOfflineRatio = sConfigMgr->GetOption<float>("AiPlayerbot.PeriodicOnlineOfflineRatio", 2.0);
+    periodicOnlineOfflineRatio = sConfigMgr->GetOption<float>("AiPlayerbot.PeriodicOnlineOfflineRatio", COA_PERIODIC_RATIO_DEFAULT);
+    onlineSelectionFollowPlayerLevels = sConfigMgr->GetOption<bool>("AiPlayerbot.OnlineSelection.FollowPlayerLevels", false);
+    onlineSelectionLevelWindow = sConfigMgr->GetOption<uint32>("AiPlayerbot.OnlineSelection.LevelWindow", 5);
     gearscorecheck = sConfigMgr->GetOption<bool>("AiPlayerbot.GearScoreCheck", false);
     randomBotPreQuests = sConfigMgr->GetOption<bool>("AiPlayerbot.PreQuests", false);
 
@@ -760,6 +857,7 @@ bool PlayerbotAIConfig::Initialize()
         sConfigMgr->GetOption<bool>("AiPlayerbot.AutoLearnTradeskillSpells", true);
     coaClassesOnly = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaClassesOnly", true);
     gatherOnlySkillUp = sConfigMgr->GetOption<bool>("AiPlayerbot.GatherOnlySkillUp", true, false);
+    altLootMasterDistance = sConfigMgr->GetOption<float>("AiPlayerbot.AltLootMasterDistance", 30.0f, false);
     // Written by the CoA Server Manager's custom races module ("bots use custom races"): a list of race ids,
     // not a mask, since its races go up to 97. CrashingBotRaces adds to it the races that module's author lists
     // as crashing the client, so that an incomplete list written by the Manager never lets them back. Its own
@@ -771,13 +869,19 @@ bool PlayerbotAIConfig::Initialize()
         sConfigMgr->GetOption<std::string>("AiPlayerbot.CrashingBotRaces", "32,72,77,97", false),
         excludedBotRaces);
     customRacesForBots = sConfigMgr->GetOption<bool>("CoACustomRaces.BotsEnable", false, false);
+    // How bots use each race, written by the server for the races it adds (AiPlayerbot.BotRace.<id>, CoaBotRaces.h).
+    CoaBotRaces::Load();
     coaSpecRotations = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaSpecRotations", true);
     coaHealerManaReserve = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaHealerManaReserve", 35);
     coaCasterManaReserve = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaCasterManaReserve", 15);
     coaGroupTelemetry = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaGroupTelemetry", false);
+    coaGroupTelemetryRaids = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaGroupTelemetryRaids", false);
+    coaLogTargets = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaLogTargets", 0);
+    coaReleaseDelay = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaReleaseDelay", 120);
     coaSmartHeal = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaSmartHeal", true);
     coaSmartTank = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaSmartTank", true);
     coaLfgMissingRoles = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaLfgMissingRoles", true, false);
+    lfgKeepRandomBots = sConfigMgr->GetOption<bool>("AiPlayerbot.LfgKeepRandomBots", false, false);
     coaHoldBehindTank = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaHoldBehindTank", false, false);
     coaPlayersReplaceBots = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaPlayersReplaceBots", 0, false), 1000);
     coaPlayersReplaceBotsMin = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaPlayersReplaceBotsMin", 0, false);
@@ -796,12 +900,33 @@ bool PlayerbotAIConfig::Initialize()
     coaAvoidMarkedAlly = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaAvoidMarkedAlly", true, false);
     coaMeleeNoRangedHardcast = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaMeleeNoRangedHardcast", true, false);
     coaLootMakeRoom = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaLootMakeRoom", true, false);
+    openChestsWithoutOrder = sConfigMgr->GetOption<bool>("AiPlayerbot.OpenChestsWithoutOrder", true, false);
+    missionsEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.Missions.Enable", true, false);
+    missionsMaxMinutes = std::clamp<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.MaxMinutes", 120, false), 1, 24 * 60);
+    missionsDefaultMinutes = std::clamp<uint32>(
+        sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.DefaultMinutes", 60, false), 1, missionsMaxMinutes);
+    missionsMaxPerPlayer = sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.MaxPerPlayer", 4, false);
+    missionsMaxDeaths = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.MaxDeaths", 3, false));
+    missionsTeleportFallback = sConfigMgr->GetOption<bool>("AiPlayerbot.Missions.TeleportFallback", true, false);
+    missionsTeleportToSpot = sConfigMgr->GetOption<bool>("AiPlayerbot.Missions.TeleportToSpot", true, false);
+    missionsHighRisk = sConfigMgr->GetOption<bool>("AiPlayerbot.Missions.HighRisk", true, false);
+    missionsRiskMailEvery = sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.RiskMailEvery", 20, false);
+    missionsRiskMailMinutes = sConfigMgr->GetOption<uint32>("AiPlayerbot.Missions.RiskMailMinutes", 15, false);
+    altChatToAddon = sConfigMgr->GetOption<bool>("AiPlayerbot.AltChatToAddon", true, false);
+    catchUpQuestChains = sConfigMgr->GetOption<bool>("AiPlayerbot.CatchUpQuestChains", true, false);
+    altDisenchant = sConfigMgr->GetOption<bool>("AiPlayerbot.AltDisenchant", true, false);
+    altLootCompanion = sConfigMgr->GetOption<bool>("AiPlayerbot.AltLootCompanion", true, false);
+    coaTotemRecall = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaTotemRecall", true, false);
+    guildBankDepositEnable = sConfigMgr->GetOption<bool>("AiPlayerbot.GuildBankDeposit.Enable", true, false);
+    LoadGuildBankDepositItems(sConfigMgr->GetOption<std::string>("AiPlayerbot.GuildBankDeposit.Items", "ore,herb,leather,cloth,boe", false));
+    guildBankDepositKeepGold = sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBankDeposit.KeepGold", 100, false);
+    guildBankDepositMinStack = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBankDeposit.MinStack", 1, false));
+    guildBankDepositTab = std::min<uint32>(sConfigMgr->GetOption<uint32>("AiPlayerbot.GuildBankDeposit.Tab", 0, false), 6);
     coaAoeNoIdlePull = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaAoeNoIdlePull", true, false);
     coaPvpTrinket = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaPvpTrinket", true, false);
     coaArenaPurge = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaArenaPurge", true, false);
     coaBossKnowledge = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaBossKnowledge", true);
     coaRecruitSameFaction = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaRecruitSameFaction", true);
-    coaBotSurname = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaBotSurname", true);
     coaThreatHold = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaThreatHold", 90);
     coaTankThreatBonus = sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaTankThreatBonus", 0);
     coaAttackLoop = sConfigMgr->GetOption<bool>("AiPlayerbot.CoaAttackLoop", true);
@@ -833,11 +958,16 @@ bool PlayerbotAIConfig::Initialize()
     coaStatusIntervalSeconds = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("AiPlayerbot.CoaStatusIntervalSeconds", 5));
     coaStatusEnabled = !coaStatusFile.empty();
     coaExcludedSpecializations.clear();
-    LoadSet<std::set<uint32>>(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaExcludedSpecializations", "99"),
+    LoadSet<std::set<uint32>>(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaExcludedSpecializations", ""),
                               coaExcludedSpecializations);
+    zoneCrowdLimit = sConfigMgr->GetOption<uint32>("AiPlayerbot.ZoneCrowdLimit", 30);
     coaOffensiveHealerSpecs.clear();
     LoadSet<std::set<uint32>>(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaOffensiveHealerSpecs", "40,43"),
                               coaOffensiveHealerSpecs);
+    coaMeleeHealerSpecs.clear();
+    LoadSet<std::set<uint32>>(sConfigMgr->GetOption<std::string>("AiPlayerbot.CoaMeleeHealerSpecs", "40"),
+                              coaMeleeHealerSpecs);
+    LoadCoaBotDamageConfig(*this);
     // Des soins que la mesure a trouvés vides. Un bot compose sa trousse de soin à partir de tout
     // ce qu'il connaît, pas à partir de sa rotation : retirer la ligne de rotation ne suffit pas à
     // lui faire oublier le sort, il faut le lui refuser ici. La liste est lue une seule fois, au
@@ -865,11 +995,15 @@ bool PlayerbotAIConfig::Initialize()
     RpgStatusProbWeight[RPG_REST] = sConfigMgr->GetOption<int32>("AiPlayerbot.RpgStatusProbWeight.Rest", 5);
     RpgStatusProbWeight[RPG_OUTDOOR_PVP] = sConfigMgr->GetOption<int32>("AiPlayerbot.RpgStatusProbWeight.OutdoorPvp", 10);
     RpgStatusProbWeight[RPG_GO_CITY] = sConfigMgr->GetOption<int32>("AiPlayerbot.RpgStatusProbWeight.GoCity", 10);
+    questMaxDropsPerPass = sConfigMgr->GetOption<uint32>("AiPlayerbot.Quest.MaxDropsPerPass", 1);
 
     syncLevelWithPlayers = sConfigMgr->GetOption<bool>("AiPlayerbot.SyncLevelWithPlayers", false);
     randomBotConcentrateInPlayerZone =
         sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotConcentrateInPlayerZone", false);
     randomBotGroupNearby = sConfigMgr->GetOption<bool>("AiPlayerbot.RandomBotGroupNearby", false);
+    flyOnlyOutOfSight = sConfigMgr->GetOption<bool>("AiPlayerbot.FlyOnlyOutOfSight", true);
+    teleportOnlyOutOfSight = sConfigMgr->GetOption<bool>("AiPlayerbot.TeleportOnlyOutOfSight", true);
+    standOffObjects = sConfigMgr->GetOption<bool>("AiPlayerbot.StandOffObjects", true);
 
     // arena
     randomBotArenaTeam2v2Count = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotArenaTeam2v2Count", 10);
@@ -909,28 +1043,47 @@ bool PlayerbotAIConfig::Initialize()
     selfBotLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.SelfBotLevel", 1);
     botTextLocale = sConfigMgr->GetOption<int32>("AiPlayerbot.BotTextLocale", -1);
 
-    RandomPlayerbotFactory::CreateRandomBots();
-    if (World::IsStopped())
+    // Code sessions (CoA Live, World, Economy, Combat): each one loads its settings in its own file.
+    LoadCoaLiveConfig();
+    LoadCoaWorldConfig();
+    LoadCoaEconomyConfig();
+    LoadCoaCombatConfig();
+
+    // Startup check (AiPlayerbot.StartupCheckOnly, or CoA.ValidationMode set by a server's qualification tool): the
+    // module loads its data and its contexts, but creates, deletes, renames and logs in no bot, and the world updates
+    // below do nothing. For a server that qualifies a build before opening it.
+    if (coaStartupCheckOnly)
     {
-        return true;
+        randomBotAutologin = false;
+        botAutologin = false;
+        LOG_INFO("server.loading", "Playerbots: startup check only, no bot is created or logged in.");
     }
-    ApplyCoaBotSurnames();
-
-    // Assign account types after accounts are created
-    sRandomPlayerbotMgr.AssignAccountTypes();
-
-    if (sPlayerbotAIConfig.enabled)
+    else
     {
-        sRandomPlayerbotMgr.Init();
-    }
+        RandomPlayerbotFactory::CreateRandomBots();
+        if (World::IsStopped())
+        {
+            return true;
+        }
+        ApplyCoaBotSurnames();
 
-    PlayerbotGuildMgr::instance().Init();
-    sRandomPlayerbotMgr.InitArenaTeams();
+        // Assign account types after accounts are created
+        sRandomPlayerbotMgr.AssignAccountTypes();
+
+        if (sPlayerbotAIConfig.enabled)
+        {
+            sRandomPlayerbotMgr.Init();
+        }
+
+        PlayerbotGuildMgr::instance().Init();
+        sRandomPlayerbotMgr.InitArenaTeams();
+    }
     sRandomItemMgr.Init();
     sRandomItemMgr.InitAfterAhBot();
     sBisListMgr->LoadAll();
     PlayerbotTextMgr::instance().LoadBotTexts();
     PlayerbotTextMgr::instance().LoadBotTextChance();
+    CoaLive::LoadBank();
     PlayerbotFactory::Init();
 
     AiObjectContext::BuildAllSharedContexts();
@@ -1106,6 +1259,59 @@ void PlayerbotAIConfig::LoadRandomBotLevelConfig()
 bool PlayerbotAIConfig::IsInRandomAccountList(uint32 id)
 {
     return find(randomBotAccounts.begin(), randomBotAccounts.end(), id) != randomBotAccounts.end();
+}
+
+void PlayerbotAIConfig::LoadGuildBankDepositItems(std::string const& value)
+{
+    static std::unordered_map<std::string, std::pair<int32, int32>> const names = {
+        {"tradegoods", {ITEM_CLASS_TRADE_GOODS, -1}},   {"consumables", {ITEM_CLASS_CONSUMABLE, -1}},
+        {"gems", {ITEM_CLASS_GEM, -1}},                 {"reagents", {ITEM_CLASS_REAGENT, -1}},
+        {"recipes", {ITEM_CLASS_RECIPE, -1}},           {"parts", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_PARTS}},
+        {"cloth", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_CLOTH}},
+        {"leather", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_LEATHER}},
+        {"ore", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_METAL_STONE}},
+        {"ores", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_METAL_STONE}},
+        {"meat", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_MEAT}},
+        {"herb", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_HERB}},
+        {"herbs", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_HERB}},
+        {"elemental", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_ELEMENTAL}},
+        {"enchanting", {ITEM_CLASS_TRADE_GOODS, ITEM_SUBCLASS_ENCHANTING}},
+        {"boe", {GUILD_DEPOSIT_BOE, -1}}};
+
+    guildBankDepositItems.clear();
+    for (std::string token : split(value, ','))
+    {
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char c) { return std::isspace(c); }),
+                    token.end());
+        std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (token.empty())
+            continue;
+
+        auto named = names.find(token);
+        if (named != names.end())
+        {
+            guildBankDepositItems.push_back(named->second);
+            continue;
+        }
+
+        std::size_t const colon = token.find(':');
+        std::string const classText = token.substr(0, colon);
+        std::string const subClassText = colon == std::string::npos ? "" : token.substr(colon + 1);
+        auto const isDigit = [](unsigned char c) { return std::isdigit(c) != 0; };
+        bool const numeric = !classText.empty() && std::all_of(classText.begin(), classText.end(), isDigit) &&
+                             std::all_of(subClassText.begin(), subClassText.end(), isDigit) &&
+                             (colon == std::string::npos || !subClassText.empty());
+        if (!numeric || classText.size() > 3 || subClassText.size() > 3)
+        {
+            LOG_ERROR("playerbots", "AiPlayerbot.GuildBankDeposit.Items: unknown entry '{}' ignored", token);
+            continue;
+        }
+        int32 const itemClass = std::stoi(classText);
+        int32 const itemSubClass = subClassText.empty() ? -1 : std::stoi(subClassText);
+        if (itemClass == ITEM_CLASS_QUEST)
+            continue;
+        guildBankDepositItems.emplace_back(itemClass, itemSubClass);
+    }
 }
 
 bool PlayerbotAIConfig::IsInRandomQuestItemList(uint32 id)

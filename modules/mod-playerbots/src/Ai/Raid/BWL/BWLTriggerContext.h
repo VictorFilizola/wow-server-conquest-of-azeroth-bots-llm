@@ -24,6 +24,7 @@ public:
         creators["bwl vaelastrasz fire resistance"] = &RaidBwlTriggerContext::bwl_vaelastrasz_fire_resistance_trigger;
         creators["bwl vaelastrasz positioning"] = &RaidBwlTriggerContext::bwl_vaelastrasz_positioning;
         creators["bwl vaelastrasz burning adrenaline"] = &RaidBwlTriggerContext::bwl_vaelastrasz_burning_adrenaline;
+        creators["bwl vaelastrasz tank swap"] = &RaidBwlTriggerContext::bwl_vaelastrasz_tank_swap;
 
         creators["bwl broodlord fire resistance"] = &RaidBwlTriggerContext::bwl_broodlord_fire_resistance_trigger;
         creators["bwl broodlord ranged too close"] = &RaidBwlTriggerContext::bwl_broodlord_ranged_too_close;
@@ -34,9 +35,16 @@ public:
         creators["bwl flamegor fire resistance"] = &RaidBwlTriggerContext::bwl_flamegor_fire_resistance_trigger;
         creators["bwl flamegor not victim"] = &RaidBwlTriggerContext::bwl_flamegor_not_victim;
 
+        creators["bwl chromaggus fire resistance"] = &RaidBwlTriggerContext::bwl_chromaggus_fire_resistance_trigger;
         creators["bwl affliction bronze"] = &RaidBwlTriggerContext::bwl_affliction_bronze;
 
         creators["bwl nefarian positioning"] = &RaidBwlTriggerContext::bwl_nefarian_positioning;
+        creators["bwl firemaw tank swap"] = &RaidBwlTriggerContext::bwl_firemaw_tank_swap;
+        creators["bwl ebonroc tank swap"] = &RaidBwlTriggerContext::bwl_ebonroc_tank_swap;
+        creators["bwl chromaggus positioning"] = &RaidBwlTriggerContext::bwl_chromaggus_positioning;
+        creators["bwl chromaggus red affliction"] = &RaidBwlTriggerContext::bwl_chromaggus_red_affliction;
+        creators["bwl ground effect"] = &RaidBwlTriggerContext::bwl_ground_effect;
+        creators["bwl flamegor combustion"] = &RaidBwlTriggerContext::bwl_flamegor_combustion;
         creators["bwl nefarian wild magic"] = &RaidBwlTriggerContext::bwl_nefarian_wild_magic;
 
         creators["bwl death talon wyrmguard tank"] = &RaidBwlTriggerContext::bwl_death_talon_wyrmguard_tank;
@@ -50,6 +58,7 @@ private:
     static Trigger* bwl_vaelastrasz_fire_resistance_trigger(PlayerbotAI* ai) { return new BossFireResistanceTrigger(ai, "vaelastrasz the corrupt"); }
     static Trigger* bwl_vaelastrasz_positioning(PlayerbotAI* ai) { return new BwlVaelastraszPositioningTrigger(ai); }
     static Trigger* bwl_vaelastrasz_burning_adrenaline(PlayerbotAI* ai) { return new BwlVaelastraszBurningAdrenalineTrigger(ai); }
+    static Trigger* bwl_vaelastrasz_tank_swap(PlayerbotAI* ai) { return new BwlVaelastraszTankSwapTrigger(ai); }
     static Trigger* bwl_broodlord_fire_resistance_trigger(PlayerbotAI* ai) { return new BossFireResistanceTrigger(ai, "broodlord lashlayer"); }
     static Trigger* bwl_broodlord_ranged_too_close(PlayerbotAI* ai) { return new BwlBroodlordRangedTooCloseTrigger(ai); }
     static Trigger* bwl_firemaw_fire_resistance_trigger(PlayerbotAI* ai) { return new BossFireResistanceTrigger(ai, "firemaw"); }
@@ -57,9 +66,22 @@ private:
     static Trigger* bwl_ebonroc_not_victim(PlayerbotAI* ai) { return new BwlBlackDrakeNotVictimTrigger(ai, "ebonroc"); }
     static Trigger* bwl_flamegor_fire_resistance_trigger(PlayerbotAI* ai) { return new BossFireResistanceTrigger(ai, "flamegor"); }
     static Trigger* bwl_flamegor_not_victim(PlayerbotAI* ai) { return new BwlBlackDrakeNotVictimTrigger(ai, "flamegor"); }
+    static Trigger* bwl_chromaggus_fire_resistance_trigger(PlayerbotAI* ai) { return new BossFireResistanceTrigger(ai, "chromaggus"); }
     static Trigger* bwl_affliction_bronze(PlayerbotAI* ai) { return new BwlAfflictionBronzeTrigger(ai); }
     static Trigger* bwl_nefarian_wild_magic(PlayerbotAI* ai) { return new BwlNefarianWildMagicTrigger(ai); }
     static Trigger* bwl_nefarian_positioning(PlayerbotAI* ai) { return new BwlNefarianPositioningTrigger(ai); }
+    static Trigger* bwl_firemaw_tank_swap(PlayerbotAI* ai)
+    {
+        return new BwlDrakeTankSwapTrigger(ai, "bwl firemaw tank swap", "firemaw", true);
+    }
+    static Trigger* bwl_ebonroc_tank_swap(PlayerbotAI* ai)
+    {
+        return new BwlDrakeTankSwapTrigger(ai, "bwl ebonroc tank swap", "ebonroc", false);
+    }
+    static Trigger* bwl_chromaggus_positioning(PlayerbotAI* ai) { return new BwlChromaggusPositioningTrigger(ai); }
+    static Trigger* bwl_chromaggus_red_affliction(PlayerbotAI* ai) { return new BwlChromaggusRedAfflictionTrigger(ai); }
+    static Trigger* bwl_ground_effect(PlayerbotAI* ai) { return new BwlGroundEffectTrigger(ai); }
+    static Trigger* bwl_flamegor_combustion(PlayerbotAI* ai) { return new BwlFlamegorCombustionTrigger(ai); }
     static Trigger* bwl_death_talon_wyrmguard_tank(PlayerbotAI* ai) { return new BwlDeathTalonWyrmguardTankTrigger(ai); }
     static Trigger* bwl_death_talon_wyrmguard_ranged(PlayerbotAI* ai) { return new BwlDeathTalonWyrmguardRangedTrigger(ai); }
 };

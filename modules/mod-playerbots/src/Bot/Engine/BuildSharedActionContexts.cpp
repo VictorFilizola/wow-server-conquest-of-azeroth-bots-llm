@@ -6,7 +6,11 @@
 
 #include "ActionContext.h"
 #include "AiObjectContext.h"
+#include "CoaCombatContext.h"
+#include "STContexts.h"
+#include "CoaGardesContext.h"
 #include "Aq20ActionContext.h"
+#include "Aq40ActionContext.h"
 #include "BTActionContext.h"
 #include "BWLActionContext.h"
 #include "ChatActionContext.h"
@@ -22,6 +26,7 @@
 #include "OnyActionContext.h"
 #include "RSActionContext.h"
 #include "SSCActionContext.h"
+#include "SunwellActionContext.h"
 #include "TKActionContext.h"
 #include "TbcDungeonActionContext.h"
 #include "VanillaDungeonActionContext.h"
@@ -30,6 +35,7 @@
 #include "WorldPacketActionContext.h"
 #include "WotlkDungeonActionContext.h"
 #include "ZAActionContext.h"
+#include "ZGActionContext.h"
 #include "CoaGenericContext.h"
 
 void AiObjectContext::BuildSharedActionContexts(SharedNamedObjectContextList<Action>& actionContexts)
@@ -38,8 +44,10 @@ void AiObjectContext::BuildSharedActionContexts(SharedNamedObjectContextList<Act
     actionContexts.Add(new ChatActionContext());
     actionContexts.Add(new WorldPacketActionContext());
     actionContexts.Add(new RaidAq20ActionContext());
+    actionContexts.Add(new RaidAq40ActionContext());
     actionContexts.Add(new RaidMcActionContext());
     actionContexts.Add(new RaidBwlActionContext());
+    actionContexts.Add(new RaidZulGurubActionContext());
     actionContexts.Add(new RaidKarazhanActionContext());
     actionContexts.Add(new RaidGruulsLairActionContext());
     actionContexts.Add(new RaidMagtheridonActionContext());
@@ -48,6 +56,7 @@ void AiObjectContext::BuildSharedActionContexts(SharedNamedObjectContextList<Act
     actionContexts.Add(new RaidHyjalSummitActionContext());
     actionContexts.Add(new RaidBlackTempleActionContext());
     actionContexts.Add(new RaidZulAmanActionContext());
+    actionContexts.Add(new RaidSunwellPlateauActionContext());
     actionContexts.Add(new RaidNaxxActionContext());
     actionContexts.Add(new RaidOsActionContext());
     actionContexts.Add(new RaidEoEActionContext());
@@ -64,6 +73,20 @@ void AiObjectContext::BuildSharedActionContexts(SharedNamedObjectContextList<Act
     actionContexts.Add(new VanillaDungeonRFCActionContext());
     actionContexts.Add(new VanillaDungeonSFKActionContext());
     actionContexts.Add(new VanillaDungeonSMActionContext());
+    actionContexts.Add(new VanillaDungeonBFDActionContext());
+    actionContexts.Add(new VanillaDungeonUldaActionContext());
+    actionContexts.Add(new VanillaDungeonWCActionContext());
+    actionContexts.Add(new VanillaDungeonRFKActionContext());
+    actionContexts.Add(new VanillaDungeonRFDActionContext());
+    actionContexts.Add(new VanillaDungeonBRSActionContext());
+    actionContexts.Add(new VanillaDungeonBRDActionContext());
+    actionContexts.Add(new VanillaDungeonSTActionContext());
+    actionContexts.Add(new VanillaDungeonScholoActionContext());
+    actionContexts.Add(new VanillaDungeonStratActionContext());
+    actionContexts.Add(new VanillaDungeonMaraActionContext());
+    actionContexts.Add(new CoaDungeonOtherSideActionContext());
+    actionContexts.Add(new CoaDungeonVaultsActionContext());
+    actionContexts.Add(new VanillaDungeonDMActionContext());
     actionContexts.Add(new WotlkDungeonUKActionContext());
     actionContexts.Add(new WotlkDungeonNexActionContext());
     actionContexts.Add(new WotlkDungeonANActionContext());
@@ -83,4 +106,7 @@ void AiObjectContext::BuildSharedActionContexts(SharedNamedObjectContextList<Act
     // CoA: generische, parametrisierbare Bausteine (GenericAction)
     // machen Kampfverhalten zu Daten - siehe Ai/Coa/CoaGenericContext.h
     actionContexts.Add(new CoaGenericActionContext());
+    actionContexts.Add(new CoaGardesActionContext());
+    // CoA Combat
+    actionContexts.Add(new CoaCombatActionContext());
 }

@@ -5,6 +5,14 @@
  */
 
 #include "NewRpgAction.h"
+#include "CoaBotAuctions.h"
+#include "CoaCityLife.h"
+#include "CoaRpgTrade.h"
+#include "CoaPathProbe.h"
+#include "RandomPlayerbotMgr.h"
+#include "CoaSafeMove.h"
+#include "CoaSafeMoveRules.h"
+#include "CoaEconomyRules.h"
 #include "AreaDefines.h"
 #include "BroadcastHelper.h"
 #include "ChatHelper.h"
@@ -23,6 +31,7 @@
 #include "PathGenerator.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
+#include "Engine.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotTextMgr.h"
 #include "QuestDef.h"
@@ -243,7 +252,25 @@ bool StartRpgDoQuestAction::Execute(Event event)
 
 bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
 {
+    // 3.2.2: a random bot stuck on a closed patch of a capital's navmesh (under a building) back on the city's floor.
+    if (RandomPlayerbotMgr::instance().IsRandomBot(bot) && !botAI->HasGameClientMaster() &&
+        CoaPathProbe::RescueFromPatch(bot))
+        return true;
     NewRpgInfo& info = botAI->rpgInfo;
+    // 3.2.2 (the user: bots in the Stormwind inn's floor, one still there for an hour): in the floor, or still on a
+    // wander no step leads anywhere, put on the capital's nearest checked arrival (CityUnstick).
+    if (RandomPlayerbotMgr::instance().IsRandomBot(bot) && !botAI->HasGameClientMaster())
+    {
+        bool wandering = false;
+        if (info.GetStatus() == RPG_WANDER_NPC)
+            if (auto const* wander = std::get_if<NewRpgInfo::WanderNpc>(&info.data))
+                wandering = !wander->lastReach && !(wander->npcOrGo && CoaCityLife::Holds(botAI, wander->npcOrGo));
+        if (CoaPathProbe::CityUnstick(bot, wandering))
+        {
+            info.ChangeToIdle();
+            return true;
+        }
+    }
     NewRpgStatus status = info.GetStatus();
     switch (status)
     {
@@ -254,6 +281,12 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
                 LeaveCity();
                 return true;
             }
+            // CoA Economy: business with a vendor or an auctioneer in reach: go there first
+            if (CoaEconomy::RpgTrade::HasTradeNpcInReach(botAI))
+            {
+                info.ChangeToWanderNpc();
+                return true;
+            }
             return RandomChangeStatus({RPG_GO_CAMP, RPG_GO_GRIND, RPG_WANDER_RANDOM, RPG_WANDER_NPC, RPG_DO_QUEST,
                                        RPG_TRAVEL_FLIGHT, RPG_REST, RPG_OUTDOOR_PVP, RPG_GO_CITY});
 
@@ -261,11 +294,22 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
         {
             auto& data = std::get<NewRpgInfo::GoGrind>(info.data);
             WorldPosition& originalPos = data.pos;
-            assert(data.pos != WorldPosition());
+            if (originalPos == WorldPosition())
+            {
+                LOG_DEBUG("playerbots", "[New RPG] {} in GO_GRIND with no destination, back to idle", bot->GetName());
+                info.ChangeToIdle();
+                return true;
+            }
             // GO_GRIND -> WANDER_RANDOM
             if (bot->GetExactDist(originalPos) < 10.0f)
             {
                 info.ChangeToWanderRandom();
+                return true;
+            }
+            // Could not get there in time: pick something else rather than walking forever.
+            if (info.HasStatusPersisted(statusGoGrindDuration))
+            {
+                info.ChangeToIdle();
                 return true;
             }
             break;
@@ -274,11 +318,21 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
         {
             auto& data = std::get<NewRpgInfo::GoCamp>(info.data);
             WorldPosition& originalPos = data.pos;
-            assert(data.pos != WorldPosition());
+            if (originalPos == WorldPosition())
+            {
+                LOG_DEBUG("playerbots", "[New RPG] {} in GO_CAMP with no destination, back to idle", bot->GetName());
+                info.ChangeToIdle();
+                return true;
+            }
             // GO_CAMP -> WANDER_NPC
             if (bot->GetExactDist(originalPos) < 10.0f)
             {
                 info.ChangeToWanderNpc();
+                return true;
+            }
+            if (info.HasStatusPersisted(statusGoCampDuration))
+            {
+                info.ChangeToIdle();
                 return true;
             }
             break;
@@ -306,6 +360,8 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
                     std::max(sPlayerbotAIConfig.coaCityStayMinMinutes, sPlayerbotAIConfig.coaCityStayMaxMinutes);
                 // At least a minute: a zero stay would fall back to the short stop of a plain NPC visit.
                 info.cityStayMs = std::max<uint32>(urand(shortest, longest), 1) * MINUTE * IN_MILLISECONDS;
+                // CoA Live City Life: the residents stay longer (unchanged when off).
+                info.cityStayMs = CoaCityLife::VisitMs(bot, info.cityStayMs);
                 return true;
             }
             if (info.HasStatusPersisted(statusGoCityDuration))
@@ -317,8 +373,62 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
         }
         case RPG_WANDER_NPC:
         {
+            // 3.2.2 (Pilote, bench of 96b4114c: auctioneers not reached 11 % the first hour, 25 % the second, the
+            // bots still 70 to 150 yards off, the wander's action last run 190 to 880 s before, nothing run since): the
+            // bot's AI slept (no player near it) and woke up past its stay, this check first on its tick. The time
+            // asleep is not part of the stay: the wander goes on where it stopped.
+            if (auto* wander = std::get_if<NewRpgInfo::WanderNpc>(&info.data))
+            {
+                constexpr uint32 WANDER_SLEPT_MS = 30 * IN_MILLISECONDS;
+                uint32 const slept = wander->lastRun ? GetMSTimeDiffToNow(wander->lastRun) : 0;
+                if (slept > WANDER_SLEPT_MS)
+                {
+                    info.startT += slept;
+                    wander->lastRun = getMSTime();
+                    if (wander->lastReach)
+                        wander->lastReach += slept;
+                }
+            }
             if (info.HasStatusPersisted(info.cityStayMs ? info.cityStayMs : statusWanderNpcDuration))
             {
+                if (auto* wander = std::get_if<NewRpgInfo::WanderNpc>(&info.data))
+                {
+                    Creature* npc = wander->npcOrGo.IsCreature() ? ObjectAccessor::GetCreature(*bot, wander->npcOrGo)
+                                                                 : nullptr;
+                    bool const auctioneer = npc && npc->HasNpcFlag(UNIT_NPC_FLAG_AUCTIONEER);
+                    bool const trade = auctioneer || (npc && npc->HasNpcFlag(UNIT_NPC_FLAG_VENDOR) &&
+                                                      CoaEconomy::RpgTrade::WantsTrade(botAI));
+                    // 3.2.2 (bench of d061adec): a bot whose AI slept for minutes by its NPC woke up there, and this check,
+                    // first on its tick, ended the wander before the wander's action could count it there ("not
+                    // reached", in reach, its action last run 90 to 640 s before). Once, the wander is kept for it.
+                    if (npc && !wander->lastReach && !wander->reachGrace && IsWithinInteractionDist(npc))
+                    {
+                        wander->reachGrace = true;
+                        break;
+                    }
+                    // 3.2: on its way to a trade NPC, the bot gets there before the wander ends.
+                    if (CoaEconomyRules::KeepsTradeGoal(trade, wander->lastReach != 0,
+                                                        wander->pickedAt ? GetMSTimeDiffToNow(wander->pickedAt) : 0))
+                        break;
+                    // 3.2 (BuyLog): an auctioneer the wander never got to (counted here, not as left for idle).
+                    if ((auctioneer || wander->toAuctioneer) && !wander->lastReach)
+                    {
+                        CoaEconomy::BotAuctions::NoteWay(CoaEconomy::BotAuctions::Way::TimedOut);
+                        // 3.2.1: where it stood, per capital.
+                        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId());
+                        // 3.2.2: bots still within a few yards and never counted as there: did the wander's action
+                        // still run, was the NPC in reach for it, and what ran instead.
+                        Engine* engine = botAI->GetEngine(BOT_STATE_NON_COMBAT);
+                        CoaEconomy::BotAuctions::NoteNotReached(
+                            zone && (zone->flags & AREA_FLAG_CAPITAL) ? zone->area_name[0] : "",
+                            npc ? npc->GetEntry() : 0, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                            npc ? bot->GetExactDist(npc) : 0.0f, bot->isMoving(), wander->refusals,
+                            wander->lastRun ? GetMSTimeDiffToNow(wander->lastRun) / IN_MILLISECONDS : 0,
+                            npc && IsWithinInteractionDist(npc),
+                            engine ? engine->GetLastExecutedAction().c_str() : "");
+                    }
+                    wander->toAuctioneer = false;
+                }
                 info.ChangeToIdle();
                 return true;
             }
@@ -340,6 +450,14 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
             if (data.inFlight && !bot->IsInFlight())
             {
                 // flight arrival
+                info.ChangeToIdle();
+                return true;
+            }
+            // Never cut a flight short: the cap is for a bot that cannot reach its flight master.
+            if (!bot->IsInFlight() && info.HasStatusPersisted(statusTravelFlightDuration))
+            {
+                LOG_DEBUG("playerbots", "[New RPG] {} gave up travelling to flight master {}", bot->GetName(),
+                          data.flightMasterEntry);
                 info.ChangeToIdle();
                 return true;
             }
@@ -429,10 +547,24 @@ bool NewRpgWanderNpcAction::Execute(Event /*event*/)
     if (!dataPtr)
         return false;
     auto& data = *dataPtr;
+    data.lastRun = getMSTime();
     if (!data.npcOrGo)
     {
+        // CoA Live City Life: on a city visit, now and then a station (inn, bank, auction house, forge, dummy).
+        ObjectGuid npcOrGo = CoaCityLife::ChooseStation(botAI);
+        bool const station = !npcOrGo.IsEmpty();
+        if (npcOrGo.IsEmpty())
+            npcOrGo = ChooseNpcOrGameObjectToInteract();
+        // 3.2 (BuyLog): the way to an auctioneer, counted.
+        data.toAuctioneer = false;
+        if (Creature* npc = npcOrGo.IsCreature() ? ObjectAccessor::GetCreature(*bot, npcOrGo) : nullptr)
+            if (npc->HasNpcFlag(UNIT_NPC_FLAG_AUCTIONEER))
+            {
+                data.toAuctioneer = true;
+                CoaEconomy::BotAuctions::NoteWay(station ? CoaEconomy::BotAuctions::Way::Station
+                                                         : CoaEconomy::BotAuctions::Way::Picked);
+            }
         // No npc can be found, switch to IDLE
-        ObjectGuid npcOrGo = ChooseNpcOrGameObjectToInteract();
         if (npcOrGo.IsEmpty())
         {
             info.ChangeToIdle();
@@ -440,31 +572,120 @@ bool NewRpgWanderNpcAction::Execute(Event /*event*/)
         }
         data.npcOrGo = npcOrGo;
         data.lastReach = 0;
+        data.refusals = 0;
+        data.reachGrace = false;
+        data.pickedAt = getMSTime();
         return true;
     }
 
     WorldObject* object = ObjectAccessor::GetWorldObject(*bot, data.npcOrGo);
-    if (object && IsWithinInteractionDist(object))
+    // CoA Live City Life: a bot that stepped from its auctioneer into the room still stays there.
+    // 3.2.2: a square of the city is reached at its slot, never at its anchor NPC (no quest, no trade there).
+    bool const square = object && CoaCityLife::HoldsSquare(botAI, data.npcOrGo);
+    if (object && (square ? CoaCityLife::AtSquare(botAI)
+                          : IsWithinInteractionDist(object) || (data.lastReach && CoaCityLife::InRoom(botAI, object))))
     {
         if (!data.lastReach)
         {
             data.lastReach = getMSTime();
-            if (bot->CanInteractWithQuestGiver(object))
+            data.givenUp = 0;
+            if (!square && bot->CanInteractWithQuestGiver(object))
                 InteractWithNpcOrGameObjectForQuest(data.npcOrGo);
+            // CoA Economy: sell, repair or use the auction house, as people do between two quests
+            if (!square)
+                CoaEconomy::RpgTrade::TradeAtNpc(botAI, object);
+            CoaCityLife::OnReach(botAI, object);
             return true;
         }
 
-        if (data.lastReach && GetMSTimeDiffToNow(data.lastReach) < npcStayTime)
+        if (data.lastReach && GetMSTimeDiffToNow(data.lastReach) < CoaCityLife::WhileStaying(botAI, object, npcStayTime))
             return false;
 
         // has reached the npc for more than `npcStayTime`, select the next target
+        CoaCityLife::Leave(botAI);
+        data.toAuctioneer = false;
         data.npcOrGo = ObjectGuid();
         data.lastReach = 0;
     }
     else
     {
         if (MoveWorldObjectTo(data.npcOrGo))
+        {
+            data.refusals = 0;
             return true;
+        }
+        // CoA Live City Life (3.1.6): a station no walkable path leads to (inside a building, off the mesh) is given
+        // up for another stop, never reached in a straight line through the walls.
+        // 3.2: in a capital, any NPC whose way the city guard refuses (a dead end, a straight line) is given up too,
+        // for another one, instead of tries and small random steps for the whole wander.
+        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(bot->GetZoneId());
+        bool const inCapital = zone && (zone->flags & AREA_FLAG_CAPITAL);
+        if (!IsWaitingForLastMove(MovementPriority::MOVEMENT_NORMAL) &&
+            (CoaCityLife::Holds(botAI, data.npcOrGo) || inCapital))
+        {
+            // 3.2: given up only when the NPC is gone, no walkable stop by it exists, or the moves keep being refused
+            // (a move to the same stop within 5 s, a bot that cannot move...): then it waits for the next tick.
+            bool wayExists = false;
+            if (object)
+            {
+                float sx = object->GetPositionX(), sy = object->GetPositionY(), sz = object->GetPositionZ();
+                wayExists = CoaSafeMove::StandByNpc(bot, object, sx, sy, sz);
+            }
+            CoaSafeMove::GiveUp const why = CoaSafeMove::GivesUpNpc(!object, wayExists, ++data.refusals);
+            if (why == CoaSafeMove::GiveUp::No)
+                return false;
+            // 3.2.2: a bot on a closed island of the navmesh gets off it (a short walk, a teleport no player sees),
+            // then tries again; otherwise the visit is given up below.
+            if (why == CoaSafeMove::GiveUp::NoWay && object)
+            {
+                CoaSafeMove::Unstick const unstick = CoaSafeMove::UnstickFromIsland(bot, object);
+                CoaEconomy::BotAuctions::NoteUnstick(int(unstick));
+                if (unstick == CoaSafeMove::Unstick::Walk || unstick == CoaSafeMove::Unstick::Teleport)
+                {
+                    data.refusals = 0;
+                    return true;
+                }
+            }
+            // 3.2 (Stormwind, Chilton): no way to this auctioneer, another of the same house it can walk to instead.
+            if (why == CoaSafeMove::GiveUp::NoWay && data.toAuctioneer)
+            {
+                ObjectGuid const other = CoaSafeMove::OtherReachableAuctioneer(bot, object);
+                if (!other.IsEmpty())
+                {
+                    data.npcOrGo = other;
+                    data.refusals = 0;
+                    data.pickedAt = getMSTime();
+                    return true;
+                }
+            }
+            // 3.2 (BuyLog): counted from the pick's flag, the NPC may be gone (out of the grid).
+            if (data.toAuctioneer)
+            {
+                CoaEconomy::BotAuctions::NoteWay(CoaEconomy::BotAuctions::Way::GivenUp);
+                CoaEconomy::BotAuctions::NoteGiveUp(int(why), zone ? zone->area_name[0] : "");
+                if (why == CoaSafeMove::GiveUp::NoWay)
+                {
+                    float gap = 0.0f;
+                    char const* reason = CoaSafeMove::NoWayWhy(bot, object, gap);
+                    CoaEconomy::BotAuctions::NoteNoWay(zone ? zone->area_name[0] : "", reason, object->GetEntry(),
+                                                       bot->GetPositionX(),
+                                                       bot->GetPositionY(), bot->GetPositionZ(), gap);
+                }
+            }
+            data.refusals = 0;
+            data.toAuctioneer = false;
+            CoaCityLife::Leave(botAI);
+            // 3.2 (".squidbots why": a bot still for minutes by the Stormwind bank, WANDER_NPC with no destination):
+            // it picked and gave up NPCs every tick. After a few in a row, the wander ends and it does something else.
+            if (++data.givenUp >= CoaSafeMove::WANDER_GIVE_UPS)
+            {
+                info.ChangeToIdle();
+                return true;
+            }
+            data.npcOrGo = ObjectGuid();
+            data.lastReach = 0;
+            return true;
+        }
         // NPC pathing failed (random offset in a wall, mmap hiccup, etc).
         // Take a small random step so the next tick retries from a
         // different spot instead of staring at the NPC from afar.
@@ -508,7 +729,14 @@ bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
         int32 currentObjective = data.objectiveIdx;
         // check if the objective has completed
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        QuestStatusData const& q_status = bot->getQuestStatusMap().at(questId);
+        QuestStatusData const* statusData = GetQuestStatusData(questId);
+        if (!quest || !statusData)
+        {
+            // Template gone from the DB or quest no longer in the log.
+            botAI->rpgInfo.ChangeToIdle();
+            return true;
+        }
+        QuestStatusData const& q_status = *statusData;
         bool completed = true;
         if (currentObjective < QUEST_OBJECTIVES_COUNT)
         {
@@ -581,7 +809,14 @@ bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
         int32 currentObjective = data.objectiveIdx;
         // check if the objective has progression
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        QuestStatusData const& q_status = bot->getQuestStatusMap().at(questId);
+        QuestStatusData const* statusData = GetQuestStatusData(questId);
+        if (!quest || !statusData)
+        {
+            // Template gone from the DB or quest no longer in the log.
+            botAI->rpgInfo.ChangeToIdle();
+            return true;
+        }
+        QuestStatusData const& q_status = *statusData;
         if (currentObjective < QUEST_OBJECTIVES_COUNT)
         {
             if (q_status.CreatureOrGOCount[currentObjective] != 0 && quest->RequiredNpcOrGoCount[currentObjective])
@@ -635,7 +870,13 @@ bool NewRpgDoQuestAction::DoCompletedQuest(NewRpgInfo::DoQuest& data)
             botAI->rpgInfo.ChangeToIdle();
             return false;
         }
-        assert(poiInfo.size() > 0);
+        if (poiInfo.empty())
+        {
+            LOG_DEBUG("playerbots", "[New RPG] {} has no reward POI for quest {}, back to idle", bot->GetName(),
+                      questId);
+            botAI->rpgInfo.ChangeToIdle();
+            return false;
+        }
         // now we get the place to get rewarded
         float dx = poiInfo[0].pos.x, dy = poiInfo[0].pos.y;
         // z = MAX_HEIGHT as we do not know accurate z

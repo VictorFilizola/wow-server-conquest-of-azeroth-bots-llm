@@ -214,8 +214,8 @@ int main(int, char** argv)
     Check(Row(searing, 1105676) && Row(searing, 1105676)->ReqLevel == 14,
         "Reborn Searing Pain trains at 14, its retuned level, not the stock trainer's 18");
     std::vector<TrainerSpell> const rogue = TrainerSpells(data, reborn, 4, { Stock(674, 1000, 10) }, exists, added);
-    Check(Row(rogue, 1100674) && Row(rogue, 1100674)->ReqLevel == 10 && Row(rogue, 1100674)->MoneyCost == 1000,
-        "Reborn Dual Wield, which has no spell level, keeps the stock trainer row's level 10, not level 1");
+    Check(Row(rogue, 674) && !Row(rogue, 1100674) && Row(rogue, 674)->ReqLevel == 10 && Row(rogue, 674)->MoneyCost == 1000,
+        "Dual Wield stays the stock spell: the client lists no trainer row for Reborn Dual Wield, which has no skill line");
     std::vector<TrainerSpell> const hunterTrainer = TrainerSpells(data, reborn, HUNTER,
         { Stock(14260, 100, 8), Stock(14261, 1000, 16) }, exists, added);
     Check(Row(hunterTrainer, 1101579) != nullptr,
@@ -309,6 +309,9 @@ int main(int, char** argv)
     Check(twinned(53, 1100053) && twinned(20271, 1120271), "Reborn Backstab and Judgement of Light are twins");
     Check(twinned(12867, 1312867) && twinned(56638, 1356638) && twinned(26016, 1326016),
         "crossover Mystic Enchants Deep Wounds, Taste for Blood and Vindication twin their stock talents");
+    Check(twinned(1112497, 1312497) && twinned(1118095, 1318095) && !twinned(12497, 1312497) && twinned(12848, 1312848),
+        "crossover Frostbite and Nightfall copy the Reborn talent, not the stock one, and twin the Reborn talent; "
+        "crossover Ignite still twins stock Ignite");
     Check(!twinned(160, 1100160) && std::none_of(twins.begin(), twins.end(),
             [&layouts](auto const& pair) { return layouts[pair.first] != layouts[pair.second]; }),
         "a stock spell and an unrelated spell 1100000 above it (Forked Lightning, Glyph of Slam) are not twins");
@@ -334,6 +337,18 @@ int main(int, char** argv)
     Check(namesake(5487, 1105487) && namesake(9634, 1109634) && !twinned(5487, 1105487) && twinned(779, 1100779) &&
             twinned(5229, 1105229) && twinned(768, 1100768),
         "Reborn Bear and Dire Bear Form are namesakes, not twins, of the forms stock Swipe, Enrage and Bash require");
+    Check(twinned(19574, 1119574) && twinned(34692, 1134692) && namesake(34471, 1134471) && twinned(33206, 1133206) &&
+            twinned(47585, 1147585) && twinned(47788, 1147788) && twinned(53385, 1153385) &&
+            twinned(53583, 1153583) && namesake(54428, 1154428) && twinned(54037, 1154037) && twinned(54038, 1154038) &&
+            twinned(63410, 1163410) && twinned(63411, 1163411) && twinned(53511, 1153511) &&
+            twinned(53512, 1153512) && twinned(60096, 1160096) && twinned(60097, 1160097) &&
+            twinned(49016, 1149016) && twinned(49036, 1149036) && twinned(49032, 1149032) &&
+            twinned(49631, 1149631) && twinned(49632, 1149632) && namesake(51099, 1151099) &&
+            namesake(51160, 1151160) && namesake(51161, 1151161) && twinned(50508, 1150508) &&
+            twinned(50509, 1150509) && twinned(50510, 1150510) && twinned(51726, 1151726) &&
+            twinned(51734, 1151734) && twinned(51735, 1151735),
+        "the Reborn talent copies that stock special cases key on resolve to their stock talent, "
+        "and the spells those cases cast have Reborn twins");
 
     std::unordered_map<std::uint32_t, std::uint32_t> const stockSlam = { { 1464, 1464 }, { 8820, 1464 }, { 11604, 1464 },
         { 11605, 1464 }, { 25241, 1464 }, { 25242, 1464 }, { 47474, 1464 }, { 47475, 1464 } };
@@ -395,13 +410,107 @@ TWIN_COPIES = {
         "CopyToSpellTwins(mSpellBonusMap);", "CopyToSpellTwins(mSpellThreatMap);",
         "CopyToSpellTwins(mSpellMixologyMap);", "CopyToSpellTwins(mSpellCones);", "twinRequirements", "twinGroups",
         "twinLinks", "GetSpellTwinFor(spellReq, twin->second)", "mSpellTargetPositions[{ twin, SpellEffIndex(i) }]", "mSpellPetAuraMap.emplace((twin << 8) + i",
-        "databaseAttributes.contains(twin)"],
+        "databaseAttributes.contains(twin)",
+        "twinInfo->ProcFlags ? twinInfo->ProcFlags : sourceInfo->ProcFlags",
+        "twinInfo->ProcChance ? twinInfo->ProcChance : sourceInfo->ProcChance",
+        "spellInfo->ProcFlags || !twinSourceInfo ? spellInfo->ProcFlags : twinSourceInfo->ProcFlags",
+        "spellInfo->ProcChance || !twinSourceInfo ? spellInfo->ProcChance : twinSourceInfo->ProcChance"],
     "src/server/game/Globals/ObjectMgr.cpp": ["sSpellMgr->GetSpellTwins()"],
     "src/server/game/World/World.cpp": ["sSpellMgr->LoadSpellTwins(false);", "sSpellMgr->LoadSpellTwins(true);"],
     "src/server/game/Spells/SpellInfoCorrections.cpp": ["SameSpellTuning(spellInfo, twin)"],
     "src/server/coa/AscensionWarcraftReborn.cpp": ["sSpellMgr->SetSpellTwins(&AscensionWarcraftReborn::LoadTwins);"],
     "src/server/scripts/Spells/spell_warlock.cpp": ["bonus ? bonus->direct_damage : 0.5f"],
 }
+
+
+PROC_FALLBACK_TWINS = {20375: 1120375, 31801: 1131801, 53736: 1153736, 31641: 1131641, 9452: 1109452, 58914: 1158914}
+MAELSTROM_SQL = ROOT / "data/sql/updates/pending_db_world/rev_20261030_60_coa_reborn_maelstrom_weapon.sql"
+
+
+def spell_rows(dbc, wanted):
+    data = (dbc / "Spell.dbc").read_bytes()
+    count, fields, size, strings = struct.unpack_from("<4I", data, 4)
+    rows = {}
+    for row in range(count):
+        record = struct.unpack_from("<%dI" % fields, data, 20 + row * size)
+        if record[0] in wanted:
+            rows[record[0]] = record
+    return rows
+
+
+def check_twin_proc_fallback(dbc):
+    rows = spell_rows(dbc, set(PROC_FALLBACK_TWINS) | set(PROC_FALLBACK_TWINS.values()))
+    ok = len(rows) == 2 * len(PROC_FALLBACK_TWINS) and all(
+        any(rows[source][field] and not rows[twin][field] for field in (34, 35))
+        for source, twin in PROC_FALLBACK_TWINS.items())
+    print(f"{'PASS' if ok else 'FAIL'}: Reborn Seal of Command, Seal of Vengeance, Seal of Corruption, Blazing Speed, "
+          "Vindication and Kill Command lack the proc flags or chance of their stock spell, so their entries take stock's")
+    return ok
+
+
+def check_maelstrom_weapon(dbc):
+    rows = spell_rows(dbc, {1151528, 1151529, 1151530, 1153817, 1153816, 1153822})
+    text = MAELSTROM_SQL.read_text(encoding="utf-8")
+    ranks = re.findall(r"\((115152[89]|1151530), 0, 0, 0, 0, 0, 0, 0x1, 0x2, 0, 0, 0, ([0-9.]+), 0, 0, 0\)", text)
+    buff = re.search(r"\(1153817, 0, 11, 0x000001C3, 0x00008000, 0, 0, 0x0, 0x1, 0, 0x8, 0, 0, 100, 0, 0\)", text)
+    ok = (len(rows) == 6 and all(not rows[r][35] and rows[r][34] for r in (1151528, 1151529, 1151530)) and
+          all(rows[r][116] == 1153817 and rows[r][117] == 1153816 for r in (1151528, 1151529, 1151530)) and
+          rows[1153817][49] == 8 and rows[1153816][49] == 8 and struct.unpack("<i", struct.pack("<I", rows[1153822][80]))[0] + 1 == 5 and
+          sorted(float(p) for _, p in ranks) == [2.0, 4.0, 6.0] and buff is not None and
+          "(1153817, 'spell_ascension_reborn_maelstrom_weapon')" in text)
+    print(f"{'PASS' if ok else 'FAIL'}: Reborn Maelstrom Weapon ranks proc per minute from weapon damage and stack the "
+          "8-stack buff, which a Lightning Bolt, Chain Lightning, heal or Hex consumes 5 at a time")
+    return ok
+
+
+NAMESAKE_PROCS_SQL = ROOT / "data/sql/updates/pending_db_world/rev_20261030_61_coa_reborn_namesake_procs.sql"
+NAMESAKE_PROCS = {1120165: ("spell_pal_seal_of_light", 1120167), 1130823: ("spell_sha_shamanistic_rage", 1130824),
+                  1151525: ("spell_sha_static_shock", 0),
+                  1115273: ("spell_ascension_reborn_improved_mind_blast", 1148301)}
+
+
+def check_namesake_procs(dbc):
+    rows = spell_rows(dbc, set(NAMESAKE_PROCS) | {trigger for _, trigger in NAMESAKE_PROCS.values() if trigger})
+    text = NAMESAKE_PROCS_SQL.read_text(encoding="utf-8")
+    ok = True
+    for spell, (script, trigger) in NAMESAKE_PROCS.items():
+        ok &= spell in rows and f"({spell}, '{script}')" in text and f"({spell}, 0, " in text
+        ok &= not trigger or (trigger in rows and trigger in rows[spell][116:119])
+    print(f"{'PASS' if ok else 'FAIL'}: Reborn Seal of Light, Shamanistic Rage, Static Shock and Improved Mind Blast "
+          "proc from their stock spells' rows and scripts")
+    return ok
+
+
+TRAINER_SEAL_SQL = ROOT / "data/sql/updates/pending_db_world/rev_20261030_63_coa_reborn_trainer_seal_of_command.sql"
+
+
+def check_trainer_seal_of_command(dbc):
+    ranks = range(1470375, 1470380)
+    rows = spell_rows(dbc, set(ranks) | {20375})
+    text = TRAINER_SEAL_SQL.read_text(encoding="utf-8")
+    paladin = (ROOT / "src/server/scripts/Spells/spell_paladin.cpp").read_text(encoding="utf-8")
+    ok = (len(rows) == 6 and rows[20375][34] == 0x4 and all(not rows[rank][34] for rank in ranks) and
+          all(f"({rank}, 0, 10, 0, 0x00168000, 0, 0x4, 0x1, 0x2, 0, 0, 0, 0, 100, 0, 0)" in text and
+              f"({rank}, 'spell_pal_seal_of_command')" in text for rank in ranks) and
+          "sSpellMgr->GetSpellTwinSource(GetSpellInfo()->Id) == 31801" in paladin and
+          "sSpellMgr->GetSpellTwinSource(m_scriptSpellId) == 20424" in paladin)
+    print(f"{'PASS' if ok else 'FAIL'}: the trainer's Seal of Command procs on melee hits like stock, and the Seal of "
+          "Vengeance script casts the Reborn spells for the Reborn seal")
+    return ok
+
+
+BLAZING_SPEED_SQL = ROOT / "data/sql/updates/pending_db_world/rev_20261030_62_coa_reborn_blazing_speed.sql"
+
+
+def check_blazing_speed(dbc):
+    rows = spell_rows(dbc, {1131641, 1131642, 1131643, 31643})
+    text = BLAZING_SPEED_SQL.read_text(encoding="utf-8")
+    ok = (len(rows) == 4 and rows[1131641][35] == 50 and rows[1131642][35] == 100 and
+          all(f"({spell}, 0, 0, 0, 0, 0, 0x28, 0x1, 0x2, 0, 0, 0, 0, 0, 0, 0)" in text and
+              f"({spell}, 'spell_ascension_reborn_blazing_speed')" in text for spell in (1131641, 1131642)))
+    print(f"{'PASS' if ok else 'FAIL'}: Reborn Blazing Speed procs at its own 50% or 100% from melee hits taken and casts "
+          "the Reborn buff, not stock's")
+    return ok
 
 
 COEFFICIENTS_SQL = ROOT / "data/sql/updates/pending_db_world/rev_20261008_20_coa_reborn_spell_coefficients.sql"
@@ -476,6 +585,61 @@ def check_class_spell_bindings(dbc):
     return ok
 
 
+EBON_PLAGUE_BRANCH = ("src/server/game/Spells/Auras/SpellAuras.cpp",
+                      "// Ebon Plaguebringer - end search if found", "// Unholy blight", [
+                          "if (aurEff) { uint32 spellId = 0; switch (sSpellMgr->GetSpellTwinSource(aurEff->GetId()))",
+                          "if (spellId) caster->CastSpell(target, "
+                          "sSpellMgr->GetSpellTwinFor(spellId, aurEff->GetId()), true, 0, GetEffect(0));"])
+
+TALENT_COPY_SITES = {
+    "src/server/game/Spells/Auras/SpellAuras.cpp": [
+        "if (!player->HasSpellCooldown(GetId()))",
+        "switch (sSpellMgr->GetSpellTwinSource(GetId()) == 19574 ? 19574 : GetId())",
+        "owner->HasAuraOrTwin(34692)", "sSpellMgr->GetSpellTwinFor(34471, GetId())"],
+    "src/server/game/Spells/Auras/SpellAuraEffects.cpp": [
+        "player->HasTalentOrTwin(63410, player->GetActiveSpec())",
+        "player->HasTalentOrTwin(63411, player->GetActiveSpec())",
+        "switch (sSpellMgr->GetSpellTwinSource(GetSpellInfo()->Id))",
+        "sSpellMgr->GetSpellTwinFor(60096, GetId())", "sSpellMgr->GetSpellTwinFor(60097, GetId())"],
+    "src/server/game/Entities/Unit/Unit.cpp": [
+        "GetAuraEffectOfRankedSpellOrTwin(49036, EFFECT_0)", "ToPlayer()->HasSpellOrTwin(53583)",
+        "switch (sSpellMgr->GetSpellTwinSource(spellInfo->Id) == 54428 ? 54428 : spellInfo->Id)"],
+    "src/server/game/Spells/SpellEffects.cpp": [
+        "sSpellMgr->GetSpellTwinSource(aurEff->GetId()) == 54037 ? 4 : 8",
+        "switch (sSpellMgr->GetSpellTwinSource(m_spellInfo->Id) == 53385 ? 53385 : m_spellInfo->Id)"],
+    "src/server/game/Spells/Spell.cpp": [
+        "sSpellMgr->GetSpellTwinSource(m_spellInfo->Id) == 19574)",
+        "sSpellMgr->GetSpellTwinSource(m_spellInfo->Id) == 33206 && !m_caster->HasAuraOrTwin(63248)"],
+    "src/server/game/Spells/SpellInfo.cpp": ["switch (sSpellMgr->GetSpellTwinSource(Id) == 19574 ? 19574 : Id)"],
+}
+
+
+def collapse_whitespace(text):
+    return " ".join(text.split())
+
+
+def source_branch(path, start, end):
+    text = collapse_whitespace((ROOT / path).read_text(encoding="utf-8"))
+    begin = text.find(start)
+    finish = text.find(end, begin) if begin >= 0 else -1
+    return text[begin:finish] if finish >= 0 else ""
+
+
+def check_talent_copy_sites():
+    missing = [f"{path}: {needle}" for path, needles in TALENT_COPY_SITES.items()
+               for needle in needles
+               if needle not in collapse_whitespace((ROOT / path).read_text(encoding="utf-8"))]
+    path, start, end, needles = EBON_PLAGUE_BRANCH
+    branch = source_branch(path, start, end)
+    missing += [f"{path} (Ebon Plague branch): {needle}" for needle in needles if needle not in branch]
+    print(f"{'PASS' if not missing else 'FAIL'}: stock special cases for Ebon Plague, Crypt Fever, Hysteria, Epidemic, "
+          "Feeding Frenzy, Improved Barkskin, Improved Felhunter, Guarded by the Light, Divine Plea, The Beast Within, "
+          "Bestial Wrath, Pain Suppression, Dispersion, Guardian Spirit and Divine Storm also match the Reborn copies")
+    for line in missing:
+        print("  missing", line)
+    return not missing
+
+
 def check_twin_copies():
     missing = [f"{path}: {needle}" for path, needles in TWIN_COPIES.items()
                for needle in needles if needle not in (ROOT / path).read_text(encoding="utf-8")]
@@ -514,8 +678,13 @@ def main():
         if build.returncode:
             raise SystemExit("Warcraft Reborn rules harness did not compile:\n" + build.stdout + build.stderr)
         result = subprocess.run([str(executable), str(args.dbc_dir.resolve())], text=True)
-        bindings_ok = check_form_only_bindings(args.dbc_dir.resolve()) & check_deep_freeze_immunity(args.dbc_dir.resolve())
-        twins_ok = (check_twin_copies() & check_reborn_coefficients(args.dbc_dir.resolve()) &
+        bindings_ok = (check_form_only_bindings(args.dbc_dir.resolve()) &
+                       check_deep_freeze_immunity(args.dbc_dir.resolve()) &
+                       check_twin_proc_fallback(args.dbc_dir.resolve()) & check_maelstrom_weapon(args.dbc_dir.resolve()) &
+                       check_namesake_procs(args.dbc_dir.resolve()) & check_blazing_speed(args.dbc_dir.resolve()) &
+                       check_trainer_seal_of_command(args.dbc_dir.resolve()))
+        twins_ok = (check_twin_copies() & check_talent_copy_sites() &
+                    check_reborn_coefficients(args.dbc_dir.resolve()) &
                     check_class_spell_bindings(args.dbc_dir.resolve()))
         raise SystemExit(result.returncode or (0 if bindings_ok and twins_ok else 1))
 

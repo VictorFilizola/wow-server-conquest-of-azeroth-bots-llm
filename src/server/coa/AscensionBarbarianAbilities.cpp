@@ -2,9 +2,9 @@
 
 #include "AscensionBarbarianCompletion.h"
 #include "CellImpl.h"
+#include "GameTime.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
-#include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -212,7 +212,17 @@ class aura_ascension_barbarian_volley : public AuraScript
             return;
         player->CastSpell(target, GetId() == 707584 ? 520541 : 807236, true, nullptr, effect);
         if (++_shots == 3 && GetId() == 707584)
-            player->GetMotionMaster()->MoveJumpTo(float(M_PI), 15.0f, 7.5f);
+            LeapBack(player);
+    }
+
+    void LeapBack(Player* player)
+    {
+        if (!player->IsAlive() || player->GetVehicle() || player->IsInFlight())
+            return;
+        SpellEffectInfo const& leap = GetSpellInfo()->Effects[EFFECT_0];
+        player->JumpTo(leap.MiscValue / 10.0f, leap.CalcValue(player) / 10.0f, false);
+        sScriptMgr->AnticheatSetUnderACKmount(player);
+        player->SetFallInformation(GameTime::GetGameTime().count(), player->GetPositionZ());
     }
 
     void Register() override
@@ -221,10 +231,40 @@ class aura_ascension_barbarian_volley : public AuraScript
             EFFECT_ALL, SPELL_AURA_PERIODIC_TRIGGER_SPELL);
     }
 };
+
+class spell_ascension_hero_spite_leap_back : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_hero_spite_leap_back);
+
+    bool Load() override
+    {
+        return GetCaster()->IsPlayer();
+    }
+
+    void Launch(SpellEffIndex index)
+    {
+        Player* player = GetCaster()->ToPlayer();
+        if (GetHitUnit() != player)
+            return;
+
+        PreventHitDefaultEffect(index);
+        SpellEffectInfo const& leap = GetSpellInfo()->Effects[index];
+        player->JumpTo(leap.MiscValue / 10.0f, leap.CalcValue() / 10.0f, false);
+        sScriptMgr->AnticheatSetUnderACKmount(player);
+        player->SetFallInformation(GameTime::GetGameTime().count(), player->GetPositionZ());
+    }
+
+    void Register() override
+    {
+        OnEffectLaunchTarget += SpellEffectFn(spell_ascension_hero_spite_leap_back::Launch,
+            EFFECT_0, SPELL_EFFECT_LEAP_BACK);
+    }
+};
 }
 
 void AddAscensionBarbarianAbilityScripts()
 {
     RegisterSpellScript(spell_ascension_barbarian_ability);
     RegisterSpellScript(aura_ascension_barbarian_volley);
+    RegisterSpellScript(spell_ascension_hero_spite_leap_back);
 }

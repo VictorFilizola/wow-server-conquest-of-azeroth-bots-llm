@@ -261,7 +261,10 @@ std::list<Unit*> Allies(Player* player, Unit* center, float range, uint32 count)
     if (center->IsAlive() && std::find(result.begin(), result.end(), center) == result.end())
         result.push_back(center);
     result.remove_if([player](Unit* unit)
-                     { return (unit != player && !player->IsInRaidWith(unit)) || !player->IsFriendlyTo(unit); });
+                     {
+                         return (unit != player && !player->IsInRaidWith(unit)) || !player->IsFriendlyTo(unit) ||
+                                unit->IsTotem() || unit->GetCreatureType() == CREATURE_TYPE_TOTEM;
+                     });
     result.sort(
         [](Unit* a, Unit* b)
         {
@@ -370,24 +373,25 @@ void Accumulate(Player* player, Unit* target, uint32 id, uint32 total)
         aura->SetScriptValue(id + 1, ticks);
     }
 }
+void AspectChain(Player* player, Unit* target, uint32 damage, uint32 remaining)
+{
+    uint32 const next = CalculatePct(damage, Amount(504750));
+    if (!next || !target || !target->IsAlive())
+        return;
+    auto& state = State(player);
+    bool const previousEvent = state.event;
+    uint32 const previousRemaining = state.aspectRemaining;
+    state.event = true;
+    state.aspectRemaining = remaining;
+    Copy(player, target, 503864, next);
+    state.aspectRemaining = previousRemaining;
+    state.event = previousEvent;
+}
 void Aspect(Player* player, Unit* target, uint32 damage, bool guaranteed)
 {
-    if (!damage || (!guaranteed && !Chance(player, 504750)))
+    if (!damage || !target || !target->IsAlive() || (!guaranteed && !Chance(player, 504750)))
         return;
-    bool previous = State(player).event;
-    State(player).event = true;
-    for (uint32 index = 0; index < 4 && target->IsAlive(); ++index)
-    {
-        damage = CalculatePct(damage, Amount(504750));
-        State(player).aspectDamage = 0;
-        Copy(player, target, 503864, damage);
-        damage = State(player).aspectDamage;
-        if (damage && player->HasAura(707479))
-            Copy(player, player, 707595, CalculatePct(damage, Amount(707479)));
-        if (!damage || !Chance(player, 504750))
-            break;
-    }
-    State(player).event = previous;
+    AspectChain(player, target, damage, 3);
 }
 void Refresh(Player* player)
 {
@@ -429,7 +433,19 @@ void Refresh(Player* player)
             Cast(player, player, 900755);
         if (Aura* aura = player->GetAura(900755))
             if (AuraEffect* effect = aura->GetEffect(0))
-                effect->ChangeAmount(player->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_CRIT_SPELL));
+            {
+                int32 const desired = int32(std::min<uint32>(
+                    player->GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + CR_CRIT_SPELL),
+                    uint32(INT32_MAX)));
+                if (effect->GetAmount() != desired)
+                {
+                    uint32 const manaBefore = player->GetPower(POWER_MANA);
+                    effect->ChangeAmount(desired);
+                    uint32 const restored = std::min(manaBefore, player->GetMaxPower(POWER_MANA));
+                    if (player->GetPower(POWER_MANA) < restored)
+                        player->SetPower(POWER_MANA, restored);
+                }
+            }
     }
     else
         player->RemoveAurasDueToSpell(900755);
@@ -460,12 +476,9 @@ void StartDash(Player* player)
         if (speed > 0 && speed < 35.0f)
         {
             float surge = rate * 35.0f / speed;
+            state.surgeMs = uint32(1000.0f * distance / 35.0f);
+            state.surgeRate = surge;
             player->SetSpeed(MOVE_RUN, surge, true);
-            state.scheduler.Schedule(Milliseconds(uint32(1000.0f * distance / 35.0f)), [player, rate, surge](TaskContext)
-            {
-                if (player->IsInWorld() && player->GetSpeedRate(MOVE_RUN) == surge)
-                    player->SetSpeed(MOVE_RUN, rate, true);
-            });
         }
         return;
     }
@@ -476,6 +489,14 @@ void StartDash(Player* player)
 void UpdateDash(Player* player, uint32 diff)
 {
     auto& state = State(player);
+    if (state.surgeMs)
+    {
+        if (player->IsAlive() && player->GetSpeedRate(MOVE_RUN) != state.surgeRate)
+            player->SetSpeed(MOVE_RUN, state.surgeRate, true);
+        state.surgeMs = state.surgeMs > diff ? state.surgeMs - diff : 0;
+        if (!state.surgeMs)
+            player->UpdateSpeed(MOVE_RUN, true);
+    }
     if (!state.dashMs)
         return;
     float dx = player->GetPositionX() - state.dashPrevious.GetPositionX();

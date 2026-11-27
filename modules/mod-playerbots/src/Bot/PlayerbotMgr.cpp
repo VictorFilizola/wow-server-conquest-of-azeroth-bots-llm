@@ -6,6 +6,8 @@
 
 #include "PlayerbotMgr.h"
 #include "CoaSpecialization.h"
+#include "CoaBotRaces.h"
+#include "CoaBotControlRules.h"
 #include "BroadcastHelper.h"
 #include "ChannelMgr.h"
 #include "CharacterCache.h"
@@ -20,14 +22,18 @@
 #include "ObjectMgr.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
+#include "CoaAltAddon.h"
 #include "PlayerbotGuildMgr.h"
 #include "PlayerbotOperations.h"
 #include "PlayerbotRepository.h"
+#include "CoaMissionMgr.h"
+#include "CoaLive.h"
 #include "PlayerbotSecurity.h"
 #include "PlayerbotTextMgr.h"
 #include "PlayerbotWorldThreadProcessor.h"
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
+#include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Timer.h"
 #include "WorldSession.h"
@@ -132,52 +138,28 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
     if (!accountId)
         return;
 
+    if (!masterAccountId)
+    {
+        CharacterCacheEntry const* character = sCharacterCache->GetCharacterCacheByGuid(playerGuid);
+        if (!character || !CoaBotRaces::Allowed(character->Race))
+            return;
+    }
+
     WorldSession* masterSession = masterAccountId ? sWorldSessionMgr->FindSession(masterAccountId) : nullptr;
     Player* masterPlayer = masterSession ? masterSession->GetPlayer() : nullptr;
-
-    bool isRndbot = !masterAccountId;
-    bool sameAccount = sPlayerbotAIConfig.allowAccountBots && accountId == masterAccountId;
-    Guild* guild = masterPlayer ? sGuildMgr->GetGuildById(masterPlayer->GetGuildId()) : nullptr;
-    bool sameGuild = sPlayerbotAIConfig.allowGuildBots && guild && guild->GetMember(playerGuid);
-    bool addClassBot = sRandomPlayerbotMgr.IsAddclassBot(playerGuid.GetCounter());
-    bool linkedAccount = sPlayerbotAIConfig.allowTrustedAccountBots && IsAccountLinked(accountId, masterAccountId);
-
-    bool allowed = true;
-    std::ostringstream out;
-    std::string botName;
-    sCharacterCache->GetCharacterNameByGuid(playerGuid, botName);
-    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
+    if (masterAccountId && masterPlayer && !GET_PLAYERBOT_MGR(masterPlayer))
     {
-        allowed = false;
-        out << "Failure: You are not allowed to control bot " << botName.c_str();
+        LOG_DEBUG("playerbots", "PlayerbotMgr not found for master player with GUID: {}", masterPlayer->GetGUID().GetRawValue());
+        return;
     }
-    if (masterAccountId && masterPlayer)
-    {
-        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(masterPlayer);
-        if (!mgr)
-        {
-            LOG_DEBUG("playerbots", "PlayerbotMgr not found for master player with GUID: {}", masterPlayer->GetGUID().GetRawValue());
-            return;
-        }
-        uint32 loadingForMaster = 0;
-        for (auto const& [guid, progress] : botLoading)
-        {
-            if (progress.masterAccountId == masterAccountId)
-                ++loadingForMaster;
-        }
-        uint32 count = mgr->GetPlayerbotsCount() + loadingForMaster;
-        if (count >= uint32(PlayerbotAIConfig::instance().maxAddedBots))
-        {
-            allowed = false;
-            out << "Failure: You have added too many bots (more than " << sPlayerbotAIConfig.maxAddedBots << ")";
-        }
-    }
-    if (!allowed)
+
+    std::string const refusal = AddPlayerBotRefusal(playerGuid, masterAccountId);
+    if (!refusal.empty())
     {
         if (masterSession)
         {
             ChatHandler ch(masterSession);
-            ch.SendSysMessage(out.str());
+            ch.SendSysMessage("Failure: " + refusal);
         }
         return;
     }
@@ -225,6 +207,46 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
             });
 }
 
+std::string PlayerbotHolder::AddPlayerBotRefusal(ObjectGuid playerGuid, uint32 masterAccountId)
+{
+    uint32 const accountId = sCharacterCache->GetCharacterAccountIdByGuid(playerGuid);
+    WorldSession* masterSession = masterAccountId ? sWorldSessionMgr->FindSession(masterAccountId) : nullptr;
+    Player* masterPlayer = masterSession ? masterSession->GetPlayer() : nullptr;
+
+    bool const isRndbot = !masterAccountId;
+    bool const sameAccount = sPlayerbotAIConfig.allowAccountBots && accountId == masterAccountId;
+    Guild* guild = masterPlayer ? sGuildMgr->GetGuildById(masterPlayer->GetGuildId()) : nullptr;
+    bool const sameGuild = sPlayerbotAIConfig.allowGuildBots && guild && guild->GetMember(playerGuid);
+    bool const addClassBot = sRandomPlayerbotMgr.IsAddclassBot(playerGuid.GetCounter());
+    bool const linkedAccount = sPlayerbotAIConfig.allowTrustedAccountBots && IsAccountLinked(accountId, masterAccountId);
+
+    std::ostringstream out;
+    if (!CoaMayControlBot(isRndbot, sameAccount, sameGuild, addClassBot, linkedAccount))
+    {
+        std::string botName;
+        sCharacterCache->GetCharacterNameByGuid(playerGuid, botName);
+        out << "You are not allowed to control bot " << botName;
+        return out.str();
+    }
+    if (masterAccountId && masterPlayer)
+        if (PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(masterPlayer))
+        {
+            uint32 loadingForMaster = 0;
+            for (auto const& [guid, progress] : botLoading)
+            {
+                if (progress.masterAccountId == masterAccountId)
+                    ++loadingForMaster;
+            }
+            uint32 const count = mgr->GetPlayerbotsCount() + loadingForMaster;
+            if (count >= uint32(PlayerbotAIConfig::instance().maxAddedBots))
+            {
+                out << "You have added too many bots (more than " << sPlayerbotAIConfig.maxAddedBots << ")";
+                return out.str();
+            }
+        }
+    return "";
+}
+
 bool PlayerbotHolder::IsAccountLinked(uint32 accountId, uint32 linkedAccountId)
 {
     QueryResult result = PlayerbotsDatabase.Query(
@@ -234,6 +256,16 @@ bool PlayerbotHolder::IsAccountLinked(uint32 accountId, uint32 linkedAccountId)
 
 void PlayerbotHolder::HandlePlayerBotLoginCallback(PlayerbotLoginQueryHolder const& holder)
 {
+    if (!holder.GetMasterAccountId())
+    {
+        CharacterCacheEntry const* character = sCharacterCache->GetCharacterCacheByGuid(holder.GetGuid());
+        if (!character || !CoaBotRaces::Allowed(character->Race))
+        {
+            PlayerbotHolder::botLoading.erase(holder.GetGuid());
+            return;
+        }
+    }
+
     uint32 botAccountId = holder.GetAccountId();
     // At login DBC locale should be what the server is set to use by default (as spells etc are hardcoded to ENUS this
     // allows channels to work as intended)
@@ -293,6 +325,24 @@ void PlayerbotHolder::UpdateSessions()
     }
 }
 
+// Loot and game object packets go through the core's CanPacketReceive hooks like a player's,
+// so scripted chests and portals (High Risk, Fel Commutation) cannot be bypassed by bots.
+static bool IsLootOrGameObjectOpcode(OpcodeClient opcode)
+{
+    switch (opcode)
+    {
+        case CMSG_LOOT:
+        case CMSG_LOOT_MONEY:
+        case CMSG_AUTOSTORE_LOOT_ITEM:
+        case CMSG_LOOT_RELEASE:
+        case CMSG_GAMEOBJ_USE:
+        case CMSG_GAMEOBJ_REPORT_USE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void PlayerbotHolder::HandleBotPackets(WorldSession* session)
 {
     WorldPacket* packet;
@@ -303,6 +353,11 @@ void PlayerbotHolder::HandleBotPackets(WorldSession* session)
         if (!opHandle)
         {
             LOG_ERROR("playerbots", "Unhandled opcode {} queued for bot session {}. Packet dropped.", static_cast<uint32>(opcode), session->GetAccountId());
+            delete packet;
+            continue;
+        }
+        if (IsLootOrGameObjectOpcode(opcode) && !sScriptMgr->CanPacketReceive(session, *packet))
+        {
             delete packet;
             continue;
         }
@@ -396,6 +451,13 @@ void PlayerbotHolder::LogoutPlayerBot(ObjectGuid guid)
 
         LOG_DEBUG("playerbots", "Bot {} logging out", bot->GetName().c_str());
 
+        // A gathering mission is saved, to resume at the next login.
+        sCoaMissionMgr.OnBotLogout(bot);
+
+        // SquidBots Lite updates its list of alts at once instead of at its next refresh.
+        if (botAI->IsAltBot() && CoaAltAddon::MasterHasAddon(botAI->GetMaster()))
+            CoaAltAddon::Send(bot, botAI->GetMaster(), "OFFLINE");
+
         // Remove taxi cheat flag on alts.
         if (!sRandomPlayerbotMgr.IsRandomBot(bot) && bot->isTaxiCheater())
             bot->SetTaxiCheater(false);
@@ -439,6 +501,7 @@ void PlayerbotHolder::LogoutPlayerBot(ObjectGuid guid)
             std::string message = PlayerbotTextMgr::instance().GetBotTextOrDefault(
                 "goodbye", "Goodbye!", {});
             botAI->TellMaster(message);
+            CoaLive::BeforeBotLogout(bot);              // CoA Live: its goodbye to its guild, while it is whole
             RemoveFromPlayerbotsMap(guid);              // deletes bot player ptr inside this WorldSession PlayerBotMap
             botWorldSessionPtr->LogoutPlayer(true);     // this will delete the bot Player object and PlayerbotAI object
             delete botWorldSessionPtr;                  // finally delete the bot's WorldSession
@@ -468,6 +531,7 @@ void PlayerbotHolder::DisablePlayerBot(ObjectGuid guid)
 
         LOG_DEBUG("playerbots", "Bot {} logged out", bot->GetName().c_str());
 
+        sCoaMissionMgr.OnBotLogout(bot);
         bot->SaveToDB(false, false);
 
         RemoveFromPlayerbotsMap(guid);  // deletes bot player ptr inside this WorldSession PlayerBotMap
@@ -506,6 +570,7 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
     playerBots[bot->GetGUID()] = bot;
 
     OnBotLoginInternal(bot);
+    PlayerbotFactory::UnequipAboveLevel(bot);
 
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (!botAI)
@@ -564,6 +629,15 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
     }
     PlayerbotRepository::instance().Load(botAI);
 
+    // The loaded strategies were saved at the bot's last strategy change and can include another
+    // instance's strategy, so apply the current map's again.
+    if (sPlayerbotAIConfig.applyInstanceStrategies)
+        botAI->ApplyInstanceStrategies(bot->GetMapId());
+
+    // An alt whose gathering mission was going on when it logged out resumes it, out of the group.
+    sCoaMissionMgr.OnBotLogin(bot);
+    bool const onMission = sCoaMissionMgr.IsOnMission(bot);
+
     if (master && !master->HasUnitState(UNIT_STATE_IN_FLIGHT))
     {
         bot->GetMotionMaster()->MovementExpired();
@@ -580,7 +654,7 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
         "hello", "Hello!", {}), PLAYERBOT_SECURITY_TALK);
 
     // Queue group operations for world thread
-    if (master && master->GetGroup() && !group)
+    if (!onMission && master && master->GetGroup() && !group)
     {
         Group* mgroup = master->GetGroup();
         if (mgroup->GetMembersCount() >= 5)
@@ -604,7 +678,7 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
             PlayerbotWorldThreadProcessor::instance().QueueOperation(std::move(addOp));
         }
     }
-    else if (master && !group)
+    else if (!onMission && master && !group)
     {
         // Queue group creation and AddMember operation
         auto inviteOp = std::make_unique<GroupInviteOperation>(master->GetGUID(), bot->GetGUID());
@@ -628,7 +702,9 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
 
     bot->SaveToDB(false, false);
     bool addClassBot = sRandomPlayerbotMgr.IsAccountType(accountId, 2);
-    if (addClassBot && master && abs((int)master->GetLevel() - (int)bot->GetLevel()) > 3)
+    // Self-found: an addclass bot keeps its own level and gear.
+    if (addClassBot && master && abs((int)master->GetLevel() - (int)bot->GetLevel()) > 3 &&
+        !PlayerbotFactory::SelfFoundAt(master->GetLevel()))
     {
         // PlayerbotFactory factory(bot, master->GetLevel());
         // factory.Randomize(false);
@@ -661,6 +737,11 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
     SpendAltBotTalentPoints(bot);
 
     JoinBotChannels(bot);
+
+    // SquidBots Lite updates its list of alts at once instead of at its next refresh.
+    if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+        if (botAI->IsAltBot() && CoaAltAddon::MasterHasAddon(botAI->GetMaster()))
+            CoaAltAddon::Send(bot, botAI->GetMaster(), "ONLINE");
 }
 
 // The channels a client joins for the zone it stands in. A bot only did this at login, so after a
@@ -793,6 +874,12 @@ std::string const PlayerbotHolder::ProcessBotCommand(std::string const cmd, Obje
             }
         }
 
+        // The loader's own check, asked first: "ok" was answered (to the player and the addon) for an offline
+        // character of another account that the loader then refused.
+        std::string const refusal = AddPlayerBotRefusal(guid, masterAccountId);
+        if (!refusal.empty())
+            return refusal;
+
         AddPlayerBot(guid, masterAccountId);
         return "ok";
     }
@@ -843,6 +930,10 @@ std::string const PlayerbotHolder::ProcessBotCommand(std::string const cmd, Obje
             {
                 return "The command is not allowed, use init=auto instead.";
             }
+
+            // Self-found: no init makes gear or levels for a bot.
+            if (cmd.starts_with("init=") && PlayerbotFactory::SelfFoundAt(master->GetLevel()))
+                return "Self-found realm: init is disabled, bots only wear what they find.";
 
             //  Use boot guard
             BotInitGuard guard(bot->GetGUID());
@@ -1018,6 +1109,12 @@ std::vector<std::string> PlayerbotHolder::HandlePlayerbotCommand(char const* arg
         return messages;
     }
 
+    if (!strncmp(cmd, "initself", 8) && PlayerbotFactory::SelfFoundAt(master->GetLevel()))
+    {
+        messages.push_back("Self-found realm: initself is disabled.");
+        return messages;
+    }
+
     if (!strcmp(cmd, "initself"))
     {
         if (master->CanBeGameMaster())
@@ -1189,53 +1286,15 @@ std::vector<std::string> PlayerbotHolder::HandlePlayerbotCommand(char const* arg
         if (!charname)
         {
             messages.push_back(
-                "addclass: invalid CLASSNAME(warrior/paladin/hunter/rogue/priest/shaman/mage/warlock/druid/dk)");
+                "addclass: invalid CLASSNAME (warrior/paladin/hunter/rogue/priest/shaman/mage/warlock/druid/dk, or a "
+                "CoA class: barbarian, witchdoctor, sun ...)");
             return messages;
         }
-        uint8 claz;
-        if (!strcmp(charname, "warrior"))
+        // 3.2.3: the CoA classes too, by name (the AddClass accounts of a CoA realm hold only them).
+        uint8 claz = AddclassClassFromName(charname);
+        if (!claz)
         {
-            claz = 1;
-        }
-        else if (!strcmp(charname, "paladin"))
-        {
-            claz = 2;
-        }
-        else if (!strcmp(charname, "hunter"))
-        {
-            claz = 3;
-        }
-        else if (!strcmp(charname, "rogue"))
-        {
-            claz = 4;
-        }
-        else if (!strcmp(charname, "priest"))
-        {
-            claz = 5;
-        }
-        else if (!strcmp(charname, "shaman"))
-        {
-            claz = 7;
-        }
-        else if (!strcmp(charname, "mage"))
-        {
-            claz = 8;
-        }
-        else if (!strcmp(charname, "warlock"))
-        {
-            claz = 9;
-        }
-        else if (!strcmp(charname, "druid"))
-        {
-            claz = 11;
-        }
-        else if (!strcmp(charname, "dk"))
-        {
-            claz = 6;
-        }
-        else
-        {
-            messages.push_back("Error: Invalid Class. Try again.");
+            messages.push_back("Error: Invalid Class (or a beginning shared by two CoA classes). Try again.");
             return messages;
         }
         //  Added for gender choice : Parsing gender
@@ -1929,7 +1988,7 @@ PlayerbotAI* PlayerbotsMgr::GetPlayerbotAI(Player* player)
     if (itr != _playerbotsAIMap.end())
     {
         if (itr->second->IsBotAI())
-            return dynamic_cast<PlayerbotAI*>(itr->second);
+            return static_cast<PlayerbotAI*>(itr->second); // map only holds PlayerbotAI
     }
 
     return nullptr;
@@ -1945,7 +2004,7 @@ PlayerbotMgr* PlayerbotsMgr::GetPlayerbotMgr(Player* player)
     if (itr != _playerbotsMgrMap.end())
     {
         if (!itr->second->IsBotAI())
-            return dynamic_cast<PlayerbotMgr*>(itr->second);
+            return static_cast<PlayerbotMgr*>(itr->second); // map only holds PlayerbotMgr
     }
 
     return nullptr;

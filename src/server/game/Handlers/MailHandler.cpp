@@ -16,6 +16,7 @@
  */
 
 #include "AccountMgr.h"
+#include "AscensionBazaarTokenReserve.h"
 #include "Chat.h"
 #include "RBAC.h"
 #include "CharacterCache.h"
@@ -221,7 +222,7 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         }
     }*/
 
-    if (/*!accountBound*/ GetAccountId() != rc_account && player->GetTeamId() != rc_teamId && !HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
+    if (/*!accountBound*/ GetAccountId() != rc_account && !sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_MAIL) && player->GetTeamId() != rc_teamId && !HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
     {
         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_NOT_YOUR_TEAM);
         return;
@@ -290,6 +291,23 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
     {
         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_INTERNAL_ERROR);
         return;
+    }
+
+    // Elite Warchest Bazaar Tokens are Realm Bound: free between the account's own characters, otherwise the
+    // account must keep its reserve.
+    if (GetAccountId() != rc_account)
+    {
+        uint32 tokens = 0;
+        for (uint8 i = 0; i < items_count; ++i)
+            if (items[i]->GetEntry() == AscensionBazaarTokenReserve::TOKEN_ITEM)
+                tokens += items[i]->GetCount();
+
+        if (!AscensionBazaarTokenReserve::CanGiveAway(player, tokens))
+        {
+            AscensionBazaarTokenReserve::SendRefusal(player);
+            player->SendMailResult(0, MAIL_SEND, MAIL_ERR_EQUIP_ERROR, EQUIP_ERR_MAIL_BOUND_ITEM);
+            return;
+        }
     }
 
     player->SendMailResult(0, MAIL_SEND, MAIL_OK);
@@ -366,13 +384,14 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         COD = 0;
 
     // will delete item or place to receiver mail list
-    draft
+    uint32 const mailId = draft
     .AddMoney(money)
     .AddCOD(COD)
     .SendMailTo(trans, MailReceiver(receive, receiverGuid.GetCounter()), MailSender(player), body.empty() ? MAIL_CHECK_MASK_COPIED : MAIL_CHECK_MASK_HAS_BODY, deliver_delay);
 
     player->SaveInventoryAndGoldToDB(trans);
     CharacterDatabase.CommitTransaction(trans);
+    sScriptMgr->OnPlayerAfterSendMail(player, receiverGuid, rc_account, receiver, mailId, subject, body);
 
     LOG_INFO("entities.player.mail", "Mail: Account: {} (IP: {}), Player [{}] ({}) sent mail to Player [{}] ({}): subject='{}', body='{}', {} copper, {} COD copper, sent item(s) [{}]",
         GetAccountId(), GetRemoteAddress(), player->GetName(), player->GetGUID().GetCounter(),

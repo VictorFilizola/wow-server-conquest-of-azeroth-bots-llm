@@ -5,14 +5,19 @@
  */
 
 #include "CoaAiObjectContext.h"
+#include "CoaSocial.h"
+#include "CoaPlayerMainTank.h"
+#include "CoaTinkerModule.h"
 
 #include "Action.h"
 #include "AttackAction.h"
 #include "CoaDungeonPriorities.h"
+#include "CoaReborn.h"
 #include "CoaSpecialization.h"
 #include "CoaWildcard.h"
 #include "AscensionWildcard.h"
 #include "CombatStrategy.h"
+#include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "Engine.h"
 #include "Group.h"
@@ -32,6 +37,7 @@
 #include "Trigger.h"
 #include "AscensionSpecialization.h"
 
+#include <string_view>
 #include <algorithm>
 #include <numeric>
 #include <array>
@@ -42,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <tuple>
@@ -200,9 +207,17 @@ bool IsControlAura(SpellEffectInfo const& effect)
 bool PossessesTarget(SpellInfo const* info)
 {
     for (SpellEffectInfo const& effect : info->Effects)
+    {
         if (IsAuraEffect(effect) && effect.ApplyAuraName == SPELL_AURA_MOD_POSSESS &&
             effect.TargetA.GetTarget() != TARGET_UNIT_CASTER)
             return true;
+        // A puppet summon is steered the same way: a Tinker healer's Build: Destructo-Bot left it standing 45 s,
+        // twice, while both channeler tanks died at Magtheridon (ladiabale, 20/10).
+        if (effect.Effect == SPELL_EFFECT_SUMMON)
+            if (SummonPropertiesEntry const* properties = sSummonPropertiesStore.LookupEntry(effect.MiscValueB))
+                if (properties->Category == SUMMON_CATEGORY_PUPPET)
+                    return true;
+    }
     return false;
 }
 
@@ -257,6 +272,12 @@ bool TakesOverBoss(SpellInfo const* info, Unit* target)
     return false;
 }
 
+// The Tinker's Firepot Drone: a bomb that flies after its target, whatever lies between.
+bool SummonsFlyingBomb(SpellInfo const* info)
+{
+    return info->Id == 707300 || std::string_view(info->SpellName[0]) == "Build: Firepot Drone";
+}
+
 // A spell that sends its caster to its home inn, the way a hearthstone does.
 bool TeleportsCasterHome(SpellInfo const* info)
 {
@@ -271,6 +292,10 @@ bool TeleportsCasterHome(SpellInfo const* info)
 // (Boulder Dash, Advance, Shooting Star).
 bool ForcesCasterForward(SpellInfo const* info)
 {
+    // A leap made by a script, which the spell's effects do not show: Vault (Witch Hunter), about 16 yd forward
+    // every 12 s, took a main tank out of its healers' reach and into two more packs (ladiabale, Gruul 2.5).
+    if (info->Id == 500085)
+        return true;
     for (SpellEffectInfo const& effect : info->Effects)
         if (IsAuraEffect(effect) && effect.ApplyAuraName == SPELL_AURA_FORCE_MOVE_FORWARD &&
             effect.TargetA.GetTarget() == TARGET_UNIT_CASTER)
@@ -532,6 +557,79 @@ bool WearsRivalBuffFrom(Unit* unit, Unit* caster, SpellInfo const* buff)
         if (BuffFamilyFlags(worn) & flags)
             return true;
     }
+    return false;
+}
+
+// The Tinker's Modules (family flag 0x80000 and "Module" in the name, see CoaTinkerModule.h): Mana Module when it
+// raises mana regeneration, Power Module when it raises attack power. None for any other spell, Guardian Module
+// (a charge on Repair Shot) included.
+CoaModule ModuleKind(SpellInfo const* info)
+{
+    if (!info || !(info->SpellFamilyFlags[0] & 0x80000) ||
+        std::string_view(info->SpellName[LOCALE_enUS]).find("Module") == std::string_view::npos)
+        return CoaModule::None;
+    for (SpellEffectInfo const& effect : info->Effects)
+    {
+        if (!effect.IsAura())
+            continue;
+        if (effect.ApplyAuraName == SPELL_AURA_MOD_POWER_REGEN)
+            return CoaModule::Mana;
+        if (effect.ApplyAuraName == SPELL_AURA_MOD_ATTACK_POWER)
+            return CoaModule::Power;
+    }
+    return CoaModule::None;
+}
+
+bool ManaCasterOrHealer(Player* player)
+{
+    return player->getPowerType() == POWER_MANA && (PlayerbotAI::IsCaster(player) || PlayerbotAI::IsHeal(player));
+}
+
+// The Module kind this Tinker bot keeps for its group (CoaModuleChoice): the group's members on the bot's map, the
+// bot included, decide whether mana casters are there, and the Tinkers before it in group order its rank.
+CoaModule KeptModule(Player* bot, bool knowsMana, bool knowsPower)
+{
+    bool manaUsers = ManaCasterOrHealer(bot);
+    uint32 tinkerIndex = 0;
+    bool beforeBot = true;
+    if (Group* group = bot->GetGroup())
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (member == bot)
+            {
+                beforeBot = false;
+                continue;
+            }
+            if (!member || !member->IsInWorld() || member->GetMapId() != bot->GetMapId())
+                continue;
+            // A Tinker is a mana user too: a damage Tinker and a mana healer Tinker give the healer Mana Module.
+            if (member->getClass() == CLASS_TINKER)
+                tinkerIndex += beforeBot;
+            if (ManaCasterOrHealer(member))
+                manaUsers = true;
+        }
+    return CoaModuleChoice(manaUsers, tinkerIndex, knowsMana, knowsPower);
+}
+
+// Whether a member of the bot's group on its map, the bot included, wears a Module of this kind from the bot.
+bool WearsModuleFrom(Player* bot, CoaModule kind)
+{
+    auto wears = [bot, kind](Player* member)
+    {
+        for (auto const& [id, application] : member->GetAppliedAuras())
+            if (application->GetBase()->GetCasterGUID() == bot->GetGUID() &&
+                ModuleKind(application->GetBase()->GetSpellInfo()) == kind)
+                return true;
+        return false;
+    };
+    if (wears(bot))
+        return true;
+    if (Group* group = bot->GetGroup())
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            if (Player* member = ref->GetSource(); member && member != bot && member->IsInWorld() &&
+                member->GetMapId() == bot->GetMapId() && wears(member))
+                return true;
     return false;
 }
 
@@ -998,22 +1096,47 @@ struct Usable
     uint32 synergy = 0;
 };
 
-// Active abilities the bot has reached and actually knows, for which `wanted(kind)` is true.
-template <typename Filter>
-std::vector<Usable> KnownAbilities(Player* bot, Filter wanted)
+// The abilities of the kit the bot has reached and knows, with the spell it really casts for each, in kit order.
+// CoA Combat (perf, a46 at 2000 bots): every attack, defensive, heal and cleanse asked this of the whole kit, a
+// HasSpell and a spell lookup per ability, each time. The answer is kept per bot and rebuilt when the kit, the level or
+// the number of spells changes, and every 5 s at worst. Per thread: a bot is updated by one map thread at a time, and
+// a bot that changes threads finds its old entry expired.
+struct KnownEntry
 {
-    std::vector<Usable> usable;
+    CoaAbility const* ability;
+    SpellInfo const* info;
+};
 
-    std::shared_ptr<ClassKit const> const kit = KitOf(bot);
-    if (!kit)
-        return usable;
+struct KnownCache
+{
+    std::shared_ptr<ClassKit const> kit;
+    uint32 builtAt = 0;
+    uint8 level = 0;
+    size_t spellCount = 0;
+    std::vector<KnownEntry> entries;
+};
 
-    // A bot can still know the lower ranks of a spell: only cast the highest one it has reached.
-    // Abilities are ordered by required level, so a later rank replaces an earlier one.
-    std::unordered_map<uint32, size_t> rankIndex;
+constexpr uint32 KnownCacheMs = 5000;
+thread_local std::unordered_map<ObjectGuid::LowType, KnownCache> KnownCaches;
+
+std::vector<KnownEntry> const& KnownEntries(Player* bot, std::shared_ptr<ClassKit const> const& kit)
+{
+    KnownCache& cache = KnownCaches[bot->GetGUID().GetCounter()];
+    uint32 const now = getMSTime();
+    uint8 const level = bot->GetLevel();
+    size_t const spellCount = bot->GetSpellMap().size();
+    if (cache.kit == kit && cache.level == level && cache.spellCount == spellCount && cache.builtAt &&
+        getMSTimeDiff(cache.builtAt, now) < KnownCacheMs)
+        return cache.entries;
+
+    cache.kit = kit;
+    cache.builtAt = now ? now : 1;
+    cache.level = level;
+    cache.spellCount = spellCount;
+    cache.entries.clear();
     for (CoaAbility const& ability : kit->abilities)
     {
-        if (!wanted(ability.kind) || ability.requiredLevel > bot->GetLevel() || !bot->HasSpell(ability.spellId))
+        if (ability.requiredLevel > level || !bot->HasSpell(ability.spellId))
             continue;
 
         // Class grants include passives (e.g. 552011 Resilient Constitution).
@@ -1032,6 +1155,31 @@ std::vector<Usable> KnownAbilities(Player* bot, Filter wanted)
                         rank && rank->SpellLevel <= bot->GetLevel() && bot->HasSpell(rankSpellId))
                         info = rank;
         }
+
+        cache.entries.push_back({&ability, info});
+    }
+    return cache.entries;
+}
+
+// Active abilities the bot has reached and actually knows, for which `wanted(kind)` is true.
+template <typename Filter>
+std::vector<Usable> KnownAbilities(Player* bot, Filter wanted)
+{
+    std::vector<Usable> usable;
+
+    std::shared_ptr<ClassKit const> const kit = KitOf(bot);
+    if (!kit)
+        return usable;
+
+    // A bot can still know the lower ranks of a spell: only cast the highest one it has reached.
+    // Abilities are ordered by required level, so a later rank replaces an earlier one.
+    std::unordered_map<uint32, size_t> rankIndex;
+    for (KnownEntry const& entry : KnownEntries(bot, kit))
+    {
+        CoaAbility const& ability = *entry.ability;
+        if (!wanted(ability.kind))
+            continue;
+        SpellInfo const* const info = entry.info;
 
         auto const [itr, inserted] = rankIndex.try_emplace(ability.firstSpellId, usable.size());
         if (inserted)
@@ -1183,11 +1331,14 @@ bool IsAttack(uint16 kind, bool tank)
 // Whether another tank holds this enemy. As for "has aggro", only the main tank set on the group takes
 // it from them: otherwise two tanks taunt back and forth what the other holds, and a bot tank pulls the
 // boss off a player tank (the same fault fixed in three forks: sksmith261, ShatteredDawn, pengjinfei).
+// A player main tank ("tank main on") holds what is on the player in any spec, even from the main tank set on the
+// group, until the rescue health: then the bots may taunt it off the player (06/11 review, points 2 and 3).
 bool HeldByOtherTank(Player* bot, Unit* enemy)
 {
     Unit* victim = enemy->GetVictim();
     Player* holder = victim ? victim->ToPlayer() : nullptr;
-    return holder && holder != bot && PlayerbotAI::IsTank(holder) && !PlayerbotAI::IsExplicitMainTank(bot);
+    return CoaHeldByOtherTank(holder && holder != bot, CoaPlayerMainTank::Hold(bot, enemy),
+                              holder && PlayerbotAI::IsTank(holder), PlayerbotAI::IsExplicitMainTank(bot));
 }
 
 /*
@@ -1278,6 +1429,15 @@ Player* GroupTank(Player* bot);
 // with what costs nothing, where alone it only kept AiPlayerbot.CoaHealerManaReserve. At 85 it was
 // saving nearly all fight long and chose its cheapest heals while members died (28/09).
 constexpr uint32 GroupHealerManaReserve = 60;
+// In a raid a healer whose damage is its healing still keeps a dispel and a heal: a Heretic hit 0% mana in all six
+// boss fights of a Kara 10 run and died to a Holy Fire her own dispel could not pay for (24/10).
+constexpr uint32 OffensiveHealerRaidManaFloor = 25;
+
+bool KnowsAHeal(Player* bot)
+{
+    return !KnownAbilities(bot, [](uint16 kind)
+        { return (kind & (KIND_HEAL | KIND_HOT)) && !(kind & (KIND_CONTROL | KIND_HOSTILE)); }).empty();
+}
 
 bool SavingManaForHeals(Player* bot)
 {
@@ -1288,7 +1448,8 @@ bool SavingManaForHeals(Player* bot)
     // from damage would keep it from healing. AiPlayerbot.CoaOffensiveHealerSpecs.
     if (uint32 const specialization = GetAscensionActiveSpecialization(bot))
         if (sPlayerbotAIConfig.coaOffensiveHealerSpecs.count(specialization))
-            return false;
+            return bot->GetMap() && bot->GetMap()->IsRaid() && bot->IsInCombat() &&
+                   bot->GetPowerPct(POWER_MANA) < float(OffensiveHealerRaidManaFloor);
 
     uint32 reserve = GetCoaRole(bot) == CoaRole::Heal ? sPlayerbotAIConfig.coaHealerManaReserve
                                                       : sPlayerbotAIConfig.coaCasterManaReserve;
@@ -1297,8 +1458,27 @@ bool SavingManaForHeals(Player* bot)
     if (!reserve || bot->GetPowerPct(POWER_MANA) >= float(reserve))
         return false;
 
-    return !KnownAbilities(bot, [](uint16 kind)
-        { return (kind & (KIND_HEAL | KIND_HOT)) && !(kind & (KIND_CONTROL | KIND_HOSTILE)); }).empty();
+    return KnowsAHeal(bot);
+}
+
+// In a dungeon a healer's mana is the group's: even the share above 60 went on damage at the start of
+// every pull, and a low-level healer, with little mana and slow regeneration, ran dry within a few pulls
+// (20/10). The maps are the ones where stock healers drop "healer dps". Only damage is held back here;
+// which heal it picks still follows SavingManaForHeals.
+bool SavingManaFromDamage(Player* bot)
+{
+    if (SavingManaForHeals(bot))
+        return true;
+
+    if (bot->getPowerType() != POWER_MANA || GetCoaRole(bot) != CoaRole::Heal ||
+        !sPlayerbotAIConfig.IsRestrictedHealerDPSMap(bot->GetMapId()))
+        return false;
+
+    if (uint32 const specialization = GetAscensionActiveSpecialization(bot))
+        if (sPlayerbotAIConfig.coaOffensiveHealerSpecs.count(specialization))
+            return false;
+
+    return KnowsAHeal(bot);
 }
 
 // Removes what costs mana, for a bot that is keeping the rest of its mana for healing.
@@ -1350,20 +1530,53 @@ Player* GroupPlayer(PlayerbotAI* botAI, Player* bot)
 }
 
 
-// The living tank of the bot's group on its own map instance, other than the bot itself.
+// The living tank of the bot's group on its own map instance, other than the bot itself: the one being hit (the
+// lowest in health when several are), else the main tank, else the first. The first in member order only: healers
+// sat on a main tank at full health while the Olm tank starved at Maulgar, and walked 124 times between the Maiden
+// pillars and the other tank (ladiabale, Gruul 18/10, Karazhan 20/10).
 Player* GroupTank(Player* bot)
 {
     Group* group = bot->GetGroup();
     if (!group)
         return nullptr;
 
+    Player* first = nullptr;
+    Player* main = nullptr;
+    Player* hit = nullptr;
+    ObjectGuid const mainGuid = PlayerbotAI::GetMainTankGuid(group);
     for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
         if (Player* member = ref->GetSource())
             if (member != bot && member->IsAlive() && OnSameInstance(bot, member) &&
                 PlayerbotAI::IsTank(member))
-                return member;
+            {
+                if (!first)
+                    first = member;
+                if (member->GetGUID() == mainGuid)
+                    main = member;
+                if (member->IsInCombat() && !member->getAttackers().empty() &&
+                    (!hit || member->GetHealthPct() < hit->GetHealthPct()))
+                    hit = member;
+            }
 
-    return nullptr;
+    return hit ? hit : main ? main : first;
+}
+
+// A healer does not spend its casts on damage while a tank in the fight is below 60%: at Maulgar the healers wanded
+// while the main tank went from 85% to dead in a second, and at Magtheridon they hit the boss before the tank had him
+// and took him (ladiabale, 18 and 20/10). A healer whose damage is its healing is left alone.
+bool HealerHoldsDamage(Player* bot)
+{
+    if (!SmartHeal() || GetCoaRole(bot) != CoaRole::Heal || !bot->GetGroup())
+        return false;
+    if (uint32 const specialization = GetAscensionActiveSpecialization(bot))
+        if (sPlayerbotAIConfig.coaOffensiveHealerSpecs.count(specialization))
+            return false;
+    for (GroupReference* ref = bot->GetGroup()->GetFirstMember(); ref; ref = ref->next())
+        if (Player* member = ref->GetSource())
+            if (member != bot && member->IsAlive() && member->IsInCombat() && OnSameInstance(bot, member) &&
+                PlayerbotAI::IsTank(member) && member->GetHealthPct() < 60.0f)
+                return true;
+    return false;
 }
 
 /*
@@ -2193,19 +2406,35 @@ Unit* DispelTarget(Player* bot, Usable const& spell, Player* member)
         if (effect.Effect != SPELL_EFFECT_DISPEL)
             continue;
 
-        switch (effect.TargetA.GetTarget())
+        // The area is in TargetA or, around a source on the caster, in TargetB: Holy Supernova Cleanse (81200) is
+        // TARGET_SRC_CASTER then TARGET_UNIT_CASTER_AREA_RAID / TARGET_UNIT_SRC_AREA_ALLY.
+        for (Targets const target : {effect.TargetA.GetTarget(), effect.TargetB.GetTarget()})
         {
-            case TARGET_UNIT_CASTER_AREA_PARTY: case TARGET_UNIT_SRC_AREA_ALLY: case TARGET_UNIT_SRC_AREA_PARTY:
-            case TARGET_UNIT_CASTER_AREA_RAID:
-                if (bot->IsWithinDistInMap(member, effect.CalcRadius(bot)))
-                    return bot;
-                break;
-            default:
-                break;
+            switch (target)
+            {
+                case TARGET_UNIT_CASTER_AREA_PARTY: case TARGET_UNIT_SRC_AREA_ALLY: case TARGET_UNIT_SRC_AREA_PARTY:
+                case TARGET_UNIT_CASTER_AREA_RAID:
+                    if (bot->IsWithinDistInMap(member, effect.CalcRadius(bot)))
+                        return bot;
+                    break;
+                default:
+                    break;
+            }
         }
     }
 
     return nullptr;
+}
+
+// The trigger looked 40 yards around while Rebuke and Resonance Rune reach 20, and the bot never walks to a member to
+// cleanse it: 6 500 OUT_OF_RANGE and 2 000 LINE_OF_SIGHT failures on the bench (05/11). A member out of the spell's own
+// reach or out of sight is left to another dispeller; the healer keeps its place.
+bool InDispelReach(Player* bot, Usable const& spell, Unit* castOn)
+{
+    if (castOn == bot)
+        return true;
+    SpellInfo const* const info = EffectiveSpell(bot, spell.info);
+    return bot->IsWithinDistInMap(castOn, info->GetMaxRange(true, bot)) && bot->IsWithinLOSInMap(castOn);
 }
 
 // Another bot of the group is already casting a cleanse on the member: one dispel per member, not
@@ -2277,6 +2506,7 @@ bool IsInterruptibleCast(Unit* unit) { return InterruptibleSpell(unit) != nullpt
 constexpr uint32 InterruptHandOverMs = 600;    // how long the chosen bot has to kick before another may
 constexpr uint32 InterruptLandMarginMs = 300;  // after a kick should have landed: the cast is then over or missed
 constexpr int32 DangerousCastMs = 2500;        // a longer cast is taken for a big hit
+constexpr uint32 DangerousChainTargets = 3;    // damage that jumps to this many targets hits the whole group
 
 struct InterruptClaim
 {
@@ -2323,15 +2553,19 @@ void DropSpentClaims(uint32 now)
 }
 
 // Whether letting this cast through hurts the group more than an ordinary hit: a heal, crowd
-// control, a summon, a shield, a channel, or a long cast that is likely a big hit.
-bool IsDangerousCast(Spell* cast)
+// control, a summon, a shield, a channel, a long cast that is likely a big hit, or a hit that
+// jumps from member to member (Venoxis' Holy Wrath 2118020, 2 s, killed three full-health bots at
+// once). That one is a dummy effect whose damage comes from the script, so the jump counts
+// whatever the effect is.
+bool IsDangerousSpell(SpellInfo const* info, int32 castTime)
 {
-    SpellInfo const* info = cast->GetSpellInfo();
-    if (info->IsChanneled() || cast->GetCastTime() >= DangerousCastMs)
+    if (info->IsChanneled() || castTime >= DangerousCastMs || info->HasAttribute(SPELL_ATTR4_BOUNCY_CHAIN_MISSILES))
         return true;
 
     for (SpellEffectInfo const& effect : info->Effects)
     {
+        if (effect.ChainTarget >= DangerousChainTargets && effect.TargetA.GetCheckType() == TARGET_CHECK_ENEMY)
+            return true;
         switch (effect.Effect)
         {
             case SPELL_EFFECT_HEAL: case SPELL_EFFECT_HEAL_PCT: case SPELL_EFFECT_HEAL_MAX_HEALTH:
@@ -2356,6 +2590,41 @@ bool IsDangerousCast(Spell* cast)
     return false;
 }
 
+bool IsDangerousCast(Spell* cast) { return IsDangerousSpell(cast->GetSpellInfo(), cast->GetCastTime()); }
+
+// Creature entries seen casting something dangerous, for the life of the worldserver.
+std::mutex DangerousEntriesLock;
+std::set<uint32> DangerousEntries;
+
+void NoteDangerousCaster(Unit* caster)
+{
+    if (Creature* creature = caster->ToCreature())
+    {
+        std::lock_guard<std::mutex> guard(DangerousEntriesLock);
+        DangerousEntries.insert(creature->GetEntry());
+    }
+}
+
+// Whether this enemy is one to keep a kick for in a raid: its entry already cast something dangerous on this server,
+// or one of its own spells is dangerous. Without that, the first Holy Wrath of each Venoxis fight went through and
+// took three full-health bots at once.
+bool DangerousCaster(Unit* caster)
+{
+    Creature* creature = caster->ToCreature();
+    if (!creature)
+        return false;
+    {
+        std::lock_guard<std::mutex> guard(DangerousEntriesLock);
+        if (DangerousEntries.count(creature->GetEntry()))
+            return true;
+    }
+    for (uint32 const spellId : creature->m_spells)
+        if (SpellInfo const* info = spellId ? sSpellMgr->GetSpellInfo(spellId) : nullptr)
+            if ((info->InterruptFlags & SPELL_INTERRUPT_FLAG_INTERRUPT) && IsDangerousSpell(info, info->CalcCastTime()))
+                return true;
+    return false;
+}
+
 // Whether this kick reaches the caster from where the bot stands. A kick with no range of its
 // own hits around the bot (Gust of Wind, Ghastly Screech); five yards or less is a melee kick.
 bool KickReaches(Player* bot, SpellInfo const* kick, Unit* caster)
@@ -2376,6 +2645,15 @@ bool KickReaches(Player* bot, SpellInfo const* kick, Unit* caster)
 // stealth: a Ranger out of stealth tried it 436 times for no kick, and won the kick claim each time.
 bool KickFits(Player* bot, SpellInfo const* kick, Unit* caster)
 {
+    // A mounted bot cannot cast it (SPELL_FAILED_NOT_MOUNTED), nor one that needs a state or an aura of its caster it
+    // lacks: Nullifying Toxin, from camouflage only, failed 27 times on CASTER_AURASTATE for 11 kicks, and while it
+    // was the chosen kicker the others waited for nothing (20 917 waits, logs of 05/11).
+    if (bot->IsMounted())
+        return false;
+    if (kick->CasterAuraState && !bot->HasAuraState(AuraStateType(kick->CasterAuraState), kick, bot))
+        return false;
+    if (kick->CasterAuraSpell && !bot->HasAura(kick->CasterAuraSpell))
+        return false;
     if (kick->CheckShapeshift(bot->GetShapeshiftForm()) != SPELL_CAST_OK)
         return false;
     if (caster && caster->IsImmunedToSpell(kick, static_cast<Unit const*>(bot)))
@@ -2498,6 +2776,8 @@ bool MayKick(Player* bot, Unit* caster, Spell* cast)
     claim.danger = IsDangerousCast(cast) ||
                    (sPlayerbotAIConfig.coaDungeonPriorities && CoaDungeonPriorities::InterruptRank(cast->GetSpellInfo()) == 2);
     claim.until = now + remaining + InterruptLandMarginMs;
+    if (claim.danger)
+        NoteDangerousCaster(caster);
     if (!CoordinateInterrupts())
     {
         InterruptClaims.emplace(KeyOf(caster), claim);
@@ -2506,7 +2786,10 @@ bool MayKick(Player* bot, Unit* caster, Spell* cast)
 
     uint32 ready = 0;
     Player* const chosen = ChooseKicker(bot, caster, ready);
-    if (!claim.danger && ready < 2 && bot->GetMap()->IsDungeon())
+    // A dungeon keeps its last kick for a worse cast. A raid keeps every kick for the dangerous casts of a caster
+    // known for them (Venoxis: Holy Nova and Holy Fire took the kicks Holy Wrath needed); the rest of the raid kicks freely.
+    if (!claim.danger && bot->GetMap()->IsDungeon() &&
+        (bot->GetMap()->IsRaid() ? DangerousCaster(caster) : ready < 2))
         ++InterruptStats.heldBack;
     else
     {
@@ -2632,7 +2915,7 @@ public:
         // measured on 18/09 that is the usual state: in 99% of the casts turned down for want of
         // power the bot sat below 10% mana. Under its reserve it attacks with what costs nothing
         // (and its weapon), keeping the rest for heals.
-        bool const saveMana = SavingManaForHeals(bot);
+        bool const saveMana = SavingManaFromDamage(bot);
 
         // Taunts, even those that deal damage, stay out of the rotation on an enemy another tank holds; those that deal
         // none, on one that already hits the tank: a Felsworn Tyrant spent 9 of its 18 Betrays on a boss already on it,
@@ -2751,7 +3034,7 @@ public:
     bool isUseful() override
     {
         Unit* target = AI_VALUE(Unit*, "current target");
-        return target && target->IsAlive();
+        return target && target->IsAlive() && !HealerHoldsDamage(bot);
     }
 
 private:
@@ -2854,7 +3137,7 @@ public:
 
         std::vector<Usable> spells = KnownAbilities(bot, [](uint16 kind)
             { return (kind & KIND_AOE) && (kind & (KIND_DAMAGE | KIND_HOSTILE)); });
-        if (SavingManaForHeals(bot))
+        if (SavingManaFromDamage(bot))
             DropManaSpells(bot, spells);
         DropChannelBreakers(bot, spells);
         std::stable_sort(spells.begin(), spells.end(), [](Usable const& a, Usable const& b) { return a.synergy > b.synergy; });
@@ -2865,7 +3148,7 @@ public:
     bool isUseful() override
     {
         Unit* target = AI_VALUE(Unit*, "current target");
-        return target && target->IsAlive() && ClassHas(bot, KIND_AOE) &&
+        return target && target->IsAlive() && !HealerHoldsDamage(bot) && ClassHas(bot, KIND_AOE) &&
                HasReadyAbility(botAI, bot,[](uint16 kind) { return (kind & KIND_AOE) && (kind & (KIND_DAMAGE | KIND_HOSTILE)); });
     }
 };
@@ -3106,7 +3389,10 @@ public:
         if (!SmartHeal() || bot->InBattleground() || !(bot->IsInCombat() || GroupFighting(bot)))
             return false;
         Player* tank = GroupTank(bot);
-        return tank && (bot->GetDistance2d(tank) > StayNearTank + 4.0f || !bot->IsWithinLOSInMap(tank));
+        // In a raid the boss strategies place the healers (Gruul's ring, the Maiden pillars): there only out of healing
+        // reach, or the healer walked between its spot and the tank all fight (59 to 86 times at Gruul, ladiabale).
+        float const reach = bot->GetMap()->IsRaid() ? sPlayerbotAIConfig.healDistance - 2.0f : StayNearTank + 4.0f;
+        return tank && (bot->GetDistance2d(tank) > reach || !bot->IsWithinLOSInMap(tank));
     }
 };
 
@@ -3144,7 +3430,12 @@ public:
         return tank && MoveNear(tank, keep);
     }
 
-    bool isUseful() override { return !bot->IsNonMeleeSpellCast(false, true, true); }
+    // Not while standing in an enemy ground effect: the tether outranked "avoid aoe" (95 against 90) and walked a healer
+    // back into the same Acid Pool 8 times in 13 s (ladiabale, ZG 22/10).
+    bool isUseful() override
+    {
+        return !bot->IsNonMeleeSpellCast(false, true, true) && !AI_VALUE(Aura*, "area debuff");
+    }
 
 private:
     float keep = StayNearTank - 4.0f;
@@ -3209,8 +3500,10 @@ Unit* LooseEnemy(PlayerbotAI* botAI, Player* bot)
             continue;
         Unit* victim = enemy->GetVictim();
         Player* victimPlayer = victim ? victim->ToPlayer() : nullptr;
+        // A player main tank holds what is on the player in any spec, and is rescued under the rescue health even in
+        // a tank spec (06/11 review, points 3 and 7).
         if (!victimPlayer || victimPlayer == bot || victimPlayer->GetGroup() != group ||
-            PlayerbotAI::IsTank(victimPlayer))
+            !CoaLooseOnMember(CoaPlayerMainTank::Hold(bot, enemy), PlayerbotAI::IsTank(victimPlayer)))
             continue;
         if (bot->GetDistance(enemy) > 30.0f || !bot->IsWithinLOSInMap(enemy))
             continue;
@@ -3233,6 +3526,17 @@ bool OwnTargetTurned(Player* bot, Unit* target)
            !HeldByOtherTank(bot, target);
 }
 
+// The taunts the bot knows that can take this enemy: Maiden of Virtue is immune, and a tank spent 29-79 taunts on her
+// each try of a Kara 10 run (24/10) while she killed the healers.
+std::vector<Usable> TauntsFor(Player* bot, Unit* target)
+{
+    std::vector<Usable> taunts = KnownAbilities(bot, [](uint16 kind) { return (kind & KIND_TAUNT) != 0; });
+    if (target)
+        taunts.erase(std::remove_if(taunts.begin(), taunts.end(),
+            [target](Usable const& taunt) { return target->IsImmunedToSpell(taunt.info); }), taunts.end());
+    return taunts;
+}
+
 // Takes the current target back when it attacks someone else, or else an enemy on another member.
 class CoaTauntAction : public Action
 {
@@ -3248,8 +3552,7 @@ public:
         if (!target || !target->IsAlive())
             return false;
 
-        SpellInfo const* taunt = CastFirst(botAI, bot,
-            KnownAbilities(bot, [](uint16 kind) { return (kind & KIND_TAUNT) != 0; }), target, USAGE_TAUNT);
+        SpellInfo const* taunt = CastFirst(botAI, bot, TauntsFor(bot, target), target, USAGE_TAUNT);
         if (taunt)
         {
             CoaTelemetryNoteTaunt(bot);
@@ -3267,6 +3570,34 @@ public:
         if (OwnTargetTurned(bot, AI_VALUE(Unit*, "current target")))
             return true;
         return LooseEnemy(botAI, bot) != nullptr;
+    }
+};
+
+// "taunt spell" for a CoA tank: the raid strategies (Tempest Keep, Zul'Aman, Molten Core) set the target first and then
+// ask for it by that name, which only the vanilla tanks had. Al'ar's phase 2 swap never happened and a tank held her
+// for 70 s under Melt Armor (ladiabale, TK 22/10). The strategy chose the mob, so another tank holding it is no reason
+// to wait.
+class CoaTauntSpellAction : public Action
+{
+public:
+    CoaTauntSpellAction(PlayerbotAI* botAI) : Action(botAI, "taunt spell") {}
+
+    bool Execute(Event /*event*/) override
+    {
+        Unit* target = AI_VALUE(Unit*, "current target");
+        if (!target || !target->IsAlive() || target->GetVictim() == bot)
+            return false;
+
+        SpellInfo const* taunt = CastFirst(botAI, bot, TauntsFor(bot, target), target, USAGE_TAUNT);
+        if (taunt)
+            CoaTelemetryNoteTaunt(bot);
+        return RecordUsage(USAGE_TAUNT, taunt);
+    }
+
+    bool isUseful() override
+    {
+        return ClassHas(bot, KIND_TAUNT) &&
+               HasReadyAbility(botAI, bot, [](uint16 kind) { return (kind & KIND_TAUNT) != 0; });
     }
 };
 
@@ -3354,7 +3685,7 @@ public:
                 if (!castOn)
                     continue;
 
-                if (!HasDispellable(member, spell.dispelMask))
+                if (!HasDispellable(member, spell.dispelMask) || !InDispelReach(bot, spell, castOn))
                     continue;
 
                 if (SpellInfo const* cast = CastFirst(botAI, bot, { spell }, castOn, USAGE_DISPEL))
@@ -3684,11 +4015,39 @@ public:
                                 cast.until = 0;
                         }
 
+        // One Module per Tinker (CoaTinkerModule.h): the bot keeps one kind for the group, the group-wide form when it
+        // knows it, and puts it up again only once it is worn nowhere.
+        bool knowsModule[3] = {false, false, false};
+        bool knowsAreaModule[3] = {false, false, false};
+        for (Usable const& spell : spells)
+            if (CoaModule const kind = ModuleKind(spell.info); kind != CoaModule::None)
+            {
+                knowsModule[uint8(kind)] = true;
+                knowsAreaModule[uint8(kind)] |= spell.info->IsAffectingArea();
+            }
+        CoaModule const keptModule = knowsModule[uint8(CoaModule::Mana)] || knowsModule[uint8(CoaModule::Power)]
+            ? KeptModule(bot, knowsModule[uint8(CoaModule::Mana)], knowsModule[uint8(CoaModule::Power)])
+            : CoaModule::None;
+        bool const moduleWorn = keptModule != CoaModule::None && WearsModuleFrom(bot, keptModule);
+        // A single target Module goes to an ally it helps, or to anyone when none does (a Tinker that knows one
+        // kind only, its group having no use for it): better than none.
+        bool const moduleHelpsSomeone = keptModule != CoaModule::None &&
+            std::any_of(group.begin(), group.end(), [keptModule](Player* member)
+                { return CoaModuleProfits(keptModule, ManaCasterOrHealer(member)); });
+
         for (Usable const& spell : spells)
             for (Player* member : group)
             {
                 if (member != bot && !(spell.kind & KIND_ALLY_CAST))
                     continue;
+
+                if (CoaModule const kind = ModuleKind(spell.info); kind != CoaModule::None)
+                {
+                    bool const area = spell.info->IsAffectingArea();
+                    if (kind != keptModule || moduleWorn || (!area && knowsAreaModule[uint8(kind)]) ||
+                        (!area && moduleHelpsSomeone && !CoaModuleProfits(kind, ManaCasterOrHealer(member))))
+                        continue;
+                }
 
                 // A buff of under a minute is a fight cooldown, not one to keep up between fights: a Bloodmage
                 // Fleshweaver cast Scarlet Delirium (40 s) again and again out of combat (player report, 10/10).
@@ -3777,7 +4136,8 @@ public:
 
     bool IsActive() override
     {
-        if (!ClassHas(bot, KIND_DISPEL))
+        // Mounted, a dispel fails (SPELL_FAILED_NOT_MOUNTED): about 40 000 of the 250 000 failures of the bench.
+        if (!ClassHas(bot, KIND_DISPEL) || bot->IsMounted())
             return false;
 
         // Only the cleanses ready now: a Ranger whose one cleanse able to clear her debuff was on
@@ -3785,9 +4145,10 @@ public:
         std::vector<Usable> const spells = KnownAbilities(bot, IsGroupDispel);
         for (Player* member : NearbyGroup(bot))
             for (Usable const& spell : spells)
-                if (DispelTarget(bot, spell, member) && HasDispellable(member, spell.dispelMask) &&
-                    !bot->HasSpellCooldown(EffectiveSpell(bot, spell.info)->Id))
-                    return true;
+                if (Unit* const castOn = DispelTarget(bot, spell, member))
+                    if (HasDispellable(member, spell.dispelMask) && InDispelReach(bot, spell, castOn) &&
+                        !bot->HasSpellCooldown(EffectiveSpell(bot, spell.info)->Id))
+                        return true;
 
         return false;
     }
@@ -3804,13 +4165,15 @@ public:
     bool IsActive() override
     {
         // a dispel on cooldown or under a silence: 165 tries and no cast in one run
-        if (!sPlayerbotAIConfig.coaSmartDispel || !ClassHas(bot, KIND_DISPEL) || !HasReadyAbility(botAI, bot, IsGroupDispel))
+        if (!sPlayerbotAIConfig.coaSmartDispel || !ClassHas(bot, KIND_DISPEL) || bot->IsMounted() ||
+            !HasReadyAbility(botAI, bot, IsGroupDispel))
             return false;
 
         std::vector<Usable> const spells = KnownAbilities(bot, IsGroupDispel);
         for (Player* member : NearbyGroup(bot))
             for (Usable const& spell : spells)
-                if (DispelTarget(bot, spell, member) && HasDispellableControl(member, spell.dispelMask))
+                if (Unit* const castOn = DispelTarget(bot, spell, member);
+                    castOn && HasDispellableControl(member, spell.dispelMask) && InDispelReach(bot, spell, castOn))
                     return true;
 
         return false;
@@ -3922,10 +4285,17 @@ float MarkRadius(SpellInfo const* aura)
             (effect.ApplyAuraName == SPELL_AURA_PERIODIC_DAMAGE || IsControlAura(effect)))
             radius = std::max(radius, effect.CalcRadius());
 
-        // What the aura casts from the carrier, now (periodic) or when it ends (trigger rider).
-        if (!effect.TriggerSpell)
+        // What the aura casts from the carrier, now (periodic) or when it ends (trigger rider). A dummy aura can name
+        // it in its base points instead: Solarian's Wrath of the Astromancer (42783) does, and 'coa marked ally' never
+        // saw it, so a carrier blew up among the group (ladiabale, TK 22/10).
+        uint32 triggerId = effect.TriggerSpell;
+        if (!triggerId && (effect.Effect == SPELL_EFFECT_DUMMY ||
+                           (effect.Effect == SPELL_EFFECT_APPLY_AURA && effect.ApplyAuraName == SPELL_AURA_DUMMY)))
+            if (int32 const named = effect.CalcValue(); named > 0)
+                triggerId = uint32(named);
+        if (!triggerId)
             continue;
-        SpellInfo const* triggered = sSpellMgr->GetSpellInfo(effect.TriggerSpell);
+        SpellInfo const* triggered = sSpellMgr->GetSpellInfo(triggerId);
         if (!triggered || triggered->HasAttribute(SPELL_ATTR0_CU_SHARE_DAMAGE))
             continue;
         for (SpellEffectInfo const& hit : triggered->Effects)
@@ -4485,7 +4855,9 @@ public:
 
 protected:
     float InterruptPriority() override { return ACTION_MEDIUM_HEAL + 7; }
-    float DispelPriority() override { return ACTION_MEDIUM_HEAL + 6; }
+    // At 26 the healer's dispel sat under every heal (30 to 34) and never went off in Zul'Gurub (Azuriah, 05/11): just
+    // above the lowest of them now, still under the heals of a member in danger. To watch on the bench (deaths).
+    float DispelPriority() override { return ACTION_CRITICAL_HEAL + 0.5f; }
     // Above the heals of a member at medium health, below those of a member at low health.
     float DispelControlPriority() override { return ACTION_CRITICAL_HEAL + 1.5f; }
     float PurgePriority() override { return ACTION_MEDIUM_HEAL + 5; }
@@ -4497,7 +4869,8 @@ protected:
  * dead, in a fight, eating or drinking, everyone at 70% health or more, the healers at 70% mana or
  * more. It pulls the nearest hostile creature it can see within 30 yards, never one more than 40
  * yards from the player or on another floor, says what it pulls, and leaves the route to the
- * player: it does not know the dungeon, it takes what is in front of the group. In dungeons only.
+ * player: it does not know the dungeon, it takes what is in front of the group. In dungeons only, not raids,
+ * by the main tank only, never a boss or a patrol.
  */
 constexpr float AutoPullRange = 30.0f;
 constexpr float AutoPullLeash = 40.0f;
@@ -4539,6 +4912,11 @@ Unit* NextPull(PlayerbotAI* botAI, Player* bot, Player* master)
         // (jealous-sound/azerothcore-wotlk-coa#5552, #5395).
         if (!creature->IsHostileTo(master) || creature->HasNpcFlag(NPCFlags(UNIT_NPC_FLAG_GOSSIP | UNIT_NPC_FLAG_QUESTGIVER)))
             continue;
+        // Never a boss, the player opens those: a tank pulled Prince Malchezaar on its own (ladiabale, Karazhan
+        // 20/10). Nor a patrol, which walks into the next packs: the Library Spell Shade brought two Horror packs.
+        if (creature->IsDungeonBoss() || creature->isWorldBoss() ||
+            creature->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE)
+            continue;
 
         // From the tank or the player, whichever is nearer: a tank that stays put while the player stands (#6505)
         // was often behind the player, and the next pack lay out of its own 30 yards.
@@ -4564,6 +4942,16 @@ public:
         // Dungeons only: in the open world the player is questing or travelling, not asking for pulls.
         if (!sPlayerbotAIConfig.coaSmartTank || !PlayerbotAI::IsTank(bot) || bot->IsInCombat() || !bot->IsAlive() ||
             !bot->GetMap()->IsDungeon())
+            return false;
+        // Not in a raid, whose packs and encounters a player leads: both Karazhan tanks pulled a pack each 2 s apart,
+        // the Banquet wipe (ladiabale, 20/10), and a tank started Magtheridon with ten players.
+        if (bot->GetMap()->IsRaid())
+            return false;
+        // One puller: with two tanks in the group, the main tank only.
+        if (bot->GetGroup() && !botAI->IsMainTank(bot))
+            return false;
+        // A player who tanks for the group ("tank main on") leads the pulls.
+        if (CoaPlayerMainTank::FlaggedInGroup(bot->GetGroup(), bot))
             return false;
         // A Manastorm floor is one room with its boss: the tank pulled the boss across it on its own (17/10).
         if (bot->GetScriptedPrivateMapId() != MAPID_INVALID)
@@ -4659,6 +5047,17 @@ bool ClaimedByOther(Player* bot, Player* dead)
            !Passed(getMSTime(), found->second.second);
 }
 
+// A bot walking to a corpse it claimed: it keeps it past sight range and nothing else takes it away (ladiabale, TK 22/10).
+bool HoldsCorpseClaim(Player* bot, Player* dead = nullptr)
+{
+    std::lock_guard<std::mutex> guard(ResurrectClaimsLock);
+    uint32 const now = getMSTime();
+    for (auto const& [deadGuid, claim] : ResurrectClaims)
+        if (claim.first == bot->GetGUID() && !Passed(now, claim.second) && (!dead || deadGuid == dead->GetGUID()))
+            return true;
+    return false;
+}
+
 void ClaimCorpse(Player* bot, Player* dead)
 {
     std::lock_guard<std::mutex> guard(ResurrectClaimsLock);
@@ -4683,7 +5082,7 @@ Player* DeadGroupMember(Player* bot)
             !OnSameInstance(bot, dead) || ClaimedByOther(bot, dead))
             return;
         float const distance = dead->GetDistance(bot);
-        if (distance > sPlayerbotAIConfig.sightDistance)
+        if (distance > sPlayerbotAIConfig.sightDistance && !HoldsCorpseClaim(bot, dead))
             return;
         if (!best || rank < bestRank || (rank == bestRank && distance < bestDistance))
         {
@@ -4734,8 +5133,10 @@ public:
             return false;
         ClaimCorpse(bot, dead);
 
+        // A step refused while the last one runs is still the walk: returning false let loot, follow and three catch-up
+        // teleports undo it until the corpse was out of sight, and a healer stayed dead 12 minutes (ladiabale, TK 22/10).
         if (bot->GetDistance(dead) > ResurrectReach || !bot->IsWithinLOSInMap(dead))
-            return MoveNear(dead, ResurrectReach - 5.0f);
+            return MoveNear(dead, ResurrectReach - 5.0f) || bot->isMoving();
 
         if (!bot->IsStandState())
             bot->SetStandState(UNIT_STAND_STATE_STAND);
@@ -4751,8 +5152,8 @@ public:
 };
 
 /*
- * A bot of a real player's group that lost them: more than 35 yards away for 6 seconds, out of a
- * fight, on the same map instance, while the player is not fighting either. It joins them, the way
+ * A bot of a real player's group that lost them: more than 35 yards away for 6 seconds (12 while the player
+ * fights), out of a fight itself, on the same map instance. It joins them, the way
  * a player would be summoned. mod-playerbots' own "move stuck" never runs for bots of a real player,
  * so one caught on a ramp or behind brambles stayed there until told to follow or teleported.
  */
@@ -4769,10 +5170,17 @@ public:
         time_t& farSince = static_cast<CoaAiObjectContext*>(botAI->GetAiObjectContext())->farFromPlayerSince;
         Player* master = botAI->GetMaster();
         // In a battleground the bot plays its objective; teleporting it to the player broke flag runs.
-        bool const lost = master && !GET_PLAYERBOT_AI(master) && !bot->InBattleground() && bot->IsAlive() &&
-                         master->IsAlive() && !bot->IsInCombat() && !master->IsInCombat() && !master->IsInFlight() &&
+        // While the player fights too, but later: a bot left out of a fight it cannot reach is stuck. A Runemaster
+        // stood out of reach of Attumen the whole fight, follow failing 217 times (ladiabale, Karazhan 20/10).
+        bool lost = master && !GET_PLAYERBOT_AI(master) && !bot->InBattleground() && bot->IsAlive() &&
+                         master->IsAlive() && !bot->IsInCombat() && !master->IsInFlight() &&
                          !master->IsBeingTeleported() && OnSameInstance(bot, master) &&
-                         bot->GetGroup() && bot->GetDistance(master) > CatchUpDistance;
+                         bot->GetGroup() && bot->GetDistance(master) > CatchUpDistance && !HoldsCorpseClaim(bot);
+        // In the player's fight a bot within healing reach of a tank is where the fight needs it, not lost.
+        if (lost && master->IsInCombat())
+            if (Player* tank = GroupTank(bot); tank && bot->GetDistance(tank) <= sPlayerbotAIConfig.healDistance &&
+                                                bot->IsWithinLOSInMap(tank))
+                lost = false;
         if (!lost)
         {
             farSince = 0;
@@ -4780,7 +5188,7 @@ public:
         }
         if (!farSince)
             farSince = time(nullptr);
-        return time(nullptr) - farSince >= CatchUpAfter;
+        return time(nullptr) - farSince >= (master->IsInCombat() ? CatchUpAfter * 2 : CatchUpAfter);
     }
 };
 
@@ -4889,6 +5297,7 @@ public:
         creators["coa group heal"] = &CoaActionFactoryInternal::coa_group_heal;
         creators["coa hot"] = &CoaActionFactoryInternal::coa_hot;
         creators["coa taunt"] = &CoaActionFactoryInternal::coa_taunt;
+        creators["taunt spell"] = &CoaActionFactoryInternal::taunt_spell;
         creators["coa defensive"] = &CoaActionFactoryInternal::coa_defensive;
         creators["coa dispel"] = &CoaActionFactoryInternal::coa_dispel;
         creators["coa avoid marked ally"] = &CoaActionFactoryInternal::coa_avoid_marked_ally;
@@ -4919,6 +5328,7 @@ private:
     }
     static Action* coa_hot(PlayerbotAI* botAI) { return new CoaHealAction(botAI, "coa hot", CoaHealAction::Mode::OverTime); }
     static Action* coa_taunt(PlayerbotAI* botAI) { return new CoaTauntAction(botAI); }
+    static Action* taunt_spell(PlayerbotAI* botAI) { return new CoaTauntSpellAction(botAI); }
     static Action* coa_defensive(PlayerbotAI* botAI) { return new CoaDefensiveAction(botAI); }
     static Action* coa_dispel(PlayerbotAI* botAI) { return new CoaDispelAction(botAI); }
     static Action* coa_avoid_marked_ally(PlayerbotAI* botAI) { return new CoaAvoidMarkedAllyAction(botAI); }
@@ -5045,7 +5455,7 @@ bool CoaHealerSavesManaFrom(Player* bot, SpellInfo const* info)
     // What heals or shields stays: saving mana for heals must not take the heals away (a Cultist
     // healer lost Gaze of C'Thun, its main heal: 18 healing a second, the tank 44 s under half).
     return info && GetCoaRole(bot) == CoaRole::Heal && info->PowerType == POWER_MANA &&
-           info->CalcPowerCost(bot, info->GetSchoolMask()) > 0 && SavingManaForHeals(bot) && !HealsOrShields(bot, info);
+           info->CalcPowerCost(bot, info->GetSchoolMask()) > 0 && SavingManaFromDamage(bot) && !HealsOrShields(bot, info);
 }
 
 bool CoaHealerAvoidsForm(Player* bot, SpellInfo const* info)
@@ -5101,6 +5511,14 @@ static bool Taunts(SpellInfo const* info, uint8 depth)
     return false;
 }
 
+// A tank of a CoA class by its specialization, or of a Warcraft Reborn class by its talent tree: GetCoaRole calls every
+// original class a damage dealer, and Reborn Protection Warriors were kept out of Defensive Stance, hence out of Shield
+// Block, Revenge and Shield Wall, and every Reborn tank from its taunts (Reborn tank bench, 22/10).
+bool IsCoaOrRebornTank(Player const* bot)
+{
+    return GetCoaRole(bot) == CoaRole::Tank || (IsRebornBot(bot) && GetWcrRole(bot) == CoaRole::Tank);
+}
+
 bool CoaTankOnlySpell(Player* bot, SpellInfo const* info, Unit* target)
 {
     // Every taunt of the spell store, read from its effects: the class kits knew 28 of them, and a taunt cast
@@ -5127,7 +5545,7 @@ bool CoaTankOnlySpell(Player* bot, SpellInfo const* info, Unit* target)
     bool const taunt = taunts.count(info->Id) || taunts.count(first);
     // A tank does not taunt an enemy already hitting it with a taunt that deals no damage, whatever asks for it (its
     // spec rotation listed Betray among its attacks): the taunt stays ready for the add that runs to a healer.
-    if (GetCoaRole(bot) == CoaRole::Tank)
+    if (IsCoaOrRebornTank(bot))
         return taunt && target && target != bot && target->GetVictim() == bot && !DealsDamage(info);
     // A spell of the bot's own raising its threat (a tank stance, Righteous Fury), kit or not.
     bool const threat = !taunt && (!target || target == bot) && RaisesThreat(info);
@@ -5149,7 +5567,7 @@ void CoaTankThreatBonus(Player* bot)
     // again when the option changes; a bot that is no tank any more loses it.
     static uint32 constexpr increasedThreat = 35773;
     uint32 const bonus = sPlayerbotAIConfig.coaTankThreatBonus;
-    bool const wanted = bonus && GetCoaRole(bot) == CoaRole::Tank;
+    bool const wanted = bonus && IsCoaOrRebornTank(bot);
     Aura* aura = bot->GetAura(increasedThreat, bot->GetGUID());
     if (!wanted)
     {
@@ -5165,7 +5583,7 @@ void CoaTankThreatBonus(Player* bot)
 
 void CoaTankThreatBuffs(PlayerbotAI* botAI, Player* bot)
 {
-    if (!botAI || !bot || GetCoaRole(bot) != CoaRole::Tank || bot->IsInCombat() || bot->IsMounted())
+    if (!botAI || !bot || !IsCoaOrRebornTank(bot) || bot->IsInCombat() || bot->IsMounted())
         return;
 
     // The tank's own threat buffs that its class kit does not list (learned from a talent, an upgrade, swapped in):
@@ -5225,6 +5643,17 @@ bool CoaCarriesBotAway(Player* bot, SpellInfo const* info)
 {
     if (!bot || !info)
         return false;
+    // In an instance, no leap, charge or dash across an enemy ground effect: Vault and Flame Step, cast as buffs, carried
+    // bots back into the pools they had just left, 48 times for one tank at Hakkar (ladiabale, ZG 22/10).
+    if (bot->IsInCombat() && bot->GetMap()->IsDungeon() &&
+        (MovesCaster(info) || ForcesCasterForward(info) || SendsCasterAhead(info)))
+        if (Unit* victim = bot->GetVictim())
+        {
+            std::vector<CoaGround> const zones = CoaHostileGround(bot);
+            if (!zones.empty() && CoaSegmentCrossesGround(zones, bot->GetPositionX(), bot->GetPositionY(),
+                                                          victim->GetPositionX(), victim->GetPositionY()))
+                return true;
+        }
     // A healer never jumps, leaps, charges or blinks, in a fight or out of it: a Flameweaving healer cast Dragon
     // Leap on cooldown from "coa attack" and "coa aoe" and landed in packs nobody had pulled (headless dungeon
     // runs, 11/10). No CoA healer path moves the bot on purpose with a spell; its feet do it.
@@ -5252,6 +5681,19 @@ bool CoaCarriesBotAway(Player* bot, SpellInfo const* info)
     return away;
 }
 
+// The Module kind a Tinker bot keeps, from the Modules it knows; None for any other bot.
+CoaModule TinkerKeptModule(Player* bot)
+{
+    if (bot->getClass() != CLASS_TINKER)
+        return CoaModule::None;
+    bool knows[3] = {false, false, false};
+    for (Usable const& spell : KnownAbilities(bot, [](uint16 kind) { return (kind & KIND_BUFF) != 0; }))
+        knows[uint8(ModuleKind(spell.info))] = true;
+    if (!knows[uint8(CoaModule::Mana)] && !knows[uint8(CoaModule::Power)])
+        return CoaModule::None;
+    return KeptModule(bot, knows[uint8(CoaModule::Mana)], knows[uint8(CoaModule::Power)]);
+}
+
 bool CoaRotationMayCast(PlayerbotAI* botAI, Player* bot, SpellInfo const* info)
 {
     if (!info)
@@ -5262,7 +5704,17 @@ bool CoaRotationMayCast(PlayerbotAI* botAI, Player* bot, SpellInfo const* info)
     // a beast no bot can steer (#6111).
     if (TeleportsCasterHome(info) || PossessesTarget(info))
         return false;
+    // The Tinker's Firepot Drone flies after its target in a straight line, through walls and floors: in Shadowfang
+    // Keep it pulled Captain Midwinter from the floor above, then Silverlaine and the Haunted Servitors, a wipe of 38
+    // (DC, tr-20261104-232907-54 and -233824-56). Never inside a dungeon or a raid; its gain is small next to that.
+    if (bot->GetMap()->IsDungeon() && SummonsFlyingBomb(info))
+        return false;
     if (CoaHoldsExclusiveSibling(bot, info))
+        return false;
+    // One Module per Tinker (CoaTinkerModule.h): the combat and non-combat rotations ask for both kinds ("buff
+    // missing::Greater Power Module", "can cast::Greater Mana Module"), and each took the other off. Only the kind
+    // the bot keeps for its group is cast.
+    if (CoaModule const kind = ModuleKind(info); kind != CoaModule::None && kind != TinkerKeptModule(bot))
         return false;
     if (!sPlayerbotAIConfig.coaExclusiveFamilies)
         return true;
@@ -5334,4 +5786,29 @@ void CoaAiObjectContext::BuildSharedTriggerContexts(SharedNamedObjectContextList
 void CoaAiObjectContext::BuildSharedValueContexts(SharedNamedObjectContextList<UntypedValue>& valueContexts)
 {
     AiObjectContext::BuildSharedValueContexts(valueContexts);
+}
+
+// CoA Live, L2 social bots (CoaSocial.h): one ally spell of the bot's class on any friendly unit, from code outside
+// the strategies (a random bot buffing, healing or raising a real player it passes). The same checks as the
+// group's buff, heal and resurrect actions; the first spell that passes is cast.
+bool CoaCastOnAlly(PlayerbotAI* botAI, Unit* target, CoaAllyCast what)
+{
+    Player* bot = botAI ? botAI->GetBot() : nullptr;
+    if (!bot || !target || !bot->IsAlive() || bot->IsMounted() || bot->IsNonMeleeSpellCast(true))
+        return false;
+
+    uint16 const wanted = what == CoaAllyCast::Buff ? KIND_BUFF : what == CoaAllyCast::Heal ? KIND_HEAL : KIND_RESURRECT;
+    std::vector<Usable> const spells = KnownAbilities(bot, [wanted, what](uint16 kind)
+        { return (kind & wanted) && (what == CoaAllyCast::Resurrect || (kind & KIND_ALLY_CAST)) &&
+                 !(kind & (KIND_HOSTILE | KIND_DAMAGE | KIND_TAUNT | KIND_CONTROL | KIND_STANCE)); });
+
+    for (Usable const& spell : spells)
+    {
+        // A buff the player already wears, or a rival one of the same family from someone: not again.
+        if (what == CoaAllyCast::Buff && (target->HasAura(spell.info->Id) || WearsRivalBuffFrom(target, bot, spell.info)))
+            continue;
+        if (StrictCheck(bot, spell.info, target) == SPELL_CAST_OK && botAI->CastSpell(spell.info->Id, target))
+            return true;
+    }
+    return false;
 }

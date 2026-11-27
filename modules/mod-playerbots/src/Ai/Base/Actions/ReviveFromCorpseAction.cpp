@@ -5,6 +5,7 @@
  */
 
 #include "ReviveFromCorpseAction.h"
+#include "CoaCleanWorld.h"
 #include "Corpse.h"
 #include "DBCStores.h"
 #include "Event.h"
@@ -40,6 +41,9 @@ static bool EnterCorpseDungeon(Player* bot)
     return bot->TeleportTo(entrance->target_mapId, entrance->target_X, entrance->target_Y, entrance->target_Z,
                            entrance->target_Orientation);
 }
+
+// Top of the default start-zone brackets (AiPlayerbot.ZoneBracket.*).
+constexpr uint32 START_ZONE_GRAVEYARD_MAX_LEVEL = 12;
 
 bool ReviveFromCorpseAction::Execute(Event event)
 {
@@ -89,6 +93,11 @@ bool ReviveFromCorpseAction::Execute(Event event)
             return botAI->DoSpecificAction("spirit healer");
     }
 
+    // CoA Live clean world: not in the middle of the monsters that killed it (a safe spot within reach, else the
+    // spirit healer). Off: as before.
+    if (CoaCleanWorld::PrepareRevive(botAI))
+        return true;
+
     LOG_DEBUG("playerbots", "Bot {} {}:{} <{}> revives at body", bot->GetGUID().ToString().c_str(),
               bot->GetTeamId() == TEAM_ALLIANCE ? "A" : "H", bot->GetLevel(), bot->GetName().c_str());
 
@@ -128,9 +137,13 @@ bool FindCorpseAction::Execute(Event /*event*/)
             // LOG_INFO("playerbots", "Bot {} {}:{} <{}>: died too many times, was revived and teleported",
             //     bot->GetGUID().ToString().c_str(), bot->GetTeamId() == TEAM_ALLIANCE ? "A" : "H", bot->GetLevel(),
             //     bot->GetName().c_str());
-            context->GetValue<uint32>("death count")->Set(0);
-            // sRandomPlayerbotMgr.RandomTeleportForLevel(bot);
-            sRandomPlayerbotMgr.Revive(bot);
+            // Revived on its corpse, the bot stood next to the mobs that just killed it five times.
+            if (!botAI->DoSpecificAction("spirit healer"))
+                return false;
+
+            // Kept until it is alive again: reset on the first step, the ghost went back to its corpse.
+            if (bot->IsAlive())
+                context->GetValue<uint32>("death count")->Set(0);
             return true;
         }
     }
@@ -240,6 +253,7 @@ GraveyardStruct const* SpiritHealerAction::GetGrave(bool startZone)
     GraveyardStruct const* NewGrave = nullptr;
 
     ClosestGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+    GraveyardStruct const* ownGrave = ClosestGrave;
 
     if (!startZone && ClosestGrave)
         return ClosestGrave;
@@ -277,6 +291,9 @@ GraveyardStruct const* SpiritHealerAction::GetGrave(bool startZone)
             }
         }
     }
+
+    if (ownGrave && bot->GetLevel() > START_ZONE_GRAVEYARD_MAX_LEVEL)
+        return ownGrave;
 
     std::vector<uint32> races;
 
@@ -340,6 +357,8 @@ bool SpiritHealerAction::Execute(Event /*event*/)
 
     GraveyardStruct const* ClosestGrave =
         GetGrave(dCount > 10 || deadTime > 15 * MINUTE || AI_VALUE(uint8, "durability") < 10);
+    if (!ClosestGrave)
+        return false;
 
     if (bot->GetDistance2d(ClosestGrave->x, ClosestGrave->y) < sPlayerbotAIConfig.sightDistance)
     {

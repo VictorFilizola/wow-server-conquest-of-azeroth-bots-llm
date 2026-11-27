@@ -145,8 +145,14 @@ void ScriptMgr::OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot
 
 void ScriptMgr::OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource)
 {
-    amount = static_cast<uint32>(std::min(double(amount) * sWorld->getRate(RATE_XP_GLOBAL),
-        double(std::numeric_limits<uint32>::max())));
+    if (amount > 0)
+    {
+        float const rate = sWorld->getRate(RATE_XP_GLOBAL);
+        amount = rate > 0.0f
+            ? std::max<uint32>(1u, static_cast<uint32>(std::min(double(amount) * rate,
+                double(std::numeric_limits<uint32>::max()))))
+            : 0;
+    }
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GIVE_EXP, script->OnPlayerGiveXP(player, amount, victim, xpSource));
 }
 
@@ -167,6 +173,12 @@ bool ScriptMgr::OnPlayerHasNoBonusExperience(Player* player)
         if (script->OnPlayerHasNoBonusExperience(player))
             suppress = true;);
     return suppress;
+}
+
+bool ScriptMgr::OnPlayerHoldsTankOrHealerRole(Player const* player)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(PlayerScript, PLAYERHOOK_ON_HOLDS_TANK_OR_HEALER_ROLE,
+        script->OnPlayerHoldsTankOrHealerRole(player));
 }
 
 void ScriptMgr::OnPlayerHonorableKillingBlow(Player* killer, Player* victim)
@@ -282,6 +294,11 @@ bool ScriptMgr::OnPlayerCreateInitialItems(Player* player, bool& handled)
 void ScriptMgr::OnPlayerSave(Player* player)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_SAVE, script->OnPlayerSave(player));
+}
+
+void ScriptMgr::OnPlayerSaveInventory(Player* player, CharacterDatabaseTransaction trans)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_SAVE_INVENTORY, script->OnPlayerSaveInventory(player, trans));
 }
 
 void ScriptMgr::OnPlayerDelete(ObjectGuid guid, uint32 accountId)
@@ -835,6 +852,11 @@ bool ScriptMgr::OnPlayerCanJoinLfg(Player* player, uint8 roles, lfg::LfgDungeonS
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_JOIN_LFG, !script->OnPlayerCanJoinLfg(player, roles, dungeons, comment));
 }
 
+bool ScriptMgr::OnPlayerCanLfgTeleport(Player* player)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_LFG_TELEPORT, !script->OnPlayerCanLfgTeleport(player));
+}
+
 bool ScriptMgr::OnPlayerCanEnterMap(Player* player, MapEntry const* entry, InstanceTemplate const* instance, MapDifficulty const* mapDiff, bool loginCheck)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_ENTER_MAP, !script->OnPlayerCanEnterMap(player, entry, instance, mapDiff, loginCheck));
@@ -893,6 +915,38 @@ bool ScriptMgr::OnPlayerCanUseChat(Player* player, uint32 type, uint32 language,
 bool ScriptMgr::OnPlayerCanUseChat(Player* player, uint32 type, uint32 language, std::string& msg, Channel* channel)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT, !script->OnPlayerCanUseChat(player, type, language, msg, channel));
+}
+
+void ScriptMgr::OnPlayerAfterChat(Player* player, uint32 type, uint32 language, std::string const& msg)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_CHAT, script->OnPlayerAfterChat(player, type, language, msg));
+}
+
+void ScriptMgr::OnPlayerAfterChat(Player* player, uint32 type, uint32 language, std::string const& msg, Player* receiver)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_PRIVATE_CHAT, script->OnPlayerAfterChat(player, type, language, msg, receiver));
+}
+
+void ScriptMgr::OnPlayerAfterChat(Player* player, uint32 type, uint32 language, std::string const& msg, Group* group)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_GROUP_CHAT, script->OnPlayerAfterChat(player, type, language, msg, group));
+}
+
+void ScriptMgr::OnPlayerAfterChat(Player* player, uint32 type, uint32 language, std::string const& msg, Guild* guild)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_GUILD_CHAT, script->OnPlayerAfterChat(player, type, language, msg, guild));
+}
+
+void ScriptMgr::OnPlayerAfterChat(Player* player, uint32 type, uint32 language, std::string const& msg, Channel* channel)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_CHANNEL_CHAT, script->OnPlayerAfterChat(player, type, language, msg, channel));
+}
+
+void ScriptMgr::OnPlayerAfterSendMail(Player* player, ObjectGuid receiverGuid, uint32 receiverAccount, std::string const& receiverName, uint32 mailId,
+    std::string const& subject, std::string const& body)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_SEND_MAIL, script->OnPlayerAfterSendMail(player, receiverGuid, receiverAccount, receiverName,
+        mailId, subject, body));
 }
 
 void ScriptMgr::OnPlayerLearnTalents(Player* player, uint32 talentId, uint32 talentRank, uint32 spellid)
@@ -986,6 +1040,11 @@ bool ScriptMgr::OnPlayerCanEnterManastorm(Player* player)
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_ENTER_MANASTORM, !script->OnPlayerCanEnterManastorm(player));
 }
 
+bool ScriptMgr::OnPlayerCanReleaseSpirit(Player* player)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_RELEASE_SPIRIT, !script->OnPlayerCanReleaseSpirit(player));
+}
+
 void ScriptMgr::OnPlayerBankWithdraw(Player* player, uint8 kind)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_BANK_WITHDRAW, script->OnPlayerBankWithdraw(player, kind));
@@ -1055,6 +1114,11 @@ void ScriptMgr::OnPlayerGetShapeshiftModel(Player* player, uint8 form, uint32 sp
         script->OnPlayerGetShapeshiftModel(player, form, spellId, modelId));
 }
 
+void ScriptMgr::OnPlayerGetNameQueryRace(Player* player, uint8& race)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GET_NAME_QUERY_RACE, script->OnPlayerGetNameQueryRace(player, race));
+}
+
 void ScriptMgr::OnPlayerNormalizeActionButtonSpell(Player* player, uint32& action, bool loading)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_NORMALIZE_ACTION_BUTTON_SPELL, script->OnPlayerNormalizeActionButtonSpell(player, action, loading));
@@ -1118,6 +1182,12 @@ bool ScriptMgr::OnPlayerCanTakeQuest(Player const* player, Quest const* quest)
 bool ScriptMgr::OnPlayerCanRewardQuest(Player const* player, Quest const* quest)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_REWARD_QUEST, !script->OnPlayerCanRewardQuest(player, quest));
+}
+
+bool ScriptMgr::OnPlayerCanRepeatDailyQuest(Player const* player, Quest const* quest)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(PlayerScript, PLAYERHOOK_CAN_REPEAT_DAILY_QUEST,
+        script->OnPlayerCanRepeatDailyQuest(player, quest));
 }
 
 bool ScriptMgr::OnPlayerQuestGiverChooseReward(Player* player, Object* questGiver, Quest const* quest, uint32 reward)

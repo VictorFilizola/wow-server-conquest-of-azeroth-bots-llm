@@ -80,6 +80,12 @@ static bool CoaPullsAheadOfTank(Player* bot, Unit* target)
 // Essence of Malygos and Void Shield were aimed at the enemy and never cast (ladiabale, 16/10).
 static bool CoaSpellForSelfOrFriend(SpellInfo const* info)
 {
+    // Auto Attack and Auto Shot have no target in their effects, yet strike the enemy: taken for the bot itself,
+    // "cast melee::Auto Attack" passed its range check on the bot and ended the tick before "reach melee", two
+    // melee bots stood 50 yd from Maulgar the whole council (ladiabale, Gruul 2.5).
+    if (info->HasEffect(SPELL_EFFECT_ATTACK) || info->IsAutoRepeatRangedSpell())
+        return false;
+
     bool friendlyOnly = true;
     bool any = false;
     for (SpellEffectInfo const& effect : info->Effects)
@@ -140,6 +146,15 @@ Unit* CoaCastAction::GetTarget()
     return CastSpellAction::GetTarget();
 }
 
+Unit* CoaCanCastTrigger::GetTarget()
+{
+    // The line's action casts a spell for the bot itself or a friend on the bot: test it there, not on the enemy,
+    // or the line never fires (Essence of Malygos: 5,134 BAD_TARGETS for a Flameweaving Pyromancer, 18/10).
+    if (Unit* self = CoaSelfTargetFor(botAI, bot, spell))
+        return self;
+    return SpellCanBeCastTrigger::GetTarget();
+}
+
 Unit* CoaCastMeleeAction::GetTarget()
 {
     if (Unit* self = CoaSelfTargetFor(botAI, bot, spell))
@@ -154,7 +169,9 @@ bool CoaCastAction::isUseful()
     if (CoaPullsAheadOfTank(bot, GetTarget()))
         return false;
     uint32 const id = AI_VALUE2(uint32, "spell id", spell);
-    SpellInfo const* info = id ? sSpellMgr->GetSpellInfo(id) : nullptr;
+    if (!id)
+        return false;
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
     if (!info)
         return true;
     if (!CoaHasPowerFor(bot, info))
@@ -172,12 +189,19 @@ bool CoaBuffPartyAction::isUseful()
     return AI_VALUE2(uint32, "spell id", spell) && BuffOnPartyAction::isUseful();
 }
 
+bool CoaHealPartyAction::isUseful()
+{
+    return AI_VALUE2(uint32, "spell id", spell) && HealPartyMemberAction::isUseful();
+}
+
 bool CoaCastMeleeAction::isUseful()
 {
     if (!CastMeleeSpellAction::isUseful() || CoaPullsAheadOfTank(bot, GetTarget()))
         return false;
     uint32 const id = AI_VALUE2(uint32, "spell id", spell);
-    SpellInfo const* info = id ? sSpellMgr->GetSpellInfo(id) : nullptr;
+    if (!id)
+        return false;
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
     return !info || CoaHasPowerFor(bot, info);
 }
 
@@ -603,18 +627,20 @@ bool CoaCanCastTrigger::IsActive()
     bool const active = CanCastNow();
     uint32 const id = AI_VALUE2(uint32, "spell id", spell);
     SpellInfo const* info = id ? sSpellMgr->GetSpellInfo(id) : nullptr;
-    if (!info || !info->HasEffect(SPELL_EFFECT_SUMMON))
+    if (!info || (!info->HasEffect(SPELL_EFFECT_SUMMON) && !info->HasEffect(SPELL_EFFECT_SUMMON_PET)))
         return active;
     return summonBackoff.Allow(active);
 }
 
 bool CoaCanCastTrigger::CanCastNow()
 {
-    if (!SpellCanBeCastTrigger::IsActive())
+    // A spell the bot has not learnt yet: CanCastSpell logged "No spellid" for it on every tick, ~10% of the
+    // playerbots log of a level 17 group (ladiabale, 24/10).
+    uint32 const id = AI_VALUE2(uint32, "spell id", spell);
+    if (!id || !SpellCanBeCastTrigger::IsActive())
         return false;
 
-    uint32 const id = AI_VALUE2(uint32, "spell id", spell);
-    SpellInfo const* info = id ? sSpellMgr->GetSpellInfo(id) : nullptr;
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
     if (!info)
         return true;
 
@@ -683,7 +709,9 @@ bool CoaCanCastTrigger::CanCastNow()
             if (SpellInfo const* triggered = sSpellMgr->GetSpellInfo(effect.TriggerSpell))
                 if (travelUtility(triggered))
                     return false;
-        if (effect.Effect == SPELL_EFFECT_SUMMON)
+        // Build: Mechano-Bear summons a pet: rebuilt while it stood, it was only healed and moved, ~93 of
+        // 98 builds and ~23% of the fight time of a Tinker Invention healer (ladiabale, 24/10).
+        if (effect.Effect == SPELL_EFFECT_SUMMON || effect.Effect == SPELL_EFFECT_SUMMON_PET)
         {
             summons = true;
             if (effect.MiscValue > 0)

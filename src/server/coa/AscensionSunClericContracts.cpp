@@ -14,6 +14,8 @@ namespace AscensionSunCleric
 constexpr uint32 SpellRangeAnywhere = 13;
 constexpr uint32 SunDownDuration = 39;
 constexpr uint32 SunwellVisual = 560124;
+constexpr uint32 FervorOfTheSunProc = 680623;
+constexpr uint32 Calm = 804057;
 void ApplyContracts(SpellInfo* info)
 {
     if (!info || info->SpellFamilyName != 33)
@@ -23,6 +25,14 @@ void ApplyContracts(SpellInfo* info)
         info->AttributesCu |= SPELL_ATTR0_CU_AURA_CANNOT_BE_SAVED;
     if (id == 800624)
         info->AttributesEx &= ~SPELL_ATTR1_NO_THREAT;
+    if (id == 803493)
+        info->Effects[EFFECT_0].ChainTarget = 0;
+    if (id == ValianceExtraAttack)
+        info->ExcludeTargetAuraSpell = 0;
+    if (id == ValianceMarker)
+        info->AttributesEx3 |= SPELL_ATTR3_DOT_STACKING_RULE;
+    if (id == 572886)
+        info->Effects[EFFECT_0].MiscValue = SPELL_SCHOOL_MASK_ALL;
     if (id == Rejuvenating)
         for (auto& effect : info->Effects)
             if (effect.IsAura())
@@ -47,6 +57,8 @@ void ApplyContracts(SpellInfo* info)
         effect.TargetA = SpellImplicitTargetInfo(target);
         effect.TargetB = SpellImplicitTargetInfo();
     };
+    if (id == Calm)
+        aura(EFFECT_0, SPELL_AURA_MOD_DISARM_RANGED, 0, 0, TARGET_UNIT_TARGET_ENEMY);
     for (auto list : {std::pair(SunClericEvents, std::size(SunClericEvents)),
                      std::pair(SunClericDrivers, std::size(SunClericDrivers)),
                      std::pair(SunClericFinite, std::size(SunClericFinite))})
@@ -87,7 +99,10 @@ void ApplyContracts(SpellInfo* info)
     {
         info->Effects[0].TargetA = SpellImplicitTargetInfo(TARGET_UNIT_TARGET_ALLY);
         info->Effects[0].TargetB = SpellImplicitTargetInfo();
+        info->Effects[0].RealPointsPerLevel = 0.0f;
     }
+    if (id == 704931)
+        info->Effects[1].RealPointsPerLevel = 0.0f;
     if (id == DawnCast)
     {
         info->CasterAuraSpell = 0;
@@ -103,6 +118,8 @@ void ApplyContracts(SpellInfo* info)
         info->AttributesCu &= ~SPELL_ATTR0_CU_NEGATIVE;
         Ascension::ClientSpellPatches::Instance().Register(id);
     }
+    if (id == SunStride)
+        Ascension::ClientSpellPatches::Instance().Register(id);
     if (id == SolarPower)
         dummy(1);
     if (id == 800764)
@@ -175,8 +192,9 @@ void ApplyContracts(SpellInfo* info)
         dummy(1);
     if (id == 300353)
     {
-        dummy(1);
-        dummy(2);
+        aura(1, SPELL_AURA_IGNORE_COMBAT_RESULT, 0, MELEE_HIT_DODGE, TARGET_UNIT_CASTER);
+        aura(2, SPELL_AURA_IGNORE_COMBAT_RESULT, 0, MELEE_HIT_PARRY, TARGET_UNIT_CASTER);
+        info->Effects[1].SpellClassMask = info->Effects[2].SpellClassMask = flag96(0, 32, 0);
     }
     if (id == 805816)
         dummy(0);
@@ -218,16 +236,21 @@ void ApplyContracts(SpellInfo* info)
         info->AttributesEx4 |= SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS;
         info->AscensionInheritsResolvedAmount = true;
     }
+    if (Gavel(info))
+        info->AscensionFlatAfterWeaponPercent = true;
     if (Named(info, 500141))
         info->Effects[0].ChainTarget = 5;
     if (Named(info, 800231))
         for (auto& effect : info->Effects)
             if (effect.Effect == 168)
                 effect.Effect = SPELL_EFFECT_DUMMY;
+    if (id == 804751)
+        info->AttributesEx2 &= ~SPELL_ATTR2_IGNORE_LINE_OF_SIGHT;
     if (id == 707768)
     {
         info->Effects[0].TargetA = SpellImplicitTargetInfo(TARGET_UNIT_CASTER);
         info->Effects[0].BasePoints = 9;
+        info->AttributesCu &= ~SPELL_ATTR0_CU_NEGATIVE_EFF0;
     }
     if (id == 520024 || id == 520026 || id == 807441 || id == 680630)
         for (auto& effect : info->Effects)
@@ -274,6 +297,10 @@ void ApplyContracts(SpellInfo* info)
                 info->DurationEntry = sSpellDurationStore.LookupEntry(SunDownDuration);
             }
         }
+    if (id == 504734)
+        info->Effects[EFFECT_1].SpellClassMask |= flag96(0, 0, 0x8 | 0x40);
+    if (id == FervorOfTheSunProc)
+        info->Effects[EFFECT_0].ApplyAuraName = SPELL_AURA_ADD_PCT_MODIFIER;
     info->_InitializeExplicitTargetMask();
 }
 }
@@ -313,10 +340,6 @@ public:
         }
         value = std::clamp(value, float(INT32_MIN / 2), float(INT32_MAX / 2));
     }
-    bool idIsJustice(SpellInfo const* info)
-    {
-        return Any(info, {524857,525005,525006,525007,572849,572850,572040,572041,572042,572043,572044,572045});
-    }
     float Factor(Unit* target, Unit* caster, SpellInfo const* info)
     {
         Player* player = Owner(caster);
@@ -345,12 +368,19 @@ public:
     {
         if (!info || !info->HasAura(SPELL_AURA_PERIODIC_HEAL))
             damage = uint32(damage * Factor(target, caster, info));
+        if (!target || !info || info->HasAttribute(SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS))
+            return;
+        if (AuraEffect const* stand = target->GetAuraEffect(707768, EFFECT_1))
+            if ((stand->GetMiscValue() & info->SchoolMask) &&
+                (info->HasAura(SPELL_AURA_PERIODIC_DAMAGE) || info->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT) ||
+                 info->HasAura(SPELL_AURA_PERIODIC_LEECH)))
+                damage = uint32(damage * std::max(0.0f, 1.0f + float(stand->GetAmount()) / 100.0f));
     }
     void ModifyMeleeDamage(Unit*, Unit* caster, uint32& damage) override
     {
         Player* player = Owner(caster);
         if (player == caster && player && player->HasAura(807749))
-            AddPct(damage, Amount(807749, 1));
+            AddPct(damage, Amount(807749, 1, player));
     }
     void OnDamage(Unit*, Unit* victim, uint32& damage) override
     {

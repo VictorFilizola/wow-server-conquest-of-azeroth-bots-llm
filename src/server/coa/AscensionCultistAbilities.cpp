@@ -1,6 +1,7 @@
 /* Copyright (C) 2016+ AzerothCore, GNU AGPL v3. */
 #include "AscensionCultist.h"
 #include "AscensionCultistData.h"
+#include "Creature.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Random.h"
@@ -10,12 +11,13 @@
 #include "SpellAuras.h"
 #include "SpellMgr.h"
 #include "SpellScript.h"
+#include "TemporarySummon.h"
 #include "ThreatManager.h"
 #include <algorithm>
 namespace
 {
 using namespace AscensionCultist;
-constexpr uint32 selected[] = {502133, 301186, 561288, 301259, 806250, 255070, 681794};
+constexpr uint32 selected[] = {502133, 301186, 561288, 301259, 806250, 255070, 681794, 300605};
 bool Select(uint32 id, SpellInfo const* info)
 {
     switch (id)
@@ -27,6 +29,7 @@ bool Select(uint32 id, SpellInfo const* info)
         case 806250: return Named(info, 805116);
         case 255070: return info->Id == 504719;
         case 681794: return info->Id == 680576;
+        case 300605: return Named(info, 805572);
         default: return false;
     }
 }
@@ -36,6 +39,33 @@ void Finish(Player* player, Spell* spell)
         if (uint64 generation = spell->GetScriptValue(id))
             if (Aura* aura = player->GetAura(id); aura && generation == aura->GetScriptValue(Insanity))
                 aura->Remove();
+}
+void DeflectMeleeAbility(Spell* spell, SpellInfo const* info)
+{
+    if (!info || info->DmgClass != SPELL_DAMAGE_CLASS_MELEE || info->IsPositive() ||
+        info->HasAttribute(SPELL_ATTR3_ALWAYS_HIT))
+        return;
+    Unit* attacker = spell->GetOriginalCaster() ? spell->GetOriginalCaster() : spell->GetCaster();
+    if (!attacker)
+        return;
+    for (TargetInfo& target : *spell->GetUniqueTargetInfo())
+    {
+        if (target.missCondition != SPELL_MISS_NONE || target.targetGUID == attacker->GetGUID())
+            continue;
+        Unit* victim = ObjectAccessor::GetUnit(*attacker, target.targetGUID);
+        Player* cultist = Owner(victim);
+        if (!cultist || victim != cultist || !cultist->IsAlive() || attacker->IsFriendlyTo(cultist))
+            continue;
+        if (cultist->HasUnitState(UNIT_STATE_STUNNED) ||
+            (!cultist->HasInArc(M_PI, attacker) && !cultist->HasIgnoreHitDirectionAura()))
+            continue;
+        int32 chance = 0;
+        for (AuraEffect const* effect : cultist->GetAuraEffectsByType(SPELL_AURA_DEFLECT_SPELLS))
+            if (effect->GetId() == 525065)
+                chance += effect->GetAmount();
+        if (chance > 0 && roll_chance_i(std::clamp(chance, 0, 100)))
+            target.missCondition = SPELL_MISS_DEFLECT;
+    }
 }
 class cultist_spells : public AllSpellScript
 {
@@ -49,17 +79,43 @@ public:
         if (!player || spell->IsTriggered() || result != SPELL_CAST_OK)
             return;
         auto* info = spell->GetSpellInfo();
-        if (Any(info, {805116, 804152}) && !player->HasAura(Madness) && Count(player, Insanity) < 40)
+        if (Any(info, {805116, 804152}) && !player->HasAura(Madness) &&
+            Count(player, Insanity) < (Named(info, 804152) ? 60 : 40))
             result = SPELL_FAILED_NO_POWER;
         if (info->Id == 520345 && spell->m_targets.GetUnitTarget() == player)
             result = SPELL_FAILED_BAD_TARGETS;
     }
     void OnSpellBeforeEffects(Spell* spell, Unit* caster, SpellInfo const* info) override
     {
+        DeflectMeleeAbility(spell, info);
         Player* player = Owner(caster);
-        if (!player || caster != player || info->SpellFamilyName != 31 || spell->IsTriggered())
+        if (!player || caster != player || info->SpellFamilyName != 31)
+            return;
+        if (info->Id == 560109 && State(player).hourOfTwilightCorruptMind)
+        {
+            ObjectGuid targetGuid = spell->m_targets.GetUnitTargetGUID();
+            spell->GetUniqueTargetInfo()->remove_if([targetGuid](TargetInfo const& entry)
+            {
+                return entry.targetGUID != targetGuid;
+            });
+            return;
+        }
+        if (spell->IsTriggered())
             return;
         spell->SetScriptValue(Insanity, Count(player, Insanity));
+        if (Named(info, 500110) || info->Id == 680576)
+            for (Unit* ally : Allies(player, player, 100))
+                if (Aura* marks = ally->GetAura(301982, player->GetGUID()))
+                {
+                    uint32 stacks = marks->GetStackAmount();
+                    float amount = Amount(301983, 0) +
+                        .35f * player->SpellBaseHealingBonusDone(SPELL_SCHOOL_MASK_SHADOW);
+                    Copy(player, ally, 301983, uint32(std::max(0.0f, amount)));
+                    if (Aura* remaining = ally->GetAura(301982, player->GetGUID());
+                        remaining && remaining->GetStackAmount() == stacks)
+                        remaining->Remove();
+                    MarkVoidTouched(player, ally);
+                }
         for (uint32 id : selected)
             if (Select(id, info))
                 if (Aura* aura = player->GetAura(id))
@@ -96,8 +152,14 @@ public:
             return;
         if (aura->GetId() == Herald && player->HasAura(807128))
             duration = std::max(1000, duration - std::abs(Amount(806769)));
-        if (Named(aura->GetSpellInfo(), 582591) && player->HasAura(704881))
-            duration += std::abs(Amount(704881, 2));
+        if (aura->GetId() == 560109)
+            if (Unit const* target = aura->GetOwner() ? aura->GetOwner()->ToUnit() : nullptr)
+            {
+                Unit const* effective = target->GetOwner() ? target->GetOwner() : target;
+                if (effective->IsPlayer() || (effective->IsCreature() &&
+                    effective->ToCreature()->HasFlagsExtra(CREATURE_FLAG_EXTRA_ALL_DIMINISH)))
+                    duration = std::min(duration, 8000);
+            }
     }
     void OnSpellCast(Spell* spell, Unit* caster, SpellInfo const* info, bool) override
     {
@@ -117,15 +179,6 @@ public:
                 Reduce(player, 573028, std::abs(Amount(300297)));
                 Reduce(player, 800432, std::abs(Amount(300297, 1)));
             }
-            for (Unit* ally : Allies(player, player, 100))
-                if (Aura* marks = ally->GetAura(301982, player->GetGUID()))
-                {
-                    uint32 stacks = marks->GetStackAmount();
-                    float amount = Amount(301983, 0, player) + .35f * player->SpellBaseHealingBonusDone(SPELL_SCHOOL_MASK_SHADOW);
-                    Copy(player, ally, 301983, uint32(std::max(0.0f, amount)));
-                    if (Aura* remaining = ally->GetAura(301982, player->GetGUID()); remaining && remaining->GetStackAmount() == stacks)
-                        remaining->Remove();
-                }
             if (target && player->IsValidAttackTarget(target))
             {
                 Command(player, target);
@@ -143,7 +196,7 @@ public:
         if (Named(info, 800413))
         {
             if (target && (player->HasAura(301200) || player->HasAura(301067)))
-                Summon(player, 533030, target->GetNearPosition(3, 0), 12000, target);
+                Summon(player, 533030, target->GetNearPosition(3, 0), 12000, target, id);
             if (player->HasAura(301068))
                 Cast(player, player, 301067);
         }
@@ -188,10 +241,10 @@ public:
             if (player->HasAura(680570))
                 Cast(player, player, 680571);
         }
+        if (id == 500723)
+            Cast(player, player, 500717);
         if (id == 806175)
             StartDash(player);
-        if (id == 805114 && player->HasAura(707429) && spell->GetScriptValue(Insanity) >= 80)
-            Reduce(player, id, 60000);
         if (Any(info, {808036, 808037, 808038}) && player->HasAura(560977))
             Reduce(player, id, INT32_MAX);
         Finish(player, spell);
@@ -215,9 +268,10 @@ public:
                 Copy(player, player, 707185, CalculatePct(healing, Amount(704884)));
             State(player).event = old;
         }
-        if (Named(info, 520333) && healing && player->HasAura(706188))
+        if (Named(info, 520333) && (healing || target == player) && player->HasAura(706188))
             Cast(player, target, 807344);
-        if (Any(info, {808043, 808044, 808045, 808050, 808051, 808052}) && player->HasAura(704880) && (damage || healing))
+        if (Any(info, {808043, 808044, 808045, 808050, 808051, 808052}) && player->HasAura(704880) &&
+            (damage || spell->GetScriptHealingIncludingOverheal()))
         {
             uint32 consumed = damage ? 705107 : 705106;
             player->RemoveAurasDueToSpell(consumed);
@@ -260,6 +314,8 @@ public:
                 bool linkedB = b->GetGUID() == State(player).covenant;
                 if (linkedA != linkedB)
                     return linkedA;
+                if (a->IsPlayer() != b->IsPlayer())
+                    return a->IsPlayer();
                 uint32 stacksA = a->GetAura(BlackBlood, player->GetGUID()) ? a->GetAura(BlackBlood, player->GetGUID())->GetStackAmount() : 0;
                 uint32 stacksB = b->GetAura(BlackBlood, player->GetGUID()) ? b->GetAura(BlackBlood, player->GetGUID())->GetStackAmount() : 0;
                 return stacksA != stacksB ? stacksA < stacksB : a->GetHealthPct() < b->GetHealthPct();
@@ -278,13 +334,16 @@ public:
         }
         if (Named(info, 524876) && damage && player->HasAura(704889))
         {
-            uint32 existing = 0;
+            int64 remaining = 0;
             if (AuraEffect* shield = player->GetAuraEffect(850002, EFFECT_0))
-                existing = std::max(0, shield->GetAmount());
-            Copy(player, player, 850002, existing + CalculatePct(damage, Amount(704889)));
+                remaining = std::max(0, shield->GetAmount());
+            if (uint32 added = CalculatePct(damage, Amount(704889)))
+            {
+                Copy(player, player, 850002, added);
+                if (AuraEffect* shield = player->GetAuraEffect(850002, EFFECT_0); shield && remaining)
+                    shield->ChangeAmount(int32(std::min<int64>(INT32_MAX, shield->GetAmount() + remaining)));
+            }
         }
-        if (id == 500717)
-            Cast(player, player, 500723);
         if (id == 560109 && player->HasAura(525049))
             for (Unit* enemy : Nearby(target, Radius(560943)))
                 if (player->IsValidAttackTarget(enemy))
@@ -435,7 +494,7 @@ class spell_ascension_cultist_ability : public SpellScript
             player->GetThreatMgr().RemoveMeFromThreatLists();
             uint32 duration = sSpellMgr->GetSpellInfo(706932)->GetDuration();
             for (uint32 n = 0; n < 3; ++n)
-                Summon(player, 840000, player->GetNearPosition(2, float(n) * 2), duration, player->GetVictim());
+                Summon(player, 840000, player->GetNearPosition(2, float(n) * 2), duration, player->GetVictim(), id);
         }
         if (effect.Effect == SPELL_EFFECT_SUMMON)
         {
@@ -444,7 +503,10 @@ class spell_ascension_cultist_ability : public SpellScript
             {
                 done = true;
                 Position position = GetExplTargetDest() ? GetExplTargetDest()->GetPosition() : player->GetNearPosition(2, 0);
-                Summon(player, effect.MiscValue, position, std::max(1000, GetSpellInfo()->GetDuration()), GetExplTargetUnit());
+                int32 duration = GetSpellInfo()->GetDuration();
+                player->ApplySpellMod(GetSpellInfo()->Id, SPELLMOD_DURATION, duration);
+                Summon(player, effect.MiscValue, position, std::max(1000, duration),
+                    GetExplTargetUnit(), GetSpellInfo()->Id);
             }
         }
         if (id == 804779 && (effect.Effect == 174 || effect.Effect == 164))
@@ -526,6 +588,58 @@ class aura_ascension_cultist_shadow_training : public AuraScript
             aura_ascension_cultist_shadow_training::AddGazeHealingModifier, EFFECT_1, SPELL_AURA_MOD_EXPERTISE);
     }
 };
+constexpr float GazeJumpRadius = 10.0f;
+
+class spell_ascension_cultist_gaze_of_cthun_jump : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_cultist_gaze_of_cthun_jump);
+    static bool IsCompanion(WorldObject* object)
+    {
+        Creature* creature = object ? object->ToCreature() : nullptr;
+        if (!creature)
+            return false;
+        if (creature->GetCreatureType() == CREATURE_TYPE_NON_COMBAT_PET)
+            return true;
+        TempSummon* summon = creature->ToTempSummon();
+        return summon && summon->m_Properties && summon->m_Properties->Type == SUMMON_TYPE_MINIPET;
+    }
+    bool IsJumpTarget(Unit* unit)
+    {
+        Unit* caster = GetCaster();
+        return unit && !IsCompanion(unit) && caster &&
+            (caster->IsValidAttackTarget(unit, GetSpellInfo()) || caster->IsValidAssistTarget(unit));
+    }
+    void SkipUnusableTargets(std::list<WorldObject*>& targets)
+    {
+        Unit* primary = GetExplTargetUnit();
+        size_t const jumps = targets.size();
+        targets.remove_if([this](WorldObject* target) { return !IsJumpTarget(target ? target->ToUnit() : nullptr); });
+        if (!primary || targets.size() == jumps)
+            return;
+        std::list<Unit*> candidates = Nearby(primary, GazeJumpRadius);
+        candidates.remove_if([&](Unit* unit)
+        {
+            return unit == primary || !IsJumpTarget(unit) ||
+                std::find(targets.begin(), targets.end(), unit) != targets.end() ||
+                GetSpellInfo()->CheckTarget(GetCaster(), unit, true) != SPELL_CAST_OK ||
+                !primary->IsWithinLOSInMap(unit, VMAP::ModelIgnoreFlags::M2);
+        });
+        candidates.sort([primary](Unit* a, Unit* b) { return primary->GetDistanceOrder(a, b); });
+        for (Unit* unit : candidates)
+        {
+            if (targets.size() == jumps)
+                break;
+            targets.push_back(unit);
+        }
+    }
+    void Register() override
+    {
+        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(
+            spell_ascension_cultist_gaze_of_cthun_jump::SkipUnusableTargets, EFFECT_0, TARGET_UNIT_TARGET_ANY);
+        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(
+            spell_ascension_cultist_gaze_of_cthun_jump::SkipUnusableTargets, EFFECT_1, TARGET_UNIT_TARGET_ANY);
+    }
+};
 }
 void AddSC_AscensionCultistAbilities()
 {
@@ -536,4 +650,5 @@ void AddSC_AscensionCultistAbilities()
     RegisterSpellScript(spell_ascension_cultist_ability);
     RegisterSpellScript(spell_ascension_cultist_shield);
     RegisterSpellScript(aura_ascension_cultist_shadow_training);
+    RegisterSpellScript(spell_ascension_cultist_gaze_of_cthun_jump);
 }

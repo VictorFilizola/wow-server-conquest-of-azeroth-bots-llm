@@ -33,6 +33,7 @@
 #include "ServerFacade.h"
 #include "Vehicle.h"
 #include <algorithm>
+#include <mutex>
 
 // common bg positions
 Position const WS_WAITING_POS_HORDE_1 = {944.981f, 1423.478f, 345.434f, 6.18f};
@@ -114,7 +115,8 @@ enum BattleBotWsgWaitSpot
     BB_WSG_WAIT_SPOT_RIGHT
 };
 
-std::unordered_map<uint32, BGStrategyData> bgStrategies;
+static std::unordered_map<uint32, BGStrategyData> bgStrategies;
+static std::mutex bgStrategiesMutex;
 
 std::vector<uint32> const vFlagsAV = {
     BG_AV_OBJECTID_BANNER_H_B,      BG_AV_OBJECTID_BANNER_H,      BG_AV_OBJECTID_BANNER_A_B,
@@ -1432,8 +1434,23 @@ std::string const BGTactics::HandleConsoleCommandPrivate(WorldSession* session, 
 }
 
 // Depends on OnBattlegroundStart in playerbots.cpp
+void BGTactics::SetBotStrategies(uint32 instanceId, BGStrategyData const& data)
+{
+    std::lock_guard<std::mutex> lock(bgStrategiesMutex);
+    bgStrategies[instanceId] = data;
+}
+
+void BGTactics::ClearBotStrategies(uint32 instanceId)
+{
+    std::lock_guard<std::mutex> lock(bgStrategiesMutex);
+    bgStrategies.erase(instanceId);
+}
+
 uint8 BGTactics::GetBotStrategyForTeam(Battleground* bg, TeamId teamId)
 {
+    if (!bg)
+        return 0;
+    std::lock_guard<std::mutex> lock(bgStrategiesMutex);
     auto itr = bgStrategies.find(bg->GetInstanceID());
     if (itr == bgStrategies.end())
         return 0;
@@ -1576,6 +1593,10 @@ bool BGTactics::Execute(Event /*event*/)
         botAI->ResetStrategies();
         return false;
     }
+
+    // Still porting in, or a battleground that is not the bot's map: its objects cannot be read.
+    if (bot->GetMapId() != bg->GetMapId() || bot->GetInstanceId() != bg->GetInstanceID())
+        return false;
 
     if (getName() == "unstuck")
         return Unstuck(bg);
@@ -1971,12 +1992,6 @@ bool BGTactics::selectObjective(bool reset)
                         Position objPos = go->GetPosition();
                         float rx, ry, rz;
                         bot->GetRandomPoint(objPos, frand(5.0f, 15.0f), rx, ry, rz);
-                        if (Map* map = bot->GetMap())
-                        {
-                            float groundZ = map->GetHeight(rx, ry, rz);
-                            if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                                rz = groundZ;
-                        }
 
                         pos.Set(rx, ry, rz, go->GetMapId());
                         posMap["bg objective"] = pos;
@@ -2089,13 +2104,6 @@ bool BGTactics::selectObjective(bool reset)
                     float rx, ry, rz;
                     bot->GetRandomPoint(waitPos, 5.0f, rx, ry, rz);
 
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
-
                     pos.Set(rx, ry, rz, bot->GetMapId());
                     posMap["bg objective"] = pos;
 
@@ -2131,13 +2139,6 @@ bool BGTactics::selectObjective(bool reset)
                 }
                 else
                     bot->GetRandomPoint(objPos, frand(-2.0f, 2.0f), rx, ry, rz);
-
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
 
                 pos.Set(rx, ry, rz, BgObjective->GetMapId());
                 posMap["bg objective"] = pos;
@@ -2388,12 +2389,6 @@ bool BGTactics::selectObjective(bool reset)
                 Position camp = (team == TEAM_ALLIANCE) ? AB_GY_CAMPING_HORDE : AB_GY_CAMPING_ALLIANCE;
                 float rx, ry, rz;
                 bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
                 pos.Set(rx, ry, rz, bot->GetMapId());
                 posMap["bg objective"] = pos;
                 break;
@@ -2513,13 +2508,6 @@ bool BGTactics::selectObjective(bool reset)
                 Position objPos = BgObjective->GetPosition();
                 bot->GetRandomPoint(objPos, frand(5.0f, 15.0f), rx, ry, rz);
 
-                if (Map* map = bot->GetMap())
-                {
-                    float groundZ = map->GetHeight(rx, ry, rz);
-                    if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                        rz = groundZ;
-                }
-
                 pos.Set(rx, ry, rz, BgObjective->GetMapId());
                 posMap["bg objective"] = pos;
             }
@@ -2607,13 +2595,6 @@ bool BGTactics::selectObjective(bool reset)
                     float rx, ry, rz;
                     bot->GetRandomPoint(targetPos, 5.0f, rx, ry, rz);
 
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
-
                     pos.Set(rx, ry, rz, bot->GetMapId());
 
                     // Check AreaTrigger activation range
@@ -2634,13 +2615,6 @@ bool BGTactics::selectObjective(bool reset)
 
                     float rx, ry, rz;
                     bot->GetRandomPoint(fallback, 5.0f, rx, ry, rz);
-
-                    if (Map* map = bot->GetMap())
-                    {
-                        float groundZ = map->GetHeight(rx, ry, rz);
-                        if (groundZ == VMAP_INVALID_HEIGHT_VALUE)
-                            rz = groundZ;
-                    }
 
                     pos.Set(rx, ry, rz, bot->GetMapId());
                     foundObjective = true;
@@ -2664,7 +2638,6 @@ bool BGTactics::selectObjective(bool reset)
                     {
                         float rx, ry, rz;
                         bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                        rz = bot->GetMap()->GetHeight(rx, ry, rz);
                         pos.Set(rx, ry, rz, bot->GetMapId());
                         foundObjective = true;
                     }
@@ -2739,7 +2712,6 @@ bool BGTactics::selectObjective(bool reset)
                             Position const& p = EY_NodePositions[chosenId];
                             float rx, ry, rz;
                             bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                            rz = bot->GetMap()->GetHeight(rx, ry, rz);
                             pos.Set(rx, ry, rz, bot->GetMapId());
                             foundObjective = true;
                         }
@@ -2801,7 +2773,6 @@ bool BGTactics::selectObjective(bool reset)
                         Position const& p = EY_NodePositions[*bestNode];
                         float rx, ry, rz;
                         bot->GetRandomPoint(p, 5.0f, rx, ry, rz);
-                        rz = bot->GetMap()->GetHeight(rx, ry, rz);
                         pos.Set(rx, ry, rz, bot->GetMapId());
                         foundObjective = true;
                     }
@@ -2869,7 +2840,6 @@ bool BGTactics::selectObjective(bool reset)
                 Position camp = (team == TEAM_HORDE) ? EY_GY_CAMPING_ALLIANCE : EY_GY_CAMPING_HORDE;
                 float rx, ry, rz;
                 bot->GetRandomPoint(camp, 10.0f, rx, ry, rz);
-                rz = bot->GetMap()->GetHeight(rx, ry, rz);
                 pos.Set(rx, ry, rz, bot->GetMapId());
                 foundObjective = true;
             }
@@ -3669,7 +3639,7 @@ bool BGTactics::atFlag(std::vector<BattleBotPath*> const& vPaths, std::vector<ui
 {
     // Basic sanity checks
     Battleground* bg = bot->GetBattleground();
-    if (!bg)
+    if (!bg || bot->GetMapId() != bg->GetMapId() || bot->GetInstanceId() != bg->GetInstanceID())
         return false;
 
     // Get the actual BG type (in case of random BG)

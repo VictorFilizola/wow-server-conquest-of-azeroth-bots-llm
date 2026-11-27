@@ -17,7 +17,7 @@ constexpr unsigned SlotCount = 19;
 constexpr unsigned ShirtSlot = 4;
 constexpr unsigned TabardSlot = 19;
 constexpr double DefaultFeeMultiplier = 1.0;
-constexpr unsigned DefaultMaxSlots = 3;
+constexpr unsigned DefaultMaxSlots = 0;
 constexpr std::uint64_t LevelCapSurcharge = 100000;
 
 struct RateBand
@@ -32,6 +32,34 @@ constexpr std::array<RateBand, 9> RateBands = {{{0, 28}, {26, 85}, {36, 256}, {4
 constexpr bool Insurable(unsigned slot)
 {
     return slot >= 1 && slot <= SlotCount && slot != ShirtSlot && slot != TabardSlot;
+}
+
+constexpr std::uint32_t BuildAllSlotsMask()
+{
+    std::uint32_t mask = 0;
+    for (unsigned slot = 1; slot <= SlotCount; ++slot)
+        if (Insurable(slot))
+            mask |= 1u << slot;
+    return mask;
+}
+
+constexpr std::uint32_t AllSlotsMask = BuildAllSlotsMask();
+
+enum class DefaultSync : std::uint8_t
+{
+    None,
+    Apply,
+    Clear
+};
+
+constexpr DefaultSync DecideDefaultSync(bool enabled, bool insureAllByDefault, bool defaultApplied)
+{
+    bool const wanted = enabled && insureAllByDefault;
+    if (wanted && !defaultApplied)
+        return DefaultSync::Apply;
+    if (!wanted && defaultApplied)
+        return DefaultSync::Clear;
+    return DefaultSync::None;
 }
 
 enum class ToggleResult : std::uint8_t
@@ -88,12 +116,6 @@ inline std::uint64_t ClientCost(float averageItemLevel, bool atLevelCap)
     double cost = double(level) * double(CopperPerLevel(std::uint32_t(level)));
     if (atLevelCap)
         cost += double(LevelCapSurcharge);
-    return cost > 0.0 ? std::uint64_t(std::llround(cost)) : 0;
-}
-
-inline std::uint64_t ItemFee(std::uint32_t itemLevel, double feeMultiplier)
-{
-    double const cost = double(itemLevel) * double(CopperPerLevel(itemLevel)) * std::max(0.0, feeMultiplier);
     return cost > 0.0 ? std::uint64_t(std::llround(cost)) : 0;
 }
 

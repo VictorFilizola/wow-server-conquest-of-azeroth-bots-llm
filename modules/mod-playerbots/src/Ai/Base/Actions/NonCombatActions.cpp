@@ -6,6 +6,7 @@
 
 #include "NonCombatActions.h"
 #include "Event.h"
+#include "GridTerrainData.h"
 #include "Playerbots.h"
 
 namespace
@@ -14,8 +15,23 @@ constexpr uint32 BG_WS_SPELL_WARSONG_FLAG = 23333;
 constexpr uint32 BG_WS_SPELL_SILVERWING_FLAG = 23335;
 constexpr uint32 BG_EY_NETHERSTORM_FLAG_SPELL = 34976;
 
-bool IsDisallowedShapeshiftForm(Player* bot)
+// Standing in an enemy ground effect or in lava: a bot that sits down to eat there dies (Nightbane's Charred Earth,
+// ladiabale 20/10; lava, Yeh 21/10). "avoid aoe" moves it out first.
+bool InHarmfulGround(PlayerbotAI* botAI, Player* bot)
 {
+    if (botAI->GetAiObjectContext()->GetValue<Aura*>("area debuff")->Get())
+        return true;
+    LiquidData const& liquid = bot->GetLiquidData();
+    return liquid.Status != LIQUID_MAP_NO_WATER && liquid.Status != LIQUID_MAP_ABOVE_WATER &&
+           (liquid.Flags & (MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME));
+}
+
+// Stunned, feared, frozen in an ice block, charmed: no eating or drinking.
+bool IsDisallowedFoodState(Player* bot)
+{
+    if (bot->HasUnitState(UNIT_STATE_LOST_CONTROL))
+        return true;
+
     if (bot->getClass() == CLASS_DRUID)
     {
         ShapeshiftForm form = bot->GetShapeshiftForm();
@@ -35,6 +51,9 @@ bool IsDisallowedShapeshiftForm(Player* bot)
 
 bool DrinkAction::Execute(Event event)
 {
+    if (IsDisallowedFoodState(bot))
+        return false;
+
     if (botAI->HasCheat(BotCheatMask::food))
     {
         // if (bot->IsNonMeleeSpellCast(true))
@@ -80,7 +99,10 @@ bool DrinkAction::isUseful()
 
 bool DrinkAction::isPossible()
 {
-    if (bot->IsInCombat() || bot->IsMounted() || bot->IsInWater() || IsDisallowedShapeshiftForm(bot))
+    if (bot->IsInCombat() || bot->IsMounted() || bot->IsInWater() || IsDisallowedFoodState(bot))
+        return false;
+
+    if (InHarmfulGround(botAI, bot))
         return false;
 
     if (bot->HasAura(BG_WS_SPELL_WARSONG_FLAG) || bot->HasAura(BG_WS_SPELL_SILVERWING_FLAG) ||
@@ -94,6 +116,9 @@ bool DrinkAction::isPossible()
 
 bool EatAction::Execute(Event event)
 {
+    if (IsDisallowedFoodState(bot))
+        return false;
+
     if (botAI->HasCheat(BotCheatMask::food))
     {
         // if (bot->IsNonMeleeSpellCast(true))
@@ -135,7 +160,10 @@ bool EatAction::isUseful() { return UseItemAction::isUseful() && AI_VALUE2(uint8
 
 bool EatAction::isPossible()
 {
-    if (bot->IsInCombat() || bot->IsMounted() || bot->IsInWater() || IsDisallowedShapeshiftForm(bot))
+    if (bot->IsInCombat() || bot->IsMounted() || bot->IsInWater() || IsDisallowedFoodState(bot))
+        return false;
+
+    if (InHarmfulGround(botAI, bot))
         return false;
 
     if (bot->HasAura(BG_WS_SPELL_WARSONG_FLAG) || bot->HasAura(BG_WS_SPELL_SILVERWING_FLAG) ||

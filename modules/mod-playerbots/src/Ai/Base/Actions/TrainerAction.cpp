@@ -13,8 +13,13 @@
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
 #include "ReputationMgr.h"
+#include "StatsWeightCalculator.h"
 #include "Trainer.h"
+#include "GossipDef.h"
+#include "ObjectAccessor.h"
 #include "CoaReborn.h"
+#include "CoaAltAddon.h"
+#include "CoaWorldItemOrigin.h"
 
 namespace
 {
@@ -47,8 +52,64 @@ bool TrainerAction::Execute(Event event)
                         // TODO: Rewrite to only exclude start primary profession skills and make config dependent.
                         (trainer->GetTrainerType() != Trainer::Type::Tradeskill || !IsRealPlayer(botAI->GetMaster())));
 
-    Iterate(target, learnSpells, spellId);
+    Iterate(target, learnSpells, spellId, CoaAltAddon::ToAddon(botAI));
 
+    return true;
+}
+
+bool TrainerAction::LearnFrom(Creature* trainer)
+{
+    if (!trainer || !trainer->IsInWorld() || !trainer->IsAlive() || !TrainerOf(trainer, bot))
+        return false;
+    Iterate(trainer, true, 0, CoaAltAddon::AddonSeen(botAI));
+    return true;
+}
+
+Creature* TrainerAction::InteractionTrainer()
+{
+    auto usable = [this](Creature* npc)
+    { return npc && npc->IsInWorld() && npc->IsAlive() && npc->IsTrainer() && TrainerOf(npc, bot); };
+
+    Creature* target = GetCreatureTarget();
+    if (usable(target))
+        return target;
+
+    Player* master = GetMaster();
+    if (!master || master->GetMap() != bot->GetMap())
+        return nullptr;
+
+    // The window the owner has open: its gossip page (Book of Artisans), else the one trainer at arm's length.
+    ObjectGuid const sender = master->PlayerTalkClass->GetGossipMenu().GetSenderGUID();
+    if (sender.IsCreature())
+        if (Creature* npc = ObjectAccessor::GetCreature(*master, sender); usable(npc))
+            return npc;
+
+    Creature* nearby = nullptr;
+    for (ObjectGuid const& guid : AI_VALUE(GuidVector, "nearest npcs"))
+    {
+        Creature* npc = botAI->GetCreature(guid);
+        if (!usable(npc) || master->GetDistance(npc) > INTERACTION_DISTANCE)
+            continue;
+        if (nearby)
+            return nullptr;
+        nearby = npc;
+    }
+    return nearby;
+}
+
+bool TrainerAction::RunForAddon(bool learnSpells, uint32 spellId)
+{
+    Creature* target = InteractionTrainer();
+    if (!target)
+    {
+        if (CoaAltAddon::AddonSeen(botAI))
+            CoaAltAddon::SendToMaster(botAI, "T_ERR\tno_trainer");
+        else
+            botAI->TellMaster("No trainer: target one or talk to it first.");
+        return false;
+    }
+
+    Iterate(target, learnSpells, spellId, CoaAltAddon::AddonSeen(botAI));
     return true;
 }
 
@@ -110,9 +171,13 @@ Creature* TrainerAction::GetCreatureTarget()
     return target ? target->ToCreature() : nullptr;
 }
 
-void TrainerAction::Iterate(Creature* creature, bool learnSpells, uint32 spellId)
+void TrainerAction::Iterate(Creature* creature, bool learnSpells, uint32 spellId, bool addon)
 {
-    TellHeader(creature);
+    if (addon && !learnSpells)
+        CoaAltAddon::SendToMaster(botAI, "T_BEGIN\t" + std::to_string(creature->GetEntry()) + "\t" +
+                                             CoaAltAddon::Field(creature->GetName()));
+    else if (!addon)
+        TellHeader(creature);
 
     Trainer::Trainer* trainer = TrainerOf(creature, bot);
     if (!trainer)
@@ -120,6 +185,9 @@ void TrainerAction::Iterate(Creature* creature, bool learnSpells, uint32 spellId
 
     float reputationDiscount = bot->GetReputationPriceDiscount(creature);
     uint32 totalCost = 0;
+    uint32 count = 0;
+    uint32 spent = 0;
+    uint32 learnedCount = 0;
 
     for (auto& spell : trainer->GetSpells())
     {
@@ -144,9 +212,30 @@ void TrainerAction::Iterate(Creature* creature, bool learnSpells, uint32 spellId
 
         uint32 cost = static_cast<uint32>(floor(trainerSpell->MoneyCost * reputationDiscount));
         totalCost += cost;
+        ++count;
 
         std::ostringstream out;
         out << chat->FormatSpell(spellInfo) << chat->formatMoney(cost);
+
+        if (addon)
+        {
+            std::string const name = spellInfo->SpellName[LOCALE_enUS] ? spellInfo->SpellName[LOCALE_enUS] : "";
+            if (learnSpells)
+            {
+                bool const learned = Learn(spellInfo, cost, out);
+                if (learned)
+                {
+                    spent += cost;
+                    ++learnedCount;
+                }
+                CoaAltAddon::SendToMaster(botAI, "L\t" + std::to_string(spellInfo->Id) + "\t" +
+                                                     (learned ? "ok" : "too_expensive"));
+            }
+            else
+                CoaAltAddon::SendToMaster(botAI, "T\t" + std::to_string(spellInfo->Id) + "\t" + std::to_string(cost) +
+                                                     "\t" + CoaAltAddon::Field(name));
+            continue;
+        }
 
         if (learnSpells)
             Learn(spellInfo, cost, out);
@@ -154,17 +243,31 @@ void TrainerAction::Iterate(Creature* creature, bool learnSpells, uint32 spellId
         botAI->TellMaster(out);
     }
 
-    TellFooter(totalCost);
+    if (!addon)
+    {
+        TellFooter(totalCost);
+        return;
+    }
+
+    if (learnSpells)
+    {
+        CoaAltAddon::SendToMaster(botAI, "L_END\t" + std::to_string(learnedCount) + "\t" + std::to_string(spent));
+        Iterate(creature, false, 0, true);
+        return;
+    }
+
+    CoaAltAddon::SendToMaster(botAI, "T_END\t" + std::to_string(count) + "\t" + std::to_string(totalCost) + "\t" +
+                                         std::to_string(bot->GetMoney()));
 }
 
-void TrainerAction::Learn(SpellInfo const* spellInfo, uint32 cost, std::ostringstream& out)
+bool TrainerAction::Learn(SpellInfo const* spellInfo, uint32 cost, std::ostringstream& out)
 {
     if (!botAI->HasCheat(BotCheatMask::gold))
     {
         if (AI_VALUE2(uint32, "free money for", (uint32)NeedMoneyFor::spells) < cost)
         {
             out << " - too expensive";
-            return;
+            return false;
         }
 
         bot->ModifyMoney(-static_cast<int32>(cost));
@@ -176,6 +279,7 @@ void TrainerAction::Learn(SpellInfo const* spellInfo, uint32 cost, std::ostrings
         bot->learnSpell(spellInfo->Id, false);
 
     out << " - learned";
+    return true;
 }
 
 void TrainerAction::TellHeader(Creature* creature)
@@ -321,6 +425,13 @@ bool BisGearAction::RunAutogearFallback(uint16 effectiveIlvl)
 
 bool BisGearAction::Execute(Event event)
 {
+    CoaWorld::StartGearScope const startGear;  // CoA World 3.3: the auto-gear's pieces are "start" in coa_item_origin
+    if (PlayerbotFactory::SelfFoundAt(bot->GetLevel()) || PlayerbotFactory::IsSelfFoundBot(bot))
+    {
+        botAI->TellError("Self-found realm: I only wear what I find, loot or am given.");
+        return false;
+    }
+
     if (!sPlayerbotAIConfig.autoGearBisCommand)
     {
         botAI->TellError(PlayerbotTextMgr::instance().GetBotTextOrDefault(
@@ -479,6 +590,7 @@ bool BisGearAction::Execute(Event event)
     // 3. Apply BiS: only touch slots where the bot can actually equip the BiS item.
     //    If item requires reputation, grant the required rank first. If CanUseItem still
     //    fails (class/race/skill/level), keep autogear's pick for that slot.
+    StatsWeightCalculator bisCalculator(bot);
     for (auto const& kv : bisMap)
     {
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(kv.second);
@@ -530,7 +642,8 @@ bool BisGearAction::Execute(Event event)
 
         if (eqResult == EQUIP_ERR_OK)
         {
-            bot->EquipNewItem(dest, kv.second, true);
+            if (Item* equipped = bot->EquipNewItem(dest, kv.second, true))
+                PlayerbotFactory::SetRandomProperty(bot, equipped, bisCalculator.PickBestRandomPropertyId(kv.second));
             bot->AutoUnequipOffhandIfNeed();
         }
     }
@@ -578,6 +691,12 @@ static uint32 GetWornItemLevelAverage(Player* player)
 
 bool AutoGearAction::Execute(Event event)
 {
+    if (PlayerbotFactory::SelfFoundAt(bot->GetLevel()) || PlayerbotFactory::IsSelfFoundBot(bot))
+    {
+        botAI->TellError("Self-found realm: I only wear what I find, loot or am given.");
+        return false;
+    }
+
     if (!sPlayerbotAIConfig.autoGearCommand)
     {
         botAI->TellError(PlayerbotTextMgr::instance().GetBotTextOrDefault(
@@ -586,7 +705,8 @@ bool AutoGearAction::Execute(Event event)
     }
 
     if (!sPlayerbotAIConfig.autoGearCommandAltBots &&
-        !sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()))
+        (!sPlayerbotAIConfig.IsInRandomAccountList(bot->GetSession()->GetAccountId()) ||
+         !PlayerbotFactory::MayGearItself(bot)))
     {
         botAI->TellError(PlayerbotTextMgr::instance().GetBotTextOrDefault("autogear_altbot_refused_error",
                                                                           "You cannot use autogear on alt bots.", {}));

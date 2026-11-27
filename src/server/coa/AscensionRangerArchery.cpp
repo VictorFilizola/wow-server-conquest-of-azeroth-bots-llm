@@ -1,4 +1,6 @@
 /* Copyright (C) 2016+ AzerothCore, GNU AGPL v3. */
+#include "AscensionClientSpellPatches.h"
+#include "DBCStores.h"
 #include "Log.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -11,6 +13,10 @@
 #include "SpellScriptLoader.h"
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <utility>
 
 namespace
 {
@@ -40,6 +46,10 @@ enum RangerArcheryChains : uint32
 };
 
 constexpr uint32 RANGER_FAMILY = 27;
+constexpr uint32 SPELL_RANGE_HUNTER_30YD = 113;
+constexpr uint32 SPELL_QUICK_SHOT_RANK_1 = 500074;
+constexpr uint32 SPELL_QUICK_SHOT_RANK_2 = 572727;
+constexpr uint32 SPELL_QUICK_SHOT_RANK_7 = 572732;
 constexpr uint32 PRECISION_SHOT_FLAG = 8388608;
 constexpr uint32 BRUTAL_SHOT_FLAG = 128;
 constexpr int32 PIERCED_LINGERING_PCT = 35;
@@ -59,17 +69,62 @@ bool IsRangerSpell(SpellInfo const* info)
     return info && info->SpellFamilyName == RANGER_FAMILY;
 }
 
+bool IsQuickShot(uint32 id)
+{
+    return id == SPELL_QUICK_SHOT_RANK_1 || (id >= SPELL_QUICK_SHOT_RANK_2 && id <= SPELL_QUICK_SHOT_RANK_7);
+}
+
 bool IsPiercingShot(SpellInfo const* info)
 {
     uint32 chain = sSpellMgr->GetFirstSpellInChain(info->Id);
     return IsRangerSpell(info) && (chain == CHAIN_SKULLPIERCER || chain == CHAIN_PRECISION_SHOT);
 }
 
+bool HasDirectDamageEffect(SpellInfo const* info)
+{
+    if (!info)
+        return false;
+    for (SpellEffectInfo const& effect : info->Effects)
+        switch (effect.Effect)
+        {
+            case SPELL_EFFECT_SCHOOL_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE:
+            case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL:
+            case SPELL_EFFECT_WEAPON_PERCENT_DAMAGE:
+            case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+                return true;
+            default:
+                break;
+        }
+    return false;
+}
+
+bool IsIncendiarySpenderInfo(SpellInfo const* info)
+{
+    return IsRangerSpell(info) && info->CasterAuraSpell == SPELL_ADVANTAGE &&
+        sSpellMgr->GetFirstSpellInChain(info->Id) != SPELL_INCENDIARY_SHOT &&
+        HasDirectDamageEffect(info);
+}
+
 bool IsIncendiarySpender(Spell const* spell)
 {
-    SpellInfo const* info = spell->GetSpellInfo();
-    return !spell->IsTriggered() && IsRangerSpell(info) && info->CasterAuraSpell == SPELL_ADVANTAGE &&
-        sSpellMgr->GetFirstSpellInChain(info->Id) != SPELL_INCENDIARY_SHOT;
+    return !spell->IsTriggered() && IsIncendiarySpenderInfo(spell->GetSpellInfo());
+}
+
+Spell* ResolveIncendiarySpender(Player* player, Spell* spell, Unit* target)
+{
+    if (IsIncendiarySpender(spell))
+        return spell;
+    if (!spell->IsTriggered() || target->IsAlive())
+        return nullptr;
+    Spell* parent = player->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+    if (!parent || parent == spell || !IsIncendiarySpender(parent))
+        return nullptr;
+    uint32 const id = spell->GetSpellInfo()->Id;
+    for (SpellEffectInfo const& effect : parent->GetSpellInfo()->Effects)
+        if (effect.TriggerSpell == id)
+            return parent;
+    return nullptr;
 }
 
 void ApplyPierced(Player* player, Unit* target, uint32 damage)
@@ -78,6 +133,28 @@ void ApplyPierced(Player* player, Unit* target, uint32 damage)
         return;
     int32 dealt = int32(std::min<uint64>(damage, uint64(std::numeric_limits<int32>::max())));
     player->CastCustomSpell(SPELL_PIERCED_BLEED, SPELLVALUE_BASE_POINT0, dealt, target, TRIGGERED_FULL_MASK);
+}
+
+std::mutex landedDamageLock;
+std::map<std::tuple<ObjectGuid, ObjectGuid, uint32>, uint32> landedDamage;
+
+void RememberLandedDamage(Unit* attacker, Unit* target, uint32 spellId, uint32 damage)
+{
+    std::lock_guard<std::mutex> lock(landedDamageLock);
+    if (landedDamage.size() > 4096)
+        landedDamage.clear();
+    landedDamage[{attacker->GetGUID(), target->GetGUID(), spellId}] = damage;
+}
+
+uint32 TakeLandedDamage(Unit* attacker, Unit* target, uint32 spellId)
+{
+    std::lock_guard<std::mutex> lock(landedDamageLock);
+    auto itr = landedDamage.find({attacker->GetGUID(), target->GetGUID(), spellId});
+    if (itr == landedDamage.end())
+        return 0;
+    uint32 damage = itr->second;
+    landedDamage.erase(itr);
+    return damage;
 }
 
 void TriggerIncendiaryExplosion(Spell* spell, Player* player, Unit* target, uint32 damage)
@@ -92,7 +169,8 @@ void TriggerIncendiaryExplosion(Spell* spell, Player* player, Unit* target, uint
 
     spell->SetScriptValue(SPELL_INCENDIARY_ARROWS, 1);
     SpellCastTargets targets;
-    targets.SetUnitTarget(target);
+    if (target->IsAlive())
+        targets.SetUnitTarget(target);
     targets.SetDst(target->GetPosition());
     CustomSpellValues values;
     values.AddSpellMod(SPELLVALUE_BASE_POINT0, ClampedPct(damage, share->GetAmount()));
@@ -165,13 +243,44 @@ public:
     void OnSpellHitResult(Spell* spell, Unit* target, uint8 miss, uint32 damage, uint32, bool critical) override
     {
         Player* player = spell->GetCaster()->ToPlayer();
-        if (!player || player->getClass() != CLASS_RANGER || miss != SPELL_MISS_NONE || !damage || !target ||
-            target == player || !target->IsAlive() || !IsRangerSpell(spell->GetSpellInfo()))
+        SpellInfo const* info = spell->GetSpellInfo();
+        if (!player || player->getClass() != CLASS_RANGER || miss != SPELL_MISS_NONE || !target ||
+            !IsRangerSpell(info))
             return;
-        if (critical && IsPiercingShot(spell->GetSpellInfo()))
+
+        Spell* spender = target != player ? ResolveIncendiarySpender(player, spell, target) : nullptr;
+        bool const piercing = IsPiercingShot(info);
+        if (spender == spell || piercing)
+        {
+            uint32 const remembered = TakeLandedDamage(player, target, info->Id);
+            if (!damage)
+                damage = remembered;
+        }
+        if (!damage)
+            return;
+
+        if (spender)
+            TriggerIncendiaryExplosion(spender, player, target, damage);
+        if (target == player || !target->IsAlive())
+            return;
+        if (critical && piercing)
             ApplyPierced(player, target, damage);
-        if (IsIncendiarySpender(spell))
-            TriggerIncendiaryExplosion(spell, player, target, damage);
+    }
+};
+
+class ranger_archery_damage : public UnitScript
+{
+public:
+    ranger_archery_damage() : UnitScript("ranger_archery_damage", true,
+        {UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN}) { }
+
+    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo) override
+    {
+        Player* player = attacker ? attacker->ToPlayer() : nullptr;
+        if (!player || player->getClass() != CLASS_RANGER || !target || !spellInfo || damage <= 0 ||
+            (!IsIncendiarySpenderInfo(spellInfo) && !IsPiercingShot(spellInfo)))
+            return;
+        RememberLandedDamage(player, target, spellInfo->Id, uint32(damage));
     }
 };
 
@@ -258,6 +367,17 @@ void ApplySkirmishCriticalStrikeScope(SpellInfo* info)
         LOG_ERROR("coa", "Skipped unexpected Skirmish critical strike record {}", info->Id);
 }
 
+void ApplyQuickShotRange(SpellInfo* info)
+{
+    if (!IsRangerSpell(info) || !IsQuickShot(info->Id))
+        return;
+    if (SpellRangeEntry const* range = sSpellRangeStore.LookupEntry(SPELL_RANGE_HUNTER_30YD))
+    {
+        info->RangeEntry = range;
+        Ascension::ClientSpellPatches::Instance().Register(info->Id);
+    }
+}
+
 class ranger_archery_contracts : public GlobalScript
 {
 public:
@@ -272,6 +392,7 @@ public:
         ApplyIncendiaryArrowsCharges(info);
         ApplyBrutalShotAttributes(info);
         ApplySkirmishCriticalStrikeScope(info);
+        ApplyQuickShotRange(info);
     }
 };
 }
@@ -281,5 +402,6 @@ void AddSC_AscensionRangerArchery()
     RegisterSpellScript(aura_ascension_ranger_pierced_bleed);
     RegisterSpellScript(aura_ascension_ranger_hawkeye);
     new ranger_archery_hits();
+    new ranger_archery_damage();
     new ranger_archery_contracts();
 }

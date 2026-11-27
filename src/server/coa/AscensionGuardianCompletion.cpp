@@ -301,10 +301,18 @@ void AscensionGuardian::ApplyContracts(SpellInfo* info)
     }
     if (id == 803721)
         info->Effects[EFFECT_1].BasePoints = 1;
+    if (id == 804723)
+        info->AttributesEx2 |= SPELL_ATTR2_IGNORE_LINE_OF_SIGHT;
+    if (id == 704159 || id == 707701)
+        info->PreventionType = SPELL_PREVENTION_TYPE_PACIFY;
+    if (id == 500266 && info->Effects[EFFECT_0].ApplyAuraName == SPELL_AURA_PERIODIC_TRIGGER_SPELL)
+        info->Effects[EFFECT_0].BasePoints = 0;
     if (id == 803524)
         info->Effects[EFFECT_1].Effect = 0;
     if (id == 504145 && !info->ProcFlags)
         info->ProcCharges = 1;
+    if (id == 802873)
+        info->Effects[EFFECT_0].Effect = 0;
     if (id == 802874)
     {
         info->AttributesCu |= SPELL_ATTR0_CU_IGNORE_ARMOR;
@@ -322,6 +330,7 @@ void AscensionGuardian::ApplyContracts(SpellInfo* info)
 
 void AddAscensionGuardianCompletionScripts()
 {
+    Ascension::ClientSpellPatches::Instance().Register(500266);
     Ascension::ClientSpellPatches::Instance().Register(500673);
     new guardian_scaling();
     RegisterSpellScript(aura_ascension_guardian_lifecycle);

@@ -1,5 +1,320 @@
 # CoA Bots — changelog
 
+## v2.9.4 (6 November 2026)
+
+- **Player main tank and bot off-tanks** (SquidBots Lite Main Tank bar, or whispered): `tank main on|off|status` makes
+  you the main tank of your bots: the bot tanks no longer take back what is on you (until you fall below
+  `AiPlayerbot.PlayerMainTankRescueHealth`, new, 10 %, or die) and no longer pull for you. `tank target` gives a bot
+  tank your current target and marks it with a raid icon (square, triangle, diamond, cross, star, circle); when it dies
+  the bot helps you on your target. `tank taunt`, `tank swap` (take your target and taunt it) and `tank swap back` (give
+  it back: the bot leaves it to your taunt), `tank hold` (stand where you are and tank there), `tank clear`,
+  `tank status [all]` and `tank spec tank|dps` (out of combat). Random bots of your group take these orders too.
+- **SquidBots Lite answers faster**: an alt tells the addon when it comes online or goes offline (its list updates at
+  once), the bag and bank lists end with an `Items: N` line, a list asked again within 2 seconds is no longer cut
+  short, and a command from you wakes the bot at once instead of waiting up to 18 seconds while it eats or drinks.
+- **Tinker bots no longer build the Firepot Drone in dungeons and raids**: the flying bomb went through walls and floors
+  after its target and pulled whole rooms (a Shadowfang Keep wipe of 38 on the bench).
+- **Dispels and interrupts that land**: bots no longer try to dispel or interrupt while mounted, only cleanse a member
+  within the spell's own range and in sight (another dispeller takes the rest), healers dispel right after their
+  critical heals, cleanses around the caster (Holy Supernova Cleanse) are used for nearby members, and an interrupt is
+  no longer kept for dangerous casts only in raids (5-player dungeons keep that reserve).
+- **Bouncing damage is interrupted first**: a cast whose damage jumps to three targets or more (Holy Wrath at Venoxis
+  in Zul'Gurub, which killed several bots at full health at once) now counts as dangerous, like a heal or crowd control:
+  bots save an interrupt for it and take it before ordinary casts.
+- **Interrupts are kept for dangerous raid bosses**: in a raid, bots no longer interrupt the ordinary casts of an
+  enemy known for dangerous ones (one of its spells is, or that kind of enemy already cast one since the server
+  started); every interrupt is kept for its dangerous casts. At Venoxis the kicks went to Holy Nova and Holy Fire
+  and none was left for Holy Wrath. The rest of the raid still interrupts freely, and dungeons are unchanged.
+- **Trades are answered**: an alt that puts on an item you just traded it now says so ("Equipping [item]"), even with
+  `AiPlayerbot.CoaTellEquipUpgrades` at 0, which keeps loot and regear upgrades silent.
+- **"I don't have the necessary skill"**: bots no longer want, roll need on or try to wear a weapon or armor whose skill
+  they do not have (a mace for a bot without the Maces skill): the item is left for those who can use it.
+- **Raid roles by size**: a raid built with bots (`.playerbots coa raid`, the SquidBots Lite Raid buttons) now asks by
+  default for 2 tanks and 3 healers from 11 to 20 players (Raid 15 had 1 tank and 2 healers), and 2 tanks and 4
+  healers from 21 to 25 (was 3 and 6). 10 and under, and past 25, are unchanged. Tanks and healers you give stay
+  yours: `.playerbots coa raid 25 3 6` keeps the old mix.
+- **Quest givers with many quests**: bots no longer pass by a quest giver whose quest list is long overall but short
+  for them (Gornek and the class quests): the list is counted for the bot, as the game shows it.
+- **Alts with only flying mounts ride along**: when the player rides a ground mount, an alt that only owns flying mounts
+  now takes one that can also run on the ground, instead of walking.
+- **Option to keep the random bots of a Dungeon Finder group** (AiPlayerbot.LfgKeepRandomBots, off by default): when
+  you leave the dungeon alive, they stay in your group and follow you out, so you can queue the same group again.
+
+## v2.9.3 (5 November 2026)
+
+- **Random bots mount with you**: on a mount that can also fly (most Conquest of Azeroth mounts), the random bots of your
+  group stayed on foot where nobody can fly, while your alts rode along; they now take their ground mount there.
+- **Suffixes of the bots' gear**: the suffix chosen for a bot weighs stamina for every role (and defense, dodge and parry
+  for a tank) instead of the most damage or healing, so bots no longer wear "glass cannon" gear; among suffixes as good
+  for the role, each bot picks its own. `AiPlayerbot.GearRollRandomSuffix = 2` rolls the suffix like a looted item for
+  every bot, alts included (0 and 1 unchanged). Items a bot gets directly (starter kit, quest items) roll a suffix as
+  a player's would, and the BiS command gives the best suffix for the spec.
+- **Whole sets for the bots' look**: a random bot with a transmog shows one whole item set on its armor slots (all
+  eight pieces), never mixed pieces: an armor set of its type, or one of the cosmetic sets (such as the ones sold by
+  Tiraxis) once it has the set's level, for `AiPlayerbot.RandomBotTransmogCosmeticSets` percent of them (new, 50). Only
+  the look changes: the real gear and its stats stay.
+- **Gear above the bot's level**: a random bot brought down in level no longer keeps equipped items it could not wear
+  at its new level (a level 38 hat on a level 13 bot): they are taken off at login and when the bot is randomized.
+  Alts are never touched.
+- **Raid of 15 (Manastorm)**: a raid of 15 built with bots asks by default for 1 tank and 2 healers (other sizes
+  unchanged), and the player counts as the role chosen in the group when there is one: a tank or a healer player is one
+  less to recruit.
+- **Leaving a dungeon with your bots**: when you leave a dungeon or a raid alive (Dungeon Finder Leave, teleport,
+  hearthstone, exit portal), the bots of your group still inside join you 2 to 3 seconds later; random bots of a
+  Dungeon Finder group leave the group and the instance instead. Not after a death (corpse run), not in battlegrounds
+  or arenas, and not for bots on a mission.
+  After the Dungeon Finder Leave, your alts also leave the Dungeon Finder group and join your group again (you lead it,
+  as before the queue), instead of standing next to you outside your group; the Dungeon Finder's Leave button only
+  teleports you out, so this happens when you leave the Dungeon Finder group itself.
+- **Server start**: a slow or busy PC no longer gets a false "world stopped during startup": the start waits for the
+  worldserver as long as its supervisor runs (up to 5 minutes), and says which of the two happened when it gives up.
+- **Call Boards and mission boards for alts**: at a board of more than 32 quests, an alt now takes the quests of that
+  board its player has in the quest log or handed in today (dailies) or this week (weeklies), and hands in the ones it
+  completed (25 at most per visit), without the quest menu that crashed the server; a daily the alt already did is
+  refused as usual. Random bots still leave these boards alone; other quest givers are unchanged.
+- **`alt take <quest>`** also accepts a plain quest id (the SquidBots Lite popup "your alts take this quest too?"), works
+  at Call Boards, and answers `too_far` when the quest giver is out of the alt's reach and you do not have the quest.
+
+## v2.9.2 (4 November 2026)
+
+- **Gear of grouped bots**: `AiPlayerbot.RandomGearScoreLimit` caps random bots out in the world only; a bot grouped
+  under a player in a dungeon or a raid follows the player's item level again, above the cap.
+- **Talents of low-level bots**: a random bot of a Conquest of Azeroth class brought back below level 10 no longer
+  keeps its talent tree; its talents go back down to what its level allows, and it starts spending again from level 10.
+- **Scripted chests and portals**: bots now go through the same server rules as players when they loot or use a game
+  object, so the High Risk chest and the Fel Commutation portal can no longer be bypassed by bots.
+- **Mounts of alts below level 20**: an alt that knows a mount now mounts with its mounted player below level 20, as
+  Conquest of Azeroth allows; random bots, and alts whose player is on foot, keep `AiPlayerbot.UseGroundMountAtMinLevel`.
+- **Alts stay near their player to loot**: an alt only loots or gathers within `AiPlayerbot.AltLootMasterDistance`
+  (new, 30 yards) of its player, drops a target its player has left behind instead of going back to it after a
+  regroup, and loots nothing while its player is on a ship, a zeppelin or a flight path. Random bots and alts on a
+  mission are not affected.
+
+## v2.9.1 (2 November 2026)
+
+- **Core**: latest public CoA core of 2 November (more than 100 fixes): Cultist Entropic Slam costs 60 Insanity again
+  (bots follow the real cost), High Risk from level 15, soulbound items refused by the Realm Bank, account-wide
+  reputation, Reaper, Ranger Flank (from behind), Tinker Blast Mine and Stim, Runemaster engravings.
+- **High Risk at level 15**: random bots of the High Risk share (`AiPlayerbot.CoaRulesetForBots`) stay in PvE until
+  level 15 and change ruleset through the core, as a player does (checks, PvP flag, mercenaries, level scaling; a High
+  Risk the core suspended in a battle is left to the core).
+- **Damage of the bots per class** (`CoaBotDamageByClass` / `BySpec`): neutral targets (training dummies, yellow
+  monsters) are scaled too; heals never.
+- **Emotes**: with `AiPlayerbot.RandomBotEmote = 1`, bots react to players only (no endless loop between bots).
+- **Random suffixes** (`AiPlayerbot.GearRollRandomSuffix = 1`): random bots out in the world only; a bot grouped under a
+  player keeps the best suffix for its spec.
+- **`.reload config`** reads again `BotActiveAlone`, its duration, the `BotActiveAloneForceWhen*` rules and the smart
+  scale values.
+- **Raids** (experimental): a first strategy for The Prophet Skeram (Temple of Ahn'Qiraj).
+
+## v2.8.3 (30 October 2026)
+
+- **Alts as a team** (with SquidBots Lite 2.8.3): new addon channel `SQBA` (contract in the release notes). Opening a quest
+  at a quest giver sends each alt's state (can take, missing earlier quest of the chain, level, class/race, reputation,
+  skill, done); alts wait for "take" instead of taking the quest on their own while the addon is there.
+- **Quest chain catch-up** (`AiPlayerbot.CatchUpQuestChains = 1`): an alt blocked only by the earlier quests of a chain marks
+  them rewarded (no reward, no item) and can take the quest. Never for level, race, class, reputation or skill.
+- **Quiet alts** (`AiPlayerbot.AltChatToAddon = 1`): with the addon, the repeated quest and trainer whispers go to the addon.
+- **Trainers**: `alt train` / `alt learn` list and learn what an alt can learn at the trainer or Book of Artisans in use.
+- **Team bar and quest objectives** for the addon (TEAM, OBJ messages, on change only).
+- **High Risk missions**: `mission gather ... risk` (`AiPlayerbot.Missions.HighRisk`, `RiskMailEvery`, `RiskMailMinutes`).
+- **Sell junk** (`s junk`): grey items plus white and green gear the bot cannot use or does not need; one summary line
+  instead of one whisper per item for every batch sale.
+- **Stale targets**: unit values keep the GUID and find the unit again on the bot's map at every read (a despawned
+  creature or a player who logged out crashed AttackAction through a freed pointer).
+- **Guild bank deposits on by default** (`AiPlayerbot.GuildBankDeposit.Enable = 1`), items `ore,herb,leather,cloth,boe`;
+  new category `boe`: bind-on-equip gear, green or better, the bot can never wear.
+- **Five deaths**: a bot that died five times rises at the spirit healer instead of on its corpse next to the same mobs.
+- **Raids**: Molten Core Gehennas (bots leave his Flame Orb cast), Zul'Gurub Hakkar positioning and Blood Siphon.
+
+## v2.8.2
+
+- **Random bot transmog**: half of the random bots (`AiPlayerbot.RandomBotTransmogPercent = 50`) now show other
+  models of their armor and weapon types, a whole item set when one fits their level, from level 10
+  (`RandomBotTransmogMinLevel`). Purely visual: their real gear and stats never change and nothing is saved; a bot keeps
+  its look at every login. Not used on alt bots or self-found levels. `AiPlayerbot.RandomBotTransmog = 0` turns it off.
+- **Duels in front of Orgrimmar and Stormwind**: a few random bots now duel outside the main gates, Horde bots at
+  Orgrimmar and Alliance bots at Stormwind, in pairs of close levels (by default two pairs near level 60 and one near
+  level 30), and are replaced by other bots every 20 minutes. On by default; `AiPlayerbot.CityDuels.Enable = 0` turns
+  it off, `AiPlayerbot.CityDuels.*` sets the number of bots, their levels and the places. Bots of a player's group
+  are never taken, and no duel starts while a player of the other faction is near.
+- **Gathering missions for your alts**: whisper `mission gather [minutes] [mining|herbalism]` to one of your own
+  characters played as a bot. It leaves the group, gathers ore or herbs in a zone of its level on its continent, and
+  mails you what it gathered when the time is up, its bags are full or you whisper `mission stop` (`mission status`
+  answers `MISSION;state;zone;minutes left;items;profession;deaths`). The mission resumes when the alt logs in again,
+  even after a server restart. Never for random bots, no selling during a mission. Settings: `AiPlayerbot.Missions.*`.
+- **Automatic guild bank deposits** (off by default, `AiPlayerbot.GuildBankDeposit.Enable = 1`): a bot in the guild of
+  a real player (your alts, the bots you invited) that stands near a guild vault deposits its trade goods (ore, herbs,
+  leather, cloth...; `GuildBankDeposit.Items` sets the classes) and its gold above `KeepGold` (100 by default), with
+  no command. It needs the deposit right of its rank on the tab (`GuildBankDeposit.Tab`, else the first allowed one)
+  and room in it; bound, quest and equipped items are never moved. Never in random bot guilds, never during a mission.
+
+## v2.8.1 — Latest CoA core, classic dungeon bosses, battleground fixes (October 2026)
+
+### Highlights
+- **Latest CoA core**: 284 new commits from the public CoA core since 2.8 (full list in the GitHub release notes).
+- **Boss mechanics for the classic dungeons**: bots now handle the bosses of Wailing Caverns, Razorfen Kraul, Razorfen
+  Downs, Blackfathom Deeps, Scarlet Monastery, Uldaman, Blackrock Depths, Blackrock Spire, Stratholme, Scholomance and
+  Maraudon. Thanks to Brytenwally (#45).
+- **Molten Core is back on Heroic, Mythic and Ascended** for servers whose database was created before 11 October.
+- **Self-found bots (optional, off by default)**: with `AiPlayerbot.CoaSelfFound = 1`, bots wear only what they loot,
+  earn from quests or are traded, and random bots level only by playing, up to level 59 by default
+  (`CoaSelfFoundMaxLevel`); at 60 bots are geared as usual for endgame. Existing levels and gear are kept.
+
+### Latest CoA core
+2.8.1 includes 284 new commits of the public CoA core since 2.8, among them:
+- creature magic resistance and the new open-world creature damage, on by default;
+- PvE Power and PvP Power, on by default;
+- cross-faction battleground queues (mod-cfbg), on by default;
+- Road to De Other Side (map 937) restored;
+- name filter for profanity;
+- account-wide friends, opt-in;
+- Wisdomball dungeon quest fixes;
+- gathering nodes moved to their Ascension positions;
+- large batches of dungeon, item, quest and class fixes;
+- many quest and database fixes.
+
+### Fixes
+- **"Loot only" bots**: with "Your own bots can gear themselves" off in the launcher, the bots in your group no longer
+  gear themselves at all (level up, `.levelup`, specialization changes, `autogear`): they wear what they loot, earn from
+  quests or get from you. With it on, "Best gear quality of the bots" now also caps the gear they put on at level up.
+- **Molten Core** was empty on Heroic, Mythic and Ascended on databases created before 11 October: its spawn masks are
+  restored.
+- **Battlegrounds**: safety nets against world server crashes (battleground objects and creatures looked up within
+  bounds, end of battleground scores guarded), and the bots' battleground tactics only run on the battleground's own
+  map. Thanks to nightlund (#52).
+- Manastorm: the Horde teleport pad fixed in 2.8 stays in place.
+
+### Bots
+- **Bloodmage Eternal** tanks enter their form, keep Hypovolemic Shock up on packs and no longer cast Sanguine Rupture
+  (#38, #51).
+- **Classic dungeons**: boss mechanics for Wailing Caverns, Razorfen Kraul, Razorfen Downs, Blackfathom Deeps, Scarlet
+  Monastery, Uldaman, Blackrock Depths, Blackrock Spire, Stratholme, Scholomance and Maraudon. Thanks to Brytenwally (#45).
+- **Road to De Other Side**: boss strategy for the bots. Thanks to steviecraycray (#49).
+- Custom race exclusions now also apply to existing random bots, not only to new ones. Thanks to Corfirean (#54).
+- Wildcard Hero bot files carry the GPL header. Thanks to shiro2448 (#48).
+
+### Dungeon Clear 2.8.1
+- Blackrock Depths, Lyceum: after a fight pulls the tank away, it returns to the brazier so the torch can be lit.
+- Stratholme: the Slaughterhouse event no longer ends early when Ramstein opens the gate; the group waits for the
+  portcullis during the Barthilas fight instead of stopping.
+- Shadowfang Keep: if the courtyard door closes behind the group while Rethilgore is still alive, it is opened again.
+- Bots that fall behind between pulls are brought back to the tank after 25 s instead of 60 s, so Heroic and Mythic runs
+  are about 10 minutes faster (bots only, never players).
+- New setting: `DungeonClear.StrandedRecoveryWaitSecs = 25` (capped by `DungeonClear.StrandedRecoveryNoProgressSecs`).
+
+### Launcher 0.3.48
+- On a new install, the navigation maps can be downloaded instead of generated.
+
+### Known limits
+- Dungeon Clear: Blackfathom Deeps (two bosses) and the Scarlet Cathedral (Whitemane does not resurrect Mograine) can
+  still get stuck. Heroic and Mythic mostly depend on bot gear.
+- Dungeon Clear: a Heroic or Mythic clear still running at the daily instance reset (04:00 server time) gets stuck. Type
+  `.dc off`, then start a new clear.
+- If bots stay behind during a clear, the Regroup button teleports them back.
+
+## v2.8 — A smoother server with many bots, Dungeon Clear, realm cards (October 2026)
+
+### Highlights
+- **Much smoother server with many bots.** A hidden database wait in the Recruit-a-Friend reward check froze every map thread
+  for 2-7 s every minute (and up to 35 s under load). It is now asynchronous and skipped for bots. On our test machine, with
+  the same load (9 heavy dungeon runs + benches): spikes over 2 s went from 24 per hour to 1 per hour, worst p99 tick from
+  32.7 s to 0.14 s. The same machine now handles **75 simultaneous bot dungeon runs** without a single spike over 1 s
+  (it collapsed at 9 before).
+- **New optional module: Dungeon Clear.** Your bot group can clear a dungeon on its own, boss after boss, in Normal, Heroic
+  and Mythic 0. Start it from the SquidBots Lite addon (Dungeon button) or with `.dc on` inside a dungeon. It only acts on
+  groups that started it. On by default on the CoA realm; switch it off in the launcher (Modules). Not available on Wildcard and Reborn yet.
+- **Realm cards like Ascension**: each realm shows its own background, title and description in the realm list
+  (Vol'jin for CoA, Darkmoon for Wildcard, Bronzebeard - Warcraft Reborn).
+
+### Performance (no gameplay change)
+- Recruit-a-Friend reward check no longer blocks the map threads (see above).
+- Destiny Weaver no longer rebuilds strings or re-reads its config on every creature update; config is read once and on
+  `.reload config`.
+- Tinker scripts no longer allocate their state on every player update.
+- The server no longer builds party stats and aura updates for bots that have no game client.
+- Bots no longer store achievement progress. The launcher removes the old bot rows once after updating (backup first; on our
+  test server: 11.7 million rows, 757 MB). You can run it again from Settings > Backups.
+
+### Stability
+- Fixed a world server crash when a bot was flagged "in battleground" while its battleground was already gone.
+- Includes the latest core fixes from upstream, among them three world server crashes found in production dumps.
+- Random Heroic / Mythic dungeon queues no longer turn grey after changing map (the server sends the released difficulties
+  again on every map change, not only at login).
+
+### Bots
+- Random level-60 bots get fewer downgraded items: `AiPlayerbot.RandomGearLoweringChance` default 0.3 → 0.1 (existing
+  configs keep their value).
+- Bots set to "stay" when their master released his spirit follow again as soon as the master is alive.
+- Tinker Invention no longer loops on Mana Module; Mechano-Bear is no longer rebuilt while it is alive.
+- Less noise in the playerbots log ("No spellid").
+- Magtheridon: channeler kill order kept; timers no longer re-run every tick while caged.
+- Maiden of Virtue: tanks reach a stunned healer up to 23 yd away.
+- Offensive healers stop mana-costing attacks below 25 % mana in raids.
+- Tanks no longer taunt enemies immune to taunt.
+- Thanks to ladiabale for the detailed raid reports.
+
+### Auction house
+- The buyer bot can settle a bid at once: the sale ends and the gold arrives by mail right away instead of 12-48 h later
+  (`AuctionHouseBot.Buyer.InstantBids`, on in the CoA Bots config).
+- Launcher: buyer and auction house size settings (buyer on/off, pace, price paid, CoA prices, per-seller cap, instant
+  payment, size), applied live when the server runs.
+
+### Launcher 0.3.45
+- Dungeon Clear card in Modules and per realm; realm cards; achievement clean-up; auction house settings.
+- Stop button for a single service, "Like Rexxar" card, and a "What's new" window.
+
+### SquidBots Lite 2.8
+- The Dungeon button opens the Dungeon Clear panel (also `/sbl dc`): run state, On / Off / Pause / Skip, pull mode, and the boss list with a Go button.
+
+### Known limits
+- Dungeon Clear: Blackfathom Deeps (two bosses) and Sunken Temple (Shade of Eranikus) are not yet cleared reliably in
+  Normal. Heroic and Mythic mostly depend on bot gear.
+- If bots stay behind during a clear, the Regroup button teleports them back.
+
+## v2.7 — Smarter bots in raids, Reborn bots with mystic enchants (October 2026)
+
+Many of these fixes come from the raid and dungeon reports of ladiabale and Yeh: thank you both.
+
+### All realms
+- Melee bots: Auto Attack no longer blocks the rotation (CoA melee specializations gain 30 to 55 % damage).
+- Healers follow the tank who is taking the hits and stop dealing damage while a tank is below 60 % health; in raids
+  they no longer run back and forth between their raid spot and the tank.
+- A dead main tank is no longer kept as main tank; `coa raid` sets the tank marker. Auto pull is off in raids and on
+  bosses.
+- Ground effects: bots step out of them, no longer stand in lava, and in Zul'Gurub reach their target from a spot
+  outside them.
+- Raids: Magtheridon's cubes, Karazhan (Maiden, Illhoof, Nightbane, Enfeeble, one encounter reset when leaving
+  combat), Gruul (Shatter, Cave In), Naj'entus (a single bot throws the spine).
+- Tempest Keep: CoA tanks taunt in raids (also in Zul'Aman and Molten Core), even when another tank holds the enemy.
+  Al'ar: Embers are dealt with once pulled out of the group, everyone steps back 20 m, Rebirth is avoided. Void Reaver:
+  orbs dodged in a straight line. Solarian: healers finish their casts, the Wrath carrier uses a defensive. Kael'thas:
+  his weapons are only used when they can be, Pyroblast can be interrupted, mind control is broken with the blade,
+  assigned tanks taunt Sanguinar and Kael'thas, Capernian is taken by a ranged damage dealer when there is no
+  warlock. Healers no longer run back to the tank during Al'ar, Void Reaver and Solarian.
+- Sunwell Plateau, Kalecgos: bots rotate through the spectral realm by Arcane Buffet stacks (never the Kalecgos tank
+  or a bot under Spectral Exhaustion), attack Sathrovarr there, and stay on Kalecgos' flanks away from Tail Lash and
+  Frost Breath.
+- Resurrection: a bot keeps its claim on a body out of sight and no longer teleports while walking to it.
+- A bot far from you also comes back during your fight; an enemy on another floor and out of sight is no longer a
+  target; in arenas a bot goes after a target hidden behind a pillar.
+- An immune boss no longer makes a bot leave combat; zone-only potions are no longer tried everywhere; low-level bots
+  no longer wear abnormally armored necklaces; group buffs are no longer held back by threat.
+- Crash fixed: a quest giver despawning while a bot looked for it crashed the map.
+- New settings: `AiPlayerbot.CoaReleaseDelay` (120), `AiPlayerbot.CoaWcrMysticEnchants` (1),
+  `AiPlayerbot.CoaGroupTelemetryRaids` (0), `AiPlayerbot.CoaLogTargets` (0).
+
+### Conquest of Azeroth
+- CoA rotations cleaned (Witch Hunter, Healing Ward / Spiritual Recall, Pyromancer healer, Destructo-Bot) and raid
+  rotations corrected from real raid logs (51 dead lines removed, 26 corrected, 16 dropped).
+
+### Warcraft Reborn
+- Mystic enchants: each specialization gets its own set (1 legendary, 5 epic, 10 rare), applied as the bot levels up
+  and when it changes specialization (+20 % damage on our bench).
+- Reborn tanks now tank: they take their threat stance (Defensive Stance, Righteous Fury) and taunt; warriors use
+  Shield Block, Revenge and Shield Wall, Protection paladins keep Holy Shield up, Blood death knights cast Death and
+  Decay whenever it is ready.
+
 ## v2.6 — Three realms: Conquest of Azeroth, Wildcard and Warcraft Reborn (October 2026)
 
 ### New realm modes
@@ -91,7 +406,7 @@
 - **Area spells no longer pull the next pack** (`AiPlayerbot.CoaAoeNoIdlePull`, on by default): in a dungeon or a
   raid, a bot no longer casts an area spell that would also hit a creature not yet fighting (a tank's Thunder Clap
   pulled the Ring of Law spectators in Blackrock Depths).
-- Ragefire Chasm, Taragaman (Heroic/Mythic): the bots hide behind the earth pillar before Massive Fire Nova, the tank
+- Razorfen Kraul, Taragaman (Heroic/Mythic): the bots hide behind the earth pillar before Massive Fire Nova, the tank
   once the cast starts.
 - Scarlet Monastery, Arcanist Doan: the bots run out of Detonation (36 yd) as soon as the Arcane Bubble is up.
 - Random bots join a random dungeon only within 5 levels of the real players waiting for it.
@@ -597,7 +912,7 @@ the `worldserver.conf` it builds at each start, and the full repack ships 60. Do
   being hit
 - **#6704** KoX Defiance, and every shield spec: no more two-handed weapons
 - **#6505 / #6493** Tank: leads the group only while the player moves on, and stays put when the player stops (no
-  more back and forth in Ragefire Chasm)
+  more back and forth in Razorfen Kraul)
 - **#6802** A bot standing still indoors (an inn) gets off its mount
 
 ## v1.9 — PvP (7 October 2026) — release main-20261007-ba8ce643
@@ -855,7 +1170,7 @@ becomes the default only when it wins overall and in each group of bots. Gain = 
 - A bot tank no longer taunts what another tank holds; only the group's main tank takes a target back
 - Healers no longer recast a heal over time already on the target (922 failed tries in 1,715 before), and no
   longer skip a tank without one
-- A bot that went through Ragefire Chasm or Shadowfang Keep no longer keeps that dungeon's strategy everywhere
+- A bot that went through Razorfen Kraul or Shadowfang Keep no longer keeps that dungeon's strategy everywhere
 - `co -rtsc` and `nc -tell target` work (strategy names fixed)
 - A bot looking at a scaled item no longer stops the server (Zyth45/mod-playerbots#16)
 
@@ -1004,7 +1319,7 @@ for their tips.
   player of a map for every creature, and bots kept it running all the time (42% of the server CPU with 5000
   bots). Jealous merged the fix (jealous-sound/azerothcore-wotlk-coa#5770): median server tick 279 ms -> 52 ms
 - **Bots log in much faster**: one bot login that never completed stopped all the others; now it is set aside
-  after 60 seconds (from HatredPsycho's fork). 5000 bots were online in 4 minutes instead of about 12
+  after 60 seconds. 5000 bots were online in 4 minutes instead of about 12
 - Even with every bot fully active (`BotActiveAlone = 100`, no smart scale), 5000 bots now run at 60-240 ms
   per server tick instead of 0.5-6 seconds
 - Bots find their glyphs without walking the whole item list (562,000 items) at every refresh
@@ -1023,7 +1338,7 @@ for their tips.
 - **No more bot stuck at a dungeon door**: the finder offers dungeons by the DBC level range, the entrance checks
   another one. Bots now skip dungeons their level cannot enter, and one sent there anyway leaves the group
   instead of being revived and sent back every 5 seconds (#5725, #5159, #4818)
-- **Ragefire Chasm and Shadowfang Keep strategies** (from HatredPsycho's fork)
+- **Razorfen Kraul and Shadowfang Keep strategies**
 
 ### Dungeons and raids
 - **Bots follow you into your raid, not into an old one**: a random bot that had killed a Molten Core boss
@@ -1042,7 +1357,7 @@ for their tips.
 - No resurrection spam at a corpse behind a door or a wall (#5722)
 - No eating or drinking while swimming (#5533)
 - No endless loop on a worldforged pickup already taken (#5519)
-- Random bots no longer get Death Knight faces (from StevenLeclerc's fork)
+- Random bots no longer get Death Knight faces
 - **Quest shares work every time**: after a group quest the core left a bot marked "busy", and every later
   share was refused with "busy" until it logged out again (#5606)
 - **Bots under level 40 mount again** behind a player on a fast mount: they own only their slow mount, which was
@@ -1075,7 +1390,7 @@ for their tips.
   (hundreds of bots did it; none now)
 - **Self heals are used**: a heal that only targets its caster was never cast by any bot; it is now used when
   the bot is in trouble, like the other self-saving spells. Nearby-ally and ally-cone spells count as ally
-  spells (from StevenLeclerc's fork)
+  spells
 
 ### Healers
 - **Healers heal before it is too late**: the spec rotations put their attacks up to priority 30, and the
@@ -1216,7 +1531,7 @@ checked in game.
 - Mana potions restore mana: Rage Potions are no longer drunk by casters (#5077); an off-hand item is no
   upgrade under a two-handed weapon (#5081)
 
-### From HatredPsycho's fork — thanks!
+### More fixes
 - **Low-level CoA bots are no longer naked**: under level 5 they get their class starter kit. Bots left
   naked by an older version are dressed at their next login (Zyth45/mod-playerbots#8)
 - A random bot population capped at level 1 keeps the levels it earns

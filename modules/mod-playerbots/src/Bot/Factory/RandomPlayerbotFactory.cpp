@@ -4,11 +4,13 @@
  * or (at your option) any later version.
  */
 
+#include "CoaPopulationRules.h"
 #include "RandomPlayerbotFactory.h"
 #include "AccountMgr.h"
 #include "ArenaTeamMgr.h"
 #include "CharacterCache.h"
 #include "CoaBotNames.h"
+#include "CoaBotRaces.h"
 #include "CoaReborn.h"
 #include "CoaWildcard.h"
 #include "ObjectAccessor.h"
@@ -84,16 +86,12 @@ Player* RandomPlayerbotFactory::CreateRandomBot(WorldSession* session, uint8 cls
         // 97) are left out unless that module lets bots have them, and any race can be excluded by id. The mask
         // above cannot reach most of them: shifting by 32 or more is undefined and on x86 wrapped onto a base
         // race's bit.
-        bool const baseRace = race <= RACE_DRAENEI && race != 9;
-        if (!baseRace && !sPlayerbotAIConfig.customRacesForBots)
-            continue;
-        if (std::find(sPlayerbotAIConfig.excludedBotRaces.begin(), sPlayerbotAIConfig.excludedBotRaces.end(), race) !=
-            sPlayerbotAIConfig.excludedBotRaces.end())
+        if (!CoaBotRaces::Allowed(race))
             continue;
 
         // Try to get 50/50 faction distribution for random bot population balance.
         // Without this check, races from the faction with more class options would dominate.
-        if (alliance == IsAlliance(race))
+        if (alliance == IsAlliance(race) && CoaBotRace::ClassAllowed(CoaBotRaces::Get(race), cls))
         {
             if (IsValidRaceClassCombination(race, cls, sWorld->getIntConfig(CONFIG_EXPANSION)))
                 raceOptions.push_back(race);
@@ -107,18 +105,17 @@ Player* RandomPlayerbotFactory::CreateRandomBot(WorldSession* session, uint8 cls
     }
 
     const uint8 race = raceOptions[urand(0, raceOptions.size() - 1)];
-    // Added races with a male model only (the core's IsAscensionMaleOnlyRace, same list as the client's creation
-    // screen): a female of these races has no body in the client, or wears gear stretched across the screen.
-    // Broken (22) too, from the races' author (CoA Custom README); the core leaves it out since Eunoia's Broken.
-    // Earthen (68, 69): a client crashed drawing earthendwarffemale.m2 among bots (15/10), so their bots stay male.
-    // Ogre (53): its female shows the male model. Alpha Goblin (57): its male has no head (a missing texture shown
-    // as a checker square), so its bots are female.
-    bool const maleOnly = race == 15 || race == 17 || race == 18 || (race >= 22 && race <= 26) || race == 32 ||
-                          race == 50 || race == 53 || race == 68 || race == 69 || race == 83 ||
-                          race == 97;
-    bool const femaleOnly = race == 57;
-    const uint8 gender = femaleOnly ? GENDER_FEMALE : (maleOnly || urand(0, 1)) ? GENDER_MALE : GENDER_FEMALE;
-    const auto raceAndGender = CombineRaceAndGender(race, gender);
+    // Races with one usable model: the server's AiPlayerbot.BotRace.<id> line first, then the module's list
+    // (CoaBotRace::DefaultGender: the core's male-only races of CoA Custom, Broken 22, Earthen 68/69 whose female
+    // crashed a client on 15/10, Ogre 53, Alpha Goblin 57 female), then the core's own male-only races when it
+    // declares them.
+    CoaBotRace::Profile const& raceProfile = CoaBotRaces::Get(race);
+    CoaBotRace::Gender const oneGender = CoaBotRace::ResolveGender(raceProfile, race, CoaBotRaces::CoreMaleOnly(race));
+    const uint8 gender = oneGender == CoaBotRace::Gender::Female ? GENDER_FEMALE
+                         : (oneGender == CoaBotRace::Gender::Male || urand(0, 1)) ? GENDER_MALE
+                                                                                  : GENDER_FEMALE;
+    const auto raceAndGender =
+        CombineRaceAndGender(raceProfile.namesRace ? raceProfile.namesRace : race, gender);
 
     std::string name;
     if (!nameCache.empty())
@@ -172,6 +169,10 @@ Player* RandomPlayerbotFactory::CreateRandomBot(WorldSession* session, uint8 cls
             continue;
 
         if (!wantsDeathKnightLook && (charSection->Flags & SECTION_FLAG_DEATH_KNIGHT))
+            continue;
+
+        // look=simple in the race's line: the first variant only, for races whose other variants lack textures.
+        if (!CoaBotRace::KeepSection(raceProfile.look, uint8(charSection->GenType), uint8(charSection->Type)))
             continue;
 
         switch (charSection->GenType)
@@ -418,29 +419,50 @@ uint32 RandomPlayerbotFactory::CalculateTotalAccountCount()
     uint32 existingAddClassAccounts = 0;
     uint32 existingUnassignedAccounts = 0;
 
-    QueryResult typeCheck = PlayerbotsDatabase.Query("SELECT account_type, COUNT(*) FROM playerbots_account_type GROUP BY account_type");
+    // CoA 3.2: only the accounts of the current prefix count. The creation loop only sees those
+    // (AccountMgr::GetId(prefix + n)); rows of another prefix (a start with another prefix, a test realm) were
+    // counted all the same, so every start created that many accounts more: 650 rows of an old prefix gave 16,900
+    // accounts and 233,720 characters in 21 starts of a bench world. The other rows are left as they are.
+    std::unordered_set<uint32> prefixAccounts;
+    if (QueryResult accounts = LoginDatabase.Query("SELECT id FROM account WHERE username LIKE '{}%%'",
+                                                   sPlayerbotAIConfig.randomBotAccountPrefix.c_str()))
+    {
+        do
+            prefixAccounts.insert(accounts->Fetch()[0].Get<uint32>());
+        while (accounts->NextRow());
+    }
+    uint32 otherPrefixRows = 0;
+    QueryResult typeCheck = PlayerbotsDatabase.Query("SELECT account_id, account_type FROM playerbots_account_type");
     if (typeCheck)
     {
         do
         {
             Field* fields = typeCheck->Fetch();
-            uint8 accountType = fields[0].Get<uint8>();
-            uint32 count = static_cast<uint32>(fields[1].Get<uint64>());
+            uint32 const accountId = fields[0].Get<uint32>();
+            uint8 const accountType = fields[1].Get<uint8>();
+            if (!prefixAccounts.count(accountId))
+            {
+                ++otherPrefixRows;
+                continue;
+            }
 
-            if (accountType == 0) existingUnassignedAccounts = count;
-            else if (accountType == 1) existingRndBotAccounts = count;
-            else if (accountType == 2) existingAddClassAccounts = count;
+            if (accountType == 0) ++existingUnassignedAccounts;
+            else if (accountType == 1) ++existingRndBotAccounts;
+            else if (accountType == 2) ++existingAddClassAccounts;
         } while (typeCheck->NextRow());
     }
+    if (otherPrefixRows)
+        LOG_INFO("server.loading", "Bot accounts: {} account type row(s) of another prefix than '{}' left out of the count",
+                 otherPrefixRows, sPlayerbotAIConfig.randomBotAccountPrefix);
 
     // Determine divisor based on Death Knight availability and requested A&H faction ratio
     int divisor = CalculateAvailableCharsPerAccount();
 
     // Calculate max bots
-    int maxBots = sPlayerbotAIConfig.maxRandomBots;
-    // Take periodic online/offline into account
-    if (sPlayerbotAIConfig.enablePeriodicOnlineOffline)
-        maxBots *= sPlayerbotAIConfig.periodicOnlineOfflineRatio;
+    // Take periodic online/offline into account (CoaPeriodicBotTotal: rounded up)
+    int maxBots = int(CoaPeriodicBotTotal(sPlayerbotAIConfig.maxRandomBots,
+                                          sPlayerbotAIConfig.enablePeriodicOnlineOffline,
+                                          sPlayerbotAIConfig.periodicOnlineOfflineRatio));
 
     // Calculate number of accounts needed for RNDbots
     // Result is rounded up for maxBots not cleanly divisible by the divisor

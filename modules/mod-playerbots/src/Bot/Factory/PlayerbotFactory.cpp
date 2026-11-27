@@ -5,17 +5,33 @@
  */
 
 #include "PlayerbotFactory.h"
+#include "Ai/Coa/Combat/Mount/CoaMountRule.h"
+#include "CoaFishingGear.h"
+#include "CoaWorldItemOrigin.h"
+#include "CoaStarterWeapon.h"
+#include "Ai/Coa/Combat/Gear/CoaGearPvp.h"
+#include "CoaQuietAchievements.h"
 #include "AccountMgr.h"
 #include "AiFactory.h"
 #include "AiObjectContext.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
+#include "AscensionBloodforging.h"
+#include "CoaGearRules.h"
 #include "CoaSpecLookup.h"
 #include "CoaSpecStatWeights.h"
 #include "CoaSpecialization.h"
 #include "Config.h"
 #include "CoaWildcard.h"
 #include "CoaReborn.h"
+#include "CoaRebornGuideRules.h"
+#include "CoaRefreshRules.h"
+#include "CoaEconomyConf.h"
+#include "CoaEconomyRules.h"
+#if __has_include("CoaMaterials.h")
+#include "CoaMaterials.h"
+#endif
+#include "CoaEconomyRules.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
 #include "GuildMgr.h"
@@ -88,6 +104,23 @@ std::vector<uint32> PlayerbotFactory::ccBreakTrinketCache;
 
 namespace
 {
+// A random bot out in the world: not grouped under a player, who keeps the best suffix for the spec.
+bool IsWorldBot(Player* bot)
+{
+    if (!sRandomPlayerbotMgr.IsRandomBot(bot))
+        return false;
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+    Player* master = botAI ? botAI->GetMaster() : nullptr;
+    return !master || master == bot || GET_PLAYERBOT_AI(master);
+}
+
+// AiPlayerbot.GearRollRandomSuffix: 1 rolls for the random bots out in the world, 2 for every bot.
+bool RollsRandomSuffix(Player* bot)
+{
+    uint32 const level = sPlayerbotAIConfig.gearRollRandomSuffix;
+    return level >= 2 || (level == 1 && IsWorldBot(bot));
+}
+
 constexpr uint32 SPELL_DRUID_THICK_HIDE = 16931;
 constexpr uint32 SPELL_OWLKIN_FRENZY = 48393;
 constexpr uint32 SPELL_PRIMAL_TENACITY = 33957;
@@ -832,8 +865,17 @@ void PlayerbotFactory::Prepare()
 
 void PlayerbotFactory::Randomize(bool incremental)
 {
+    // The achievements of a bot made or levelled here are earned, not announced around it (CoA Live).
+    CoaQuietAchievements::Scope quietAchievements(bot);
     // if (sPlayerbotAIConfig.disableRandomLevels)
     //     return;
+
+    // Self-found: a bot is never moved to a level of the self-found range, it keeps the one it earned and everything
+    // it carries. A rebuild above the range (a recruit raised to the cap) goes on as usual. A self-found random bot
+    // (CoaSelfFoundBotsPercent) keeps its level at any level.
+    if (SelfFoundAt(level) || IsSelfFoundBot(bot))
+        level = bot->GetLevel();
+    bool const selfFound = SelfFound();
 
     LOG_DEBUG("playerbots", "{} randomizing {} (level {} class = {})...", (incremental ? "Incremental" : "Full"),
              bot->GetName().c_str(), level, bot->getClass());
@@ -856,18 +898,24 @@ void PlayerbotFactory::Randomize(bool incremental)
         ClearSpells();
         ResetQuests();
 
-        if (!sPlayerbotAIConfig.equipAndSpecPersistence ||
-            level < uint32(sPlayerbotAIConfig.equipAndSpecPersistenceLevel) || level < oldLevel)
+        if (!selfFound && (!sPlayerbotAIConfig.equipAndSpecPersistence ||
+            level < uint32(sPlayerbotAIConfig.equipAndSpecPersistenceLevel) || level < oldLevel))
         {
-            ClearAllItems();
+            // Above the self-found range of a self-found realm the gear is rebuilt, the bags stay.
+            if (KeepsBags())
+                ClearEquippedItems();
+            else
+                ClearAllItems();
         }
     }
-    ClearInventory();
+    if (!KeepsBags())
+        ClearInventory();
     bot->RemoveAllSpellCooldown();
     UnbindInstance();
 
     bot->GiveLevel(level);
     bot->InitStatsForLevel(true);
+    UnequipAboveLevel(bot);
     CancelAuras();
     // bot->SaveToDB(false, false);
     if (pmo)
@@ -1088,7 +1136,12 @@ void PlayerbotFactory::Randomize(bool incremental)
 
     pmo = sPerfMonitor.start(PERF_MON_RNDBOT, "PlayerbotFactory_Save");
     LOG_DEBUG("playerbots", "Saving to DB...");
-    bot->SetMoney(urand(level * 100000, level * 5 * 100000));
+    // --- CoA Economy ---
+    // A random bot's starting gold, scaled by AiPlayerbot.CoaEconomy.BotStartGoldPercent (100: unchanged; below, a
+    // rebuilt bot keeps the gold it holds).
+    bot->SetMoney(CoaEconomyRules::RebuiltBotGold(bot->GetMoney(), urand(level * 100000, level * 5 * 100000),
+                                                  CoaBotStartGoldPercent()));
+    // --- end CoA Economy ---
     bot->SetHealth(bot->GetMaxHealth());
     bot->SetPower(POWER_MANA, bot->GetMaxPower(POWER_MANA));
     bot->SaveToDB(false, false);
@@ -1106,7 +1159,10 @@ void PlayerbotFactory::Refresh()
     //     InitEquipment(true);
     // }
     InitAttunementQuests();
-    ClearInventory();
+    if (CoaRefreshClearsInventory(KeepsBags(), sPlayerbotAIConfig.refreshClearsInventory))
+        ClearInventory();
+    // A self-found bot left with no weapon at all gets its starting one, once (AiPlayerbot.CoaSelfFound.StarterWeapon).
+    CoaStarterWeapon::Ensure(bot);
     InitAmmo();
     InitFood();
     InitReagents();
@@ -1131,7 +1187,9 @@ void PlayerbotFactory::Refresh()
     bot->DurabilityRepairAll(false, 1.0f, false);
     if (bot->isDead())
         bot->ResurrectPlayer(1.0f, false);
-    uint32 money = urand(level * 1000, level * 5 * 1000);
+    // --- CoA Economy --- (the upkeep floor, scaled as the starting gold)
+    uint32 money = CoaEconomyRules::ScaleBotGold(urand(level * 1000, level * 5 * 1000), CoaBotStartGoldPercent());
+    // --- end CoA Economy ---
     if (bot->GetMoney() < money)
         bot->SetMoney(money);
     // bot->SaveToDB(false, false);
@@ -2011,9 +2069,12 @@ uint32 PlayerbotFactory::InitTalentsTree(bool increment /*false*/, bool use_temp
         return 0;
 
     // A Warcraft Reborn character takes the Character Advancement build of its tree instead.
+    // A player's own character (an alt brought in by "add") keeps the build its owner made: only a random or an
+    // addclass bot takes the guide build (an alt's talents were lost at its login).
     if (IsRebornBot(bot))
     {
-        ApplyWcrBuild(bot);
+        if (WcrGuideMayRewrite(sRandomPlayerbotMgr.IsRandomBot(bot), sRandomPlayerbotMgr.IsAddclassBot(bot)))
+            ApplyWcrBuild(bot);
         return GetWcrSpec(bot);
     }
 
@@ -2262,9 +2323,23 @@ class DestroyItemsVisitor : public IterateItemsVisitor
 public:
     DestroyItemsVisitor(Player* bot) : IterateItemsVisitor(), bot(bot) {}
 
+    // CoA Economy 3.1.4: the materials of the bot's guild stock stay, up to stockStacks + 1 full stacks of each
+    // (CoaEconomyRules::RefreshKeepsStock); nullptr = none (guild stock off: as in 3.1.3).
+    void KeepStock(std::unordered_set<uint32> const* materials, uint32 stockStacks)
+    {
+        stock = materials;
+        stacks = stockStacks;
+    }
+
     bool Visit(Item* item) override
     {
         uint32 id = item->GetTemplate()->ItemId;
+        if (stock && CoaEconomyRules::RefreshKeepsStock(true, stock->count(id) != 0, kept[id], item->GetCount(),
+                                                        item->GetTemplate()->GetMaxStackSize(), stacks))
+        {
+            kept[id] += item->GetCount();
+            return true;
+        }
         if (CanKeep(id))
         {
             keep.insert(id);
@@ -2289,6 +2364,9 @@ private:
 
     Player* bot;
     std::set<uint32> keep;
+    std::unordered_set<uint32> const* stock = nullptr;
+    uint32 stacks = 0;
+    std::unordered_map<uint32, uint32> kept;  // material -> items kept so far
 };
 
 bool PlayerbotFactory::CanEquipArmor(ItemTemplate const* proto)
@@ -2660,6 +2738,7 @@ void Shuffle(std::vector<uint32>& items)
 // outfit instead left it without any equipment after the randomizer cleared its items.
 static void StoreCoaStarterItems(Player* bot)
 {
+    CoaWorld::StartGearScope const startGear;  // CoA World 3.3: what is worn here is "start" in coa_item_origin
     for (AscensionCompatData::LiveStarterItem const& entry : AscensionCompatData::LiveStarterItems)
     {
         if (entry.ClassId != bot->getClass() || entry.ItemId == 6948)
@@ -2675,15 +2754,92 @@ static void StoreCoaStarterItems(Player* bot)
         if (entry.Slot < EQUIPMENT_SLOT_END)
         {
             uint16 dest;
-            if (bot->CanEquipNewItem(entry.Slot, dest, entry.ItemId, false) == EQUIP_ERR_OK &&
-                bot->EquipNewItem(dest, entry.ItemId, true))
-                continue;
+            if (bot->CanEquipNewItem(entry.Slot, dest, entry.ItemId, false) == EQUIP_ERR_OK)
+            {
+                if (Item* equipped = bot->EquipNewItem(dest, entry.ItemId, true))
+                {
+                    PlayerbotFactory::RollRandomProperty(bot, equipped);
+                    continue;
+                }
+            }
         }
 
         ItemPosCountVec dest;
         if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry.ItemId, entry.Count) == EQUIP_ERR_OK)
-            bot->StoreNewItem(dest, entry.ItemId, true);
+            bot->StoreNewItem(dest, entry.ItemId, true, Item::GenerateItemRandomPropertyId(entry.ItemId));
     }
+}
+
+namespace
+{
+bool StarterMainHand(uint32 itemId)
+{
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+    return proto && proto->Class == ITEM_CLASS_WEAPON && proto->SubClass != ITEM_SUBCLASS_WEAPON_FISHING_POLE &&
+           (proto->InventoryType == INVTYPE_WEAPON || proto->InventoryType == INVTYPE_WEAPONMAINHAND ||
+            proto->InventoryType == INVTYPE_2HWEAPON);
+}
+}  // namespace
+
+uint32 PlayerbotFactory::StarterWeaponOf(Player* bot)
+{
+    if (!bot)
+        return 0;
+    if (IsAscensionCustomClassId(bot->getClass()))
+    {
+        for (AscensionCompatData::LiveStarterItem const& entry : AscensionCompatData::LiveStarterItems)
+            if (entry.ClassId == bot->getClass() && StarterMainHand(entry.ItemId))
+                return entry.ItemId;
+        return 0;
+    }
+    if (CharStartOutfitEntry const* outfit = GetCharStartOutfitEntry(bot->getRace(), bot->getClass(), bot->getGender()))
+        for (int i = 0; i < MAX_OUTFIT_ITEMS; ++i)
+            if (outfit->ItemId[i] > 0 && StarterMainHand(uint32(outfit->ItemId[i])))
+                return uint32(outfit->ItemId[i]);
+    return 0;
+}
+
+void PlayerbotFactory::SetRandomProperty(Player* bot, Item* item, int32 randomPropertyId)
+{
+    if (!item || !randomPropertyId)
+        return;
+
+    bool const equipped = item->IsEquipped();
+    uint8 const slot = item->GetSlot();
+    if (equipped)
+        bot->_ApplyItemMods(item, slot, false);
+    item->SetItemRandomProperties(randomPropertyId);
+    if (equipped)
+        bot->_ApplyItemMods(item, slot, true);
+}
+
+uint32 PlayerbotFactory::UnequipAboveLevel(Player* bot)
+{
+    if (!sRandomPlayerbotMgr.IsRandomBot(bot))
+        return 0;
+
+    uint32 removed = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+        if (!proto || proto->RequiredLevel <= bot->GetLevel())
+            continue;
+
+        bot->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+        ++removed;
+    }
+
+    if (removed)
+        LOG_DEBUG("playerbots", "Bot {} (level {}): {} equipped items above its level taken off", bot->GetName(),
+                  bot->GetLevel(), removed);
+    return removed;
+}
+
+void PlayerbotFactory::RollRandomProperty(Player* bot, Item* item)
+{
+    if (item)
+        SetRandomProperty(bot, item, Item::GenerateItemRandomPropertyId(item->GetEntry()));
 }
 
 void PlayerbotFactory::DressNakedCoaStarter(Player* bot)
@@ -2725,7 +2881,10 @@ bool PlayerbotFactory::IsCoaPvpItem(ItemTemplate const* proto)
 
 void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32 onlySlot)
 {
-    if (level < 5)
+    CoaWorld::StartGearScope const startGear;  // CoA World 3.3: what is worn here is "start" in coa_item_origin
+    // A Wildcard Hero has no class starting outfit (the core's Wildcard kit goes to players at their first login):
+    // it takes its gear from the regular search below at any level, else it stayed naked under level 5.
+    if (level < 5 && !IsWildcardHeroBot(bot))
     {
         if (IsAscensionCustomClassId(bot->getClass()))
         {
@@ -2771,6 +2930,10 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32
         }
         return;
     }
+
+    // Self-found: past its starting outfit above, a bot wears only what it loots, earns or is given.
+    if (SelfFound())
+        return;
 
     std::unordered_map<uint8, std::vector<std::pair<uint32, int32>>> items;
     // int tab = AiFactory::GetPlayerSpecTab(bot);
@@ -2869,10 +3032,55 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32
             desiredQuality > ITEM_QUALITY_NORMAL)
             desiredQuality--;
 
+        uint32 const windowFloor = uint32(std::max((int32)bot->GetLevel() - delta, 0));
+        uint32 levelTop = bot->GetLevel();
+        uint32 levelFloor = windowFloor;
+        int32 const topQuality = desiredQuality;
+        bool belowWindow = false;
+        bool foundWearable = false;  // a candidate under the gear score limit passes the equip checks below
+        // Nothing fits next to a two-hander, so searching on would only cost time.
+        bool const offhandBlocked = slot == EQUIPMENT_SLOT_OFFHAND && bot->IsTwoHandUsed() && !bot->CanTitanGrip();
+
+        auto hasWearableCandidate = [&]() -> bool
+        {
+            for (auto const& candidate : items[slot])
+            {
+                uint16 dest;
+                if (CanEquipItem(sObjectMgr->GetItemTemplate(candidate.first)) &&
+                    CanEquipUnseenItem(slot, dest, candidate.first))
+                    return true;
+            }
+            return false;
+        };
+
+        // After green: with a gear score limit and nothing green or better under it that the bot can wear in the
+        // usual window, search the lower required levels from the top quality again before white and grey.
+        auto nextSearchStep = [&]() -> bool
+        {
+            if (desiredQuality == ITEM_QUALITY_UNCOMMON)
+            {
+                if (gearScoreLimit != 0 && !offhandBlocked)
+                    foundWearable = hasWearableCandidate();
+                if (!belowWindow && gearScoreLimit != 0 && windowFloor > 0 && !offhandBlocked && !foundWearable)
+                {
+                    belowWindow = true;
+                    levelTop = windowFloor;
+                    levelFloor = 0;
+                    desiredQuality = std::min<int32>(topQuality, ITEM_QUALITY_EPIC);  // no legendary in the cache
+                    return true;
+                }
+                levelTop = bot->GetLevel();
+                levelFloor = windowFloor;
+            }
+            return desiredQuality-- > ITEM_QUALITY_POOR;
+        };
+
         do
         {
-            for (uint32 requiredLevel = bot->GetLevel(); requiredLevel > uint32(std::max((int32)bot->GetLevel() - delta, 0));
-                 requiredLevel--)
+            // Grey and white skip the limit only as a last resort, when no better quality found anything wearable.
+            bool const shouldCheckGS = desiredQuality > ITEM_QUALITY_NORMAL || foundWearable;
+
+            for (uint32 requiredLevel = levelTop; requiredLevel > levelFloor; requiredLevel--)
             {
                 for (InventoryType inventoryType : GetPossibleInventoryTypeListBySlot((EquipmentSlots)slot))
                 {
@@ -2899,14 +3107,16 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32
                         if (!proto)
                             continue;
 
-                        bool shouldCheckGS = desiredQuality > ITEM_QUALITY_NORMAL;
-
                         if (shouldCheckGS && gearScoreLimit != 0 &&
                             CalcMixedGearScore(proto->ItemLevel, proto->Quality) > gearScoreLimit)
                         {
                             continue;
                         }
                         if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+                            continue;
+
+                        // CoA Combat (GearPvpSoldOnly): no PvP piece a player cannot get (CoaGearPvp).
+                        if (sPlayerbotAIConfig.coaCombatGearPvpSoldOnly && CoaGearPvp::IsUnobtainablePvpItem(itemId))
                             continue;
 
                         if (maxItemLevel && proto->ItemLevel > maxItemLevel)
@@ -2932,12 +3142,14 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32
 
                         int32 bestRandomProp = 0;
                         if (proto->RandomProperty || proto->RandomSuffix)
-                            bestRandomProp = calculator.PickBestRandomPropertyId(itemId);
+                            bestRandomProp = RollsRandomSuffix(bot)
+                                                 ? Item::GenerateItemRandomPropertyId(itemId)
+                                                 : calculator.PickBestRandomPropertyId(itemId);
                         items[slot].push_back({itemId, bestRandomProp});
                     }
                 }
             }
-        } while (items[slot].size() < 25 && desiredQuality-- > ITEM_QUALITY_POOR);
+        } while (items[slot].size() < 25 && nextSearchStep());
 
         std::vector<std::pair<uint32, int32>>& ids = items[slot];
         if (ids.empty())
@@ -3031,15 +3243,7 @@ void PlayerbotFactory::InitEquipment(bool incremental, bool second_chance, int32
             continue;
 
         if (Item* equipped = bot->EquipNewItem(dest, bestItemForSlot, true))
-        {
-            if (bestRandomPropForSlot != 0)
-            {
-                uint8 equipSlot = equipped->GetSlot();
-                bot->_ApplyItemMods(equipped, equipSlot, false);
-                equipped->SetItemRandomProperties(bestRandomPropForSlot);
-                bot->_ApplyItemMods(equipped, equipSlot, true);
-            }
-        }
+            SetRandomProperty(bot, equipped, bestRandomPropForSlot);
         bot->AutoUnequipOffhandIfNeed();
         // if (newItem)
         // {
@@ -3757,8 +3961,11 @@ void PlayerbotFactory::InitSkills()
     bot->UpdateSkillsForLevel();
 
     bot->SetSkill(SKILL_RIDING, 0, 0, 0);
+    // CoA 3.2.2: Novice Riding (33379, the quest "Path to Ascension: Novice Rider" at level 5, a 40% ground mount: the
+    // core's GetRidingGroundMountSpeed) from the ground mount level, Apprentice Riding (33388, 60%) from level 20, its
+    // trainer's level in CoA's world database. Before, Apprentice came at the ground mount level, 20.
     if (bot->GetLevel() >= sPlayerbotAIConfig.useGroundMountAtMinLevel)
-        bot->learnSpell(33388);
+        bot->learnSpell(CoaMountRule::NoviceOrApprentice(bot->GetLevel()));
     if (bot->GetLevel() >= sPlayerbotAIConfig.useFastGroundMountAtMinLevel)
         bot->learnSpell(33391);
     if (bot->GetLevel() >= sPlayerbotAIConfig.useFlyMountAtMinLevel)
@@ -3921,6 +4128,26 @@ void PlayerbotFactory::SetRandomSkill(uint16 id)
     bot->SetSkill(id, step, value, maxValue);
 }
 
+uint32 PlayerbotFactory::CountTeachableSpells(Player* bot)
+{
+    std::vector<uint32> trainerIds;
+    {
+        std::lock_guard<std::mutex> cacheLock(TrainerIdCacheLock);
+        auto it = trainerIdCache.find(bot->getClass());
+        if (it == trainerIdCache.end())
+            return 0;
+        trainerIds = it->second;
+    }
+    std::unordered_set<uint32> teachable;
+    for (uint32 trainerId : trainerIds)
+        if (Trainer::Trainer const* trainer = RebornTrainerFor(sObjectMgr->GetTrainer(trainerId), bot))
+            for (auto& spell : trainer->GetSpells())
+                if (Trainer::Spell const* trainerSpell = trainer->GetSpell(spell.SpellId))
+                    if (IsTrainerSpellAllowedForBot(bot, trainer, trainerSpell) && trainer->CanTeachSpell(bot, trainerSpell))
+                        teachable.insert(trainerSpell->SpellId);
+    return uint32(teachable.size());
+}
+
 void PlayerbotFactory::InitAvailableSpells()
 {
     std::unique_lock<std::mutex> cacheLock(TrainerIdCacheLock);
@@ -3959,6 +4186,55 @@ void PlayerbotFactory::InitAvailableSpells()
     }
     std::vector<uint32> const trainerIds = trainerIdCache[bot->getClass()];
     cacheLock.unlock();
+
+    // CoA (AiPlayerbot.CoaLive.TrainerDedup): the cache holds creature entries, and the many creatures of one trainer
+    // (every class trainer of a class) walked the same spell list again and again. Each trainer is walked once per
+    // round, in the order it first appears; a round that teaches nothing ends it (the next ones would teach nothing
+    // either), never more rounds than the trainer had creatures: the spells taught are the same.
+    if (sPlayerbotAIConfig.coaLiveTrainerDedup)
+    {
+        std::vector<std::pair<Trainer::Trainer const*, uint32>> trainers;  // trainer -> creatures that share it
+        for (uint32 trainerId : trainerIds)
+        {
+            Trainer::Trainer const* trainer = RebornTrainerFor(sObjectMgr->GetTrainer(trainerId), bot);
+            if (!trainer)
+                continue;
+            auto it = std::find_if(trainers.begin(), trainers.end(), [trainer](auto const& t) { return t.first == trainer; });
+            if (it == trainers.end())
+                trainers.emplace_back(trainer, 1);
+            else
+                ++it->second;
+        }
+        uint32 rounds = 0;
+        for (auto const& t : trainers)
+            rounds = std::max(rounds, t.second);
+        for (uint32 round = 0; round < rounds; ++round)
+        {
+            bool taught = false;
+            for (auto const& [trainer, creatures] : trainers)
+            {
+                if (round >= creatures)
+                    continue;
+                for (auto& spell : trainer->GetSpells())
+                {
+                    Trainer::Spell const* trainerSpell = trainer->GetSpell(spell.SpellId);
+                    if (!trainerSpell || !IsTrainerSpellAllowedForBot(bot, trainer, trainerSpell) ||
+                        !trainer->CanTeachSpell(bot, trainerSpell))
+                        continue;
+                    if (trainerSpell->IsCastable())
+                        bot->CastSpell(bot, trainerSpell->SpellId, true);
+                    else
+                        bot->learnSpell(trainerSpell->SpellId, false);
+                    taught = true;
+                }
+            }
+            if (!taught)
+                break;
+        }
+        ForgetStockTwins(bot);
+        return;
+    }
+
     for (uint32 trainerId : trainerIds)
     {
         // A Warcraft Reborn character is taught the Reborn rows the core serves it at the trainer.
@@ -4355,13 +4631,27 @@ void PlayerbotFactory::InitInstanceQuests()
     // quest rewards boost bot level, so reduce back
     bot->GiveLevel(level);
 
-    ClearInventory();
+    // Self-found: InitQuests already took the reward items back, the bags hold what the bot found.
+    if (!KeepsBags())
+        ClearInventory();
     bot->SetUInt32Value(PLAYER_XP, currentXP);
 }
 
 void PlayerbotFactory::ClearInventory()
 {
+    // A bot that fished takes its weapons back first: put away in the bags, they would be destroyed with them and
+    // the pole left in its hands (a refresh does not give gear back).
+    CoaFishingGear::Restore(bot);
     DestroyItemsVisitor visitor(bot);
+#ifdef COA_ECONOMY_GUILD_STOCK
+    // CoA Economy 3.1.4: with the guild stock on, its materials stay (bounded); off, the bags are emptied as in 3.1.3.
+    std::unordered_set<uint32> stock;
+    if (CoaEconomy::Materials::IsGuildStockEnabled())
+    {
+        stock = CoaEconomy::Materials::StockReagents(bot);
+        visitor.KeepStock(&stock, CoaEconomy::Materials::GuildStockStacks());
+    }
+#endif
     IterateItems(&visitor);
 }
 
@@ -4369,6 +4659,14 @@ void PlayerbotFactory::ClearAllItems()
 {
     DestroyItemsVisitor visitor(bot);
     IterateItems(&visitor, ITERATE_ALL_ITEMS);
+}
+
+bool PlayerbotFactory::KeepsBags() const { return SelfFound() || sPlayerbotAIConfig.coaSelfFound; }
+
+void PlayerbotFactory::ClearEquippedItems()
+{
+    DestroyItemsVisitor visitor(bot);
+    IterateItems(&visitor, ITERATE_ITEMS_IN_EQUIP);
 }
 
 void PlayerbotFactory::InitAmmo()
@@ -4430,6 +4728,41 @@ void PlayerbotFactory::InitAmmo()
     }
 
     bot->SetAmmo(entry);
+}
+
+bool PlayerbotFactory::SelfFoundAt(uint32 level)
+{
+    return sPlayerbotAIConfig.coaSelfFound && level <= sPlayerbotAIConfig.coaSelfFoundMaxLevel;
+}
+
+bool PlayerbotFactory::IsSelfFoundGuid(ObjectGuid::LowType guid)
+{
+    // Spread by a multiplicative hash: neighbouring guids (one account's characters) do not all fall on one side.
+    uint32 const percent = sPlayerbotAIConfig.coaSelfFoundBotsPercent;
+    return percent && ((guid * 2654435761u) >> 16) % 100 < percent;
+}
+
+bool PlayerbotFactory::IsSelfFoundBot(Player* bot)
+{
+    // Under level 10 the bot is made and geared as usual: it starts its self-found life with the gear of its level.
+    // Random bot accounts only, never a player's character or alt.
+    if (!sPlayerbotAIConfig.coaSelfFoundBotsPercent || !bot || bot->GetLevel() < SELF_FOUND_BOTS_MIN_LEVEL ||
+        !IsSelfFoundGuid(bot->GetGUID().GetCounter()))
+        return false;
+    WorldSession* session = bot->GetSession();
+    return session && sPlayerbotAIConfig.IsInRandomAccountList(session->GetAccountId());
+}
+
+// A player's bot with AutoGearCommandAltBots off is geared by what it loots or is given only ("loot only" realm).
+bool PlayerbotFactory::MayGearItself(Player* bot)
+{
+    // Self-found: no bot of the self-found range gears itself, random bots included, nor a self-found random bot.
+    if (SelfFoundAt(bot->GetLevel()) || IsSelfFoundBot(bot))
+        return false;
+    if (sPlayerbotAIConfig.autoGearCommandAltBots)
+        return true;
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+    return !botAI || !botAI->HasGameClientMaster();
 }
 
 uint32 PlayerbotFactory::CalcMixedGearScore(uint32 gs, uint32 quality)
@@ -4632,10 +4965,9 @@ void PlayerbotFactory::InitPotions()
 
         FindPotionVisitor visitor(bot, effect);
         IterateItems(&visitor);
-        if (!visitor.GetResult().empty())
-            continue;
-
-        uint32 itemId = sRandomItemMgr.GetRandomPotion(level, effect);
+        // Kept bags (AiPlayerbot.RefreshClearsInventory = 0): top up the potion already held instead of adding another.
+        uint32 itemId = visitor.GetResult().empty() ? sRandomItemMgr.GetRandomPotion(level, effect)
+                                                    : visitor.GetResult().front()->GetEntry();
         if (!itemId)
         {
             // LOG_INFO("playerbots", "No potions (type {}) available for bot {} ({} level)", effect,
@@ -4648,7 +4980,10 @@ void PlayerbotFactory::InitPotions()
             continue;
 
         uint32 maxCount = proto->GetMaxStackSize();
-        if (Item* newItem = StoreNewItemInInventorySlot(bot, itemId, urand(maxCount / 2, maxCount)))
+        uint32 count = CoaRefreshMissingCount(urand(maxCount / 2, maxCount), bot->GetItemCount(itemId));
+        if (!count)
+            continue;
+        if (Item* newItem = StoreNewItemInInventorySlot(bot, itemId, count))
             newItem->AddToUpdateQueueOf(bot);
     }
 }
@@ -4738,6 +5073,12 @@ void PlayerbotFactory::InitFood()
     {
         uint32 category = categories[i];
         std::vector<uint32>& ids = items[category];
+        // Food of this category already held: kept bags (AiPlayerbot.RefreshClearsInventory = 0) are only topped
+        // up to two stacks, never piled up at each refresh.
+        uint32 have = 0;
+        for (uint32 id : ids)
+            have += bot->GetItemCount(id);
+        uint32 target = 0;
         int tries = 0;
         for (int j = 0; j < 2; j++)
         {
@@ -4760,7 +5101,12 @@ void PlayerbotFactory::InitFood()
                 j--;
                 continue;
             }
-            StoreItem(itemId, proto->GetMaxStackSize());
+            target += proto->GetMaxStackSize();
+            uint32 count = CoaRefreshMissingCount(target, have);
+            if (!count)
+                continue;
+            StoreItem(itemId, count);
+            have += count;
         }
     }
 }
@@ -5435,6 +5781,11 @@ void PlayerbotFactory::InitInventoryEquip()
         if (proto->Quality != desiredQuality)
             continue;
 
+        // Same Bloodforged filter as RandomItemMgr::IsValidItem: this scan reads the item store directly.
+        static bool const bloodforgedEnabled = sConfigMgr->GetOption<bool>("Bloodforged.Enable", false);
+        if (!CoaGearAllowed(Bloodforging::IsBloodforged(*proto), bloodforgedEnabled))
+            continue;
+
         if (!CanEquipItem(proto))
             continue;
 
@@ -5680,6 +6031,9 @@ void PlayerbotFactory::ApplyEnchantTemplate(uint8 spec)
 
 void PlayerbotFactory::ApplyEnchantAndGemsNew(bool /*destroyOld*/)
 {
+    // Self-found: no gem or enchantment is made for a bot of the self-found range.
+    if (SelfFound())
+        return;
     //int32 bestGemEnchantId[4] = {-1, -1, -1, -1};  // 1, 2, 4, 8 color //not used, line marked for removal.
     //float bestGemScore[4] = {0, 0, 0, 0}; //not used, line marked for removal.
     std::vector<uint32> curCount = GetCurrentGemsCount();

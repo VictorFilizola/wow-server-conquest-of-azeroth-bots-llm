@@ -19,9 +19,11 @@ public:
     bool Execute(Event event) override;
     bool isUseful() override;
 
+    // The role the bot queues as (PLAYER_ROLE_*); also read by the "lfg role wanted" trigger.
+    uint32 GetRoles();
+
 protected:
     bool JoinLFG();
-    uint32 GetRoles();
 };
 
 class LfgAcceptAction : public LfgJoinAction
@@ -31,6 +33,13 @@ public:
 
     bool Execute(Event event) override;
     bool isUseful() override { return true; }
+
+private:
+    void ForgetProposal();
+
+    // The proposal the bot is waiting to accept (in combat or dead), and since when.
+    uint32 pendingProposalId = 0;
+    uint32 pendingSinceMs = 0;
 };
 
 class LfgRoleCheckAction : public LfgJoinAction

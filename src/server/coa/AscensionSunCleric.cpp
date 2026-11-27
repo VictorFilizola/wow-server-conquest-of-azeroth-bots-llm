@@ -7,6 +7,7 @@
 #include "GridNotifiersImpl.h"
 #include "Item.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "Random.h"
 #include "ScriptMgr.h"
@@ -14,11 +15,13 @@
 #include "SpellAuraEffects.h"
 #include "SpellAuras.h"
 #include "SpellMgr.h"
+#include "WorldPacket.h"
 #include <algorithm>
 #include <memory>
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 namespace AscensionSunCleric
 {
 namespace
@@ -52,6 +55,10 @@ bool Any(SpellInfo const* info, std::initializer_list<uint32> roots)
         if (Named(info, root))
             return true;
     return false;
+}
+bool idIsJustice(SpellInfo const* info)
+{
+    return Any(info, {524857,525005,525006,525007,572849,572850,572040,572041,572042,572043,572044,572045});
 }
 bool Derived(SpellInfo const* info)
 {
@@ -97,14 +104,39 @@ uint32 Highest(Player* player, uint32 root)
 }
 void Reduce(Player* player, uint32 root, int32 milliseconds)
 {
+    std::vector<uint32> cleared;
     for (auto const& pair : player->GetSpellMap())
         if (player->HasSpell(pair.first) && Named(sSpellMgr->GetSpellInfo(pair.first), root))
         {
             if (milliseconds == INT32_MAX)
+            {
                 player->RemoveSpellCooldown(pair.first, true);
+                cleared.push_back(pair.first);
+            }
             else
                 player->ModifySpellCooldown(pair.first, -milliseconds);
         }
+    if (cleared.empty())
+        return;
+    ObjectGuid const owner = player->GetGUID();
+    player->m_Events.AddEventAtOffset([owner, cleared = std::move(cleared)]()
+    {
+        Player* target = ObjectAccessor::FindPlayer(owner);
+        if (!target)
+            return;
+        for (uint32 spellId : cleared)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info || !target->HasActiveSpell(spellId) || target->HasSpellCooldown(spellId))
+                continue;
+            if (uint32 remaining = target->GetGlobalCooldownMgr().GetGlobalCooldown(info))
+            {
+                WorldPacket data;
+                target->BuildCooldownPacket(data, SPELL_COOLDOWN_FLAG_NONE, spellId, remaining);
+                target->SendDirectMessage(&data);
+            }
+        }
+    }, 0ms);
 }
 void SetHelper(Player* player, uint32 id, bool enabled)
 {
@@ -184,10 +216,10 @@ Spell* Origin(Player* player, Spell* spell)
                 return parent;
     return spell;
 }
-void Mana(Player* player, uint32 amount)
+void Mana(Player* player, uint32 amount, uint32 source)
 {
     if (amount)
-        player->EnergizeBySpell(player, 504877, int32(std::min<uint32>(amount, INT32_MAX)), POWER_MANA);
+        player->EnergizeBySpell(player, source, int32(std::min<uint32>(amount, INT32_MAX)), POWER_MANA);
 }
 bool Chance(Player* player, uint32 id, uint32 cooldown)
 {
@@ -216,7 +248,10 @@ void Extend(Player* player, uint32 id, int32 milliseconds)
     Aura* aura = player->GetAura(id);
     if (!aura)
     {
+        bool const wasOnCooldown = player->HasSpellCooldown(id);
         Cast(player, player, id);
+        if (!wasOnCooldown)
+            player->RemoveSpellCooldown(id, true);
         aura = player->GetAura(id);
         if (aura)
             aura->SetDuration(milliseconds);
@@ -258,7 +293,7 @@ void ActivateDawn(Player* player)
     Resource(player, SolarPower, -20);
     Cast(player, player, Dawn);
     if (Aura* aura = player->GetAura(Dawn))
-        aura->SetCharges(10);
+        aura->SetCharges(aura->CalcMaxCharges());
     if (AuraEffect* choice = player->GetAuraEffect(Dawn, EFFECT_0))
         choice->SetAmount(1);
     if (player->HasAura(704586))
@@ -271,17 +306,17 @@ void ActivateDawn(Player* player)
         for (uint32 root : {800054, 520024, 805629})
             ReducePercent(player, root, std::abs(Amount(712380)));
     if (player->HasSpell(520639) || player->HasAura(520639))
-        for (auto [spec, helper] : {std::pair(800586u, 520641u), std::pair(500207u, 520644u),
+        for (auto [spec, helper] : {std::pair(92137u, 520641u), std::pair(500207u, 520644u),
                                     std::pair(500209u, 520645u), std::pair(680627u, 520646u)})
             if (player->HasSpell(spec) || player->HasAura(spec))
                 Cast(player, player, helper);
     Refresh(player);
 }
-void Fulfill(Player* player, Spell* spell, Unit* target)
+void Fulfill(Player* player, Spell* spell, Spell* guard, Unit* target)
 {
-    if (!spell || !spell->GetScriptValue(Dawn) || spell->GetScriptValue(807441))
+    if (!spell || !guard || !spell->GetScriptValue(Dawn) || guard->GetScriptValue(807441))
         return;
-    spell->SetScriptValue(807441, 1);
+    guard->SetScriptValue(807441, 1);
     if (player->HasAura(805581))
         Reduce(player, 500154, std::abs(Amount(807445)));
     if (player->HasAura(680622))
@@ -294,6 +329,13 @@ void Fulfill(Player* player, Spell* spell, Unit* target)
     if (player->HasAura(707081) && target && player->IsValidAttackTarget(target))
         Cast(player, target, 657125);
 }
+static bool IsBoss(Unit const* target)
+{
+    Creature const* creature = target->ToCreature();
+    return creature && !creature->GetOwnerGUID().IsPlayer() && (creature->IsDungeonBoss() ||
+        sObjectMgr->IsRaidEncounterKillCredit(creature->GetEntry()) ||
+        creature->GetCreatureTemplate()->rank == CREATURE_ELITE_WORLDBOSS);
+}
 void Eclipse(Player* player, Unit* target, uint32 amount)
 {
     if (!amount || !target || !player->IsValidAttackTarget(target))
@@ -302,7 +344,7 @@ void Eclipse(Player* player, Unit* target, uint32 amount)
         effect->SetAmount(int32(std::min<uint64>(INT32_MAX, uint64(std::max(0, effect->GetAmount())) + amount)));
     else
         Copy(player, target, 505340, amount);
-    if (player->HasAura(704579) && (!target->ToCreature() || !target->ToCreature()->IsDungeonBoss()))
+    if (player->HasAura(704579) && !IsBoss(target))
         Cast(player, target, 505342);
 }
 bool Daytime()
@@ -325,6 +367,21 @@ void ReleaseSuncharge(Player* player, Unit* target, uint32 stacks)
     Cast(player,target,807064);
     State(player).sunchargeStacks = previous;
     target->RemoveAurasDueToSpell(807080,player->GetGUID());
+}
+namespace
+{
+void MapButtons(Player* player, uint32 from, uint32 to)
+{
+    bool changed = false;
+    for (uint8 slot = 0; slot < MAX_ACTION_BUTTONS; ++slot)
+    {
+        ActionButton const* button = player->GetActionButton(slot);
+        if (button && button->GetType() == ACTION_BUTTON_SPELL && button->GetAction() == from)
+            changed = player->addActionButton(slot, to, ACTION_BUTTON_SPELL) != nullptr || changed;
+    }
+    if (changed && player->IsInWorld())
+        player->SendActionButtons(1);
+}
 }
 void Refresh(Player* player)
 {
@@ -351,7 +408,7 @@ void Refresh(Player* player)
                                 std::pair(805267u, 807876u), std::pair(300314u, 301341u)})
         KeepHelper(player, helper, healthy && player->HasAura(talent));
     bool day = player->IsAlive() && Daytime();
-    SetHelper(player, 707768, day && player->HasAura(707078));
+    KeepHelper(player, 707768, day && player->HasAura(707078));
     int32 extraHaste = 0;
     for (uint32 id : {300363, 300621, 300626})
         if (player->HasAura(id))
@@ -366,16 +423,37 @@ void Refresh(Player* player)
     SetAmount(player, 680639, 1, int32(5 * player->GetStat(STAT_INTELLECT)));
     for (uint32 id : {803500, 803492, 807750, 807751, 807752, 807446, 805481, 805491, 681471})
         player->RemoveAurasDueToSpell(id);
-    bool replacement = player->IsAlive() && player->HasAura(803238) && player->HasSpell(Highest(player, 800231));
+    uint32 sunflare = Highest(player, 800231);
+    bool replacement = player->IsAlive() && player->HasAura(803238) && player->HasSpell(sunflare);
     if (replacement && !player->HasSpell(504764))
-        player->learnSpell(504764, true);
+        player->learnSpellWithoutAnnouncement(504764);
     for (auto const& pair : player->GetSpellMap())
-        if (player->HasSpell(pair.first) && Named(sSpellMgr->GetSpellInfo(pair.first), 800231))
-            player->SetTemporarySpellReplacement(pair.first, replacement ? 504764 : 0);
-    if (!replacement)
+        if (player->HasSpell(pair.first) && Named(sSpellMgr->GetSpellInfo(pair.first), 800231) &&
+            (!replacement || pair.first != sunflare))
+            player->SetTemporarySpellReplacement(pair.first, 0);
+    if (replacement)
+        player->SetTemporarySpellReplacement(sunflare, 504764);
+    if (!replacement && !player->HasAura(807059))
         player->removeSpell(504764, SPEC_MASK_ALL, true);
-    if (!player->IsInCombat())
-        state.firstAttacks.clear();
+    bool conversion = player->IsAlive() && player->HasAura(Dawn) && player->HasSpell(DawnCast);
+    bool const converted = player->HasSpell(RadiantConversion);
+    player->SetTemporarySpellReplacement(DawnCast, 0);
+    if (conversion)
+    {
+        if (!converted)
+        {
+            player->learnSpellWithoutAnnouncement(RadiantConversion);
+            if (player->IsInWorld())
+                player->SendLearnPacket(RadiantConversion, true);
+        }
+        MapButtons(player, DawnCast, RadiantConversion);
+    }
+    else
+    {
+        MapButtons(player, RadiantConversion, DawnCast);
+        if (converted)
+            player->removeSpell(RadiantConversion, SPEC_MASK_ALL, true);
+    }
     state.refreshing = false;
 }
 }

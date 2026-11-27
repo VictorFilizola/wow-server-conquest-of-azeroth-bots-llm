@@ -81,11 +81,18 @@ void HandleAscensionBarbarianAura(Player* player, uint32 spellId, bool apply)
             break;
         case FILL_LEVEL:
             helper = FILL_LEVEL_EFFECTS;
-            if (!apply)
+            if (apply)
+            {
+                if (!player->HasSpell(helper))
+                    player->learnSpell(helper, false);
+            }
+            else
             {
                 player->RemoveAurasDueToSpell(TANKARD);
                 player->RemoveAurasDueToSpell(AscensionBarbarian::SPELL_FULL_TANKARD);
                 player->RemoveAurasDueToSpell(AscensionBarbarian::SPELL_EMPTY_TANKARD);
+                if (player->HasSpell(helper))
+                    player->removeSpell(helper, SPEC_MASK_ALL, false);
             }
             break;
         case BODY_BUILDER:
@@ -102,16 +109,31 @@ void HandleAscensionBarbarianAura(Player* player, uint32 spellId, bool apply)
     }
     else
         player->RemoveAurasDueToSpell(helper);
+
+    if (spellId == BODY_BUILDER)
+        player->UpdateAttackPowerAndDamage(false);
 }
 
-void HandleAscensionBarbarianAttackPower(Player* player, float& modifier, bool ranged)
+float AscensionBarbarian::UnbuffedAgility(Player const* player)
 {
-    if (!player || player->getClass() != CLASS_BARBARIAN || ranged ||
-        player->GetStat(STAT_STRENGTH) < player->GetStat(STAT_AGILITY))
-        return;
+    UnitMods const agility = UnitMods(UNIT_MOD_STAT_START + AsUnderlyingType(STAT_AGILITY));
+    return player->GetCreateStat(STAT_AGILITY) + player->GetFlatModifierValue(agility, BASE_VALUE);
+}
 
-    if (AuraEffect const* effect = player->GetAuraEffect(BODY_BUILDER, EFFECT_0))
-        modifier -= CalculatePct(player->GetStat(STAT_STRENGTH), effect->GetAmount());
+float AscensionBarbarian::BodyBuilderAttackPowerCorrection(Player* player)
+{
+    if (!player || player->getClass() != CLASS_BARBARIAN)
+        return 0.0f;
+
+    AuraEffect const* bonus = player->GetAuraEffect(BODY_BUILDER, EFFECT_0);
+    if (!bonus || bonus->GetAuraType() != SPELL_AURA_MOD_ATTACK_POWER_OF_STAT_PERCENT)
+        return 0.0f;
+
+    float const strength = player->GetStat(STAT_STRENGTH);
+    if (strength < UnbuffedAgility(player))
+        return 0.0f;
+
+    return -CalculatePct(strength, bonus->GetAmount());
 }
 
 void HandleAscensionBarbarianCast(Spell* spell)
@@ -154,10 +176,5 @@ void HandleAscensionBarbarianCast(Spell* spell)
             reset.push_back(spellId);
     }
     for (uint32 spellId : reset)
-    {
         player->RemoveSpellCooldown(spellId, true);
-        if (SpellInfo const* spear = sSpellMgr->GetSpellInfo(spellId))
-            if (uint32 category = spear->GetCategory())
-                player->RemoveCategoryCooldown(category);
-    }
 }

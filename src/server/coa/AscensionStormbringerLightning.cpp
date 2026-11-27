@@ -6,6 +6,7 @@
 #include "SpellAuraEffects.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "SpellScript.h"
 
 #include <algorithm>
 #include <limits>
@@ -24,7 +25,9 @@ enum StormbringerLightningSpells : uint32
     SPELL_FORKED_LIGHTNING_FIRST_RANK = 801851,
     SPELL_ARM_OF_THORIM_FIRST_RANK = 801847,
     SPELL_CALL_LIGHTNING = 500040,
-    SPELL_ELECTROCUTE_FIRST_RANK = 801844
+    SPELL_ELECTROCUTE_FIRST_RANK = 801844,
+    SPELL_VOLT_FIRST_RANK = 500928,
+    SPELL_VOLT_HIGH_VOLTAGE = 500936
 };
 
 class stormbringer_lightning_procs : public AllSpellScript
@@ -39,10 +42,14 @@ public:
         SpellInfo const* info = spell->GetSpellInfo();
         if (!owner || owner->getClass() != CLASS_STORMBRINGER || info->SpellFamilyName != 22 ||
             !target || !target->IsAlive() || !owner->IsValidAttackTarget(target) ||
-            miss != SPELL_MISS_NONE || !damage)
+            miss != SPELL_MISS_NONE)
             return;
 
         uint32 source = sSpellMgr->GetFirstSpellInChain(info->Id);
+        ApplyHighVoltage(owner, target, source);
+        if (!damage)
+            return;
+
         MarkFluxArc(owner, target, source);
         SplashFluxArc(owner, target, source, damage);
         ApplySparks(owner, target, source);
@@ -50,6 +57,13 @@ public:
     }
 
 private:
+    void ApplyHighVoltage(Player* owner, Unit* target, uint32 source) const
+    {
+        if (source != SPELL_VOLT_FIRST_RANK)
+            return;
+        owner->CastSpell(target, SPELL_VOLT_HIGH_VOLTAGE, true);
+    }
+
     void MarkFluxArc(Player* owner, Unit* target, uint32 source) const
     {
         if ((source != SPELL_FORKED_LIGHTNING_FIRST_RANK && source != SPELL_ARM_OF_THORIM_FIRST_RANK) ||
@@ -91,9 +105,45 @@ private:
         owner->CastSpell(target, SPELL_THUNDER_WAVE_STRIKE, true);
     }
 };
+
+class spell_ascension_eye_of_the_storm_pulse : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_eye_of_the_storm_pulse);
+
+    void FilterUnitTarget(WorldObject*& target)
+    {
+        if (!target || !target->ToUnit() || !target->ToUnit()->IsAlive())
+            target = nullptr;
+    }
+
+    void FilterAreaTargets(std::list<WorldObject*>& targets)
+    {
+        targets.remove_if([](WorldObject const* target)
+        {
+            return !target || !target->ToUnit() || !target->ToUnit()->IsAlive();
+        });
+    }
+
+    void ClearDeadAnchor()
+    {
+        Unit const* target = GetSpell()->m_targets.GetUnitTarget();
+        if (target && !target->IsAlive())
+            GetSpell()->m_targets.RemoveObjectTarget();
+    }
+
+    void Register() override
+    {
+        OnObjectTargetSelect += SpellObjectTargetSelectFn(spell_ascension_eye_of_the_storm_pulse::FilterUnitTarget,
+            EFFECT_ALL, TARGET_UNIT_TARGET_ENEMY);
+        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(
+            spell_ascension_eye_of_the_storm_pulse::FilterAreaTargets, EFFECT_ALL, TARGET_UNIT_DEST_AREA_ENEMY);
+        OnCast += SpellCastFn(spell_ascension_eye_of_the_storm_pulse::ClearDeadAnchor);
+    }
+};
 }
 
 void AddSC_AscensionStormbringerLightning()
 {
     new stormbringer_lightning_procs();
+    RegisterSpellScript(spell_ascension_eye_of_the_storm_pulse);
 }

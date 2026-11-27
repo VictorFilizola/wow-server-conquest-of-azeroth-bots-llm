@@ -41,3 +41,17 @@ src/server/coa/AscensionClassContracts19To25Data.h -text
 src/server/coa/AscensionClassContracts26To32Data.h -text
 src/server/coa/AscensionCoATalentData.h -text
 src/server/coa/AscensionCustomClassData.h -text
+
+# Binary client patches, archives, and images
+*.MPQ binary
+*.mpq binary
+*.dll binary
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.dbc binary
+*.zip binary
+*.gz binary

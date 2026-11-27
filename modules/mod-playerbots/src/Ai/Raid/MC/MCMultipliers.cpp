@@ -13,6 +13,9 @@
 #include "HunterActions.h"
 #include "MCActions.h"
 #include "MCHelpers.h"
+#include "MCTriggers.h"
+#include "Spell.h"
+#include "SpellMgr.h"
 #include "MovementActions.h"
 #include "PaladinActions.h"
 #include "Playerbots.h"
@@ -131,7 +134,9 @@ float GolemaggMultiplier::GetValue(Action* action)
             return 0.0f;
 
         // Backed-off melee stay out until their whole Magma Splash stack expires (30s after the last application).
-        bool backedOff = GetAuraStacks(bot, MAGMA_SPLASH_AURAS) >= MAGMA_SPLASH_BACK_OFF_STACKS;
+        uint32 const splashStacks = GetAuraStacks(bot, MAGMA_SPLASH_AURAS) +
+                                    (McCoaFixesOn() ? GetAuraStacks(bot, MAGMA_SPLASH_COA_AURAS) : 0);
+        bool backedOff = splashStacks >= MAGMA_SPLASH_BACK_OFF_STACKS;
         bool engagesBoss = !dynamic_cast<McGolemaggBackOffAction*>(action) &&
                            (dynamic_cast<AttackAction*>(action) || dynamic_cast<MeleeAction*>(action) ||
                             dynamic_cast<CastReachTargetSpellAction*>(action));
@@ -139,4 +144,116 @@ float GolemaggMultiplier::GetValue(Action* action)
             return 0.0f;
     }
     return 1.0f;
+}
+
+float MajordomoReflectionMultiplier::GetValue(Action* action)
+{
+    // Majordomo shields his adds for 10 s: Magic Reflection sends spells back at the caster, Damage Shield
+    // burns every melee hit. Bots hold those attacks on their target until it fades; tanks keep the adds.
+    if (PlayerbotAI::IsTank(bot))
+        return 1.0f;
+
+    bool const isAttack = dynamic_cast<AttackAction*>(action) != nullptr;
+    auto* spellAction = dynamic_cast<CastSpellAction*>(action);
+    if (!isAttack && !spellAction)
+        return 1.0f;
+
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!IsMajordomoAdd(target))
+        return 1.0f;
+
+    bool const reflects = target->HasAura(SPELL_MAGIC_REFLECTION);
+    bool const shielded = target->HasAura(SPELL_DAMAGE_SHIELD);
+    if (!reflects && !shielded)
+        return 1.0f;
+
+    // Only melee swings hit the shield; ranged auto-attacks do not.
+    if (isAttack)
+        return shielded && PlayerbotAI::IsMelee(bot) ? 0.0f : 1.0f;
+
+    if (spellAction->GetTargetName() != "current target")
+        return 1.0f;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(AI_VALUE2(uint32, "spell id", spellAction->getSpell()));
+    if (!spellInfo)
+        return 1.0f;
+
+    // The core's own tests: Spell::m_canReflect, and Unit::DealDamage for Damage Shield procs.
+    auto const canReflect = [](SpellInfo const* info)
+    {
+        return info && info->DmgClass == SPELL_DAMAGE_CLASS_MAGIC && !info->HasAttribute(SPELL_ATTR0_IS_ABILITY) &&
+               !info->HasAttribute(SPELL_ATTR1_NO_REFLECTION) && !info->HasAttribute(SPELL_ATTR0_NO_IMMUNITIES) &&
+               !info->IsPassive() && (!info->IsPositive() || info->HasEffect(SPELL_EFFECT_DISPEL));
+    };
+    if (reflects)
+    {
+        if (canReflect(spellInfo))
+            return 0.0f;
+
+        // A channel like Arcane Missiles is not reflected itself, but the spells it triggers are.
+        for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+        {
+            if (effect.TriggerSpell && canReflect(sSpellMgr->GetSpellInfo(effect.TriggerSpell)))
+                return 0.0f;
+        }
+    }
+
+    if (shielded && spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE &&
+        !(spellInfo->GetSchoolMask() & SPELL_SCHOOL_MASK_HOLY))
+        return 0.0f;
+
+    return 1.0f;
+}
+
+float ShazzrahReflectionMultiplier::GetValue(Action* action)
+{
+    if (PlayerbotAI::IsTank(bot) || PlayerbotAI::IsRanged(bot))
+        return 1.0f;
+
+    Unit* boss = AI_VALUE2(Unit*, "find target", "shazzrah");
+    if (!boss || !IsShazzrahHeldByTank(boss) ||
+        !FindReflectionNear(GetShazzrahReflections(boss), boss, REFLECTION_DISTANCE))
+        return 1.0f;
+
+    bool const engagesBoss = !dynamic_cast<McMoveFromShazzrahReflectionAction*>(action) &&
+                             (dynamic_cast<AttackAction*>(action) || dynamic_cast<MeleeAction*>(action) ||
+                              dynamic_cast<CastReachTargetSpellAction*>(action));
+    return engagesBoss ? 0.0f : 1.0f;
+}
+
+float ShazzrahSaveInterruptMultiplier::GetValue(Action* action)
+{
+    constexpr uint32 SPELL_COA_ARCANE_FORCE_NOVA = 2105612;
+    auto* cast = dynamic_cast<CastSpellAction*>(action);
+    if (!cast || !McCoaFixesOn())
+        return 1.0f;
+
+    Unit* target = cast->GetTarget();
+    if (!target || !target->IsAlive() || !IsMcEntry(target->GetEntry(), 12264))  // Shazzrah
+        return 1.0f;
+    Spell* casting = target->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+    if (!casting || !casting->m_spellInfo || casting->m_spellInfo->Id == SPELL_COA_ARCANE_FORCE_NOVA)
+        return 1.0f;
+
+    // Only an interrupt is held back: a spell of this bot that interrupts a cast.
+    uint32 const spellId = AI_VALUE2(uint32, "spell id", cast->getSpell());
+    SpellInfo const* info = spellId ? sSpellMgr->GetSpellInfo(spellId) : nullptr;
+    return info && info->HasEffect(SPELL_EFFECT_INTERRUPT_CAST) ? 0.0f : 1.0f;
+}
+
+float RagnarosSonsNoAoeMultiplier::GetValue(Action* action)
+{
+    if (!McCoaFixesOn() || bot->GetMapId() != 409 || !IsDpsBotWithAoeAction(bot, action))
+        return 1.0f;
+    return FindSonOfFlameToKill(bot) ? 0.0f : 1.0f;
+}
+
+float GarrFireswornEruptionMultiplier::GetValue(Action* action)
+{
+    if (!McCoaFixesOn() || bot->GetMapId() != 409 || PlayerbotAI::IsTank(bot) || !PlayerbotAI::IsMelee(bot))
+        return 1.0f;
+    if (!dynamic_cast<ReachMeleeAction*>(action) && !dynamic_cast<MeleeAction*>(action))
+        return 1.0f;
+    // The margin keeps a bot that just stepped out from walking straight back in.
+    return FindDyingFireswornNear(bot, FIRESWORN_ERUPTION_YARDS + 4.0f) ? 0.0f : 1.0f;
 }

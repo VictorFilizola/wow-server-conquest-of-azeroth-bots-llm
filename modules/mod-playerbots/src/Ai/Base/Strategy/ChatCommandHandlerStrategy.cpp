@@ -108,6 +108,10 @@ ChatCommandHandlerStrategy::ChatCommandHandlerStrategy(PlayerbotAI* botAI) : Pas
     supported.push_back("emblems");
     supported.push_back("talents");
     supported.push_back("wcr");
+    supported.push_back("mission");
+    supported.push_back("alt");
+    supported.push_back("tank");
+    supported.push_back("loot pet");
     supported.push_back("wildcard");
     supported.push_back("spells");
     supported.push_back("co");

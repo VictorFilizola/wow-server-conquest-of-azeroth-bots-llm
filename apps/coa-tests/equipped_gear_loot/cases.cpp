@@ -13,6 +13,7 @@ ItemTemplate Gear(uint32 display, uint32 stat, uint32 type = INVTYPE_CHEST, uint
 void Reset()
 {
     objectMgr.items.clear();
+    itemDisplayInfos.clear();
     sCreatureDisplayInfoStore.rows.clear();
     sCreatureDisplayInfoExtraStore.rows.clear();
     presets.rows.clear();
@@ -125,7 +126,7 @@ int main()
     assert(AddLoot(&caster, staff, 1) && staff.items.front().itemid == 400);
     assert(!AddLoot(&caster, staff, 1) && staff.items.size() == 1);
 
-    for (uint32 rejected = 0; rejected < 14; ++rejected)
+    for (uint32 rejected = 0; rejected < 15; ++rejected)
     {
         Reset();
         Outfit(1, 5000);
@@ -149,11 +150,27 @@ int main()
             item.Name1 = "Bloodforged Stone Sledgehammer";
             item.Description = "@Bloodforged@";
         }
+        if (rejected == 14) item.Description = "@Mythic@Also serves as a mining pick.";
         objectMgr.items[500] = item;
         Index();
         Loot rejectedLoot;
         assert(!AddLoot(&physical, rejectedLoot, 1));
     }
+
+    Reset();
+    Creature kobold;
+    kobold.level = 60;
+    kobold.weapons[0] = 756;
+    objectMgr.items[756] = Gear(3743, ITEM_MOD_AGILITY, INVTYPE_2HWEAPON, 24);
+    objectMgr.items[756].Class = ITEM_CLASS_WEAPON;
+    objectMgr.items[756].SubClass = 1;
+    objectMgr.items[131103] = objectMgr.items[756];
+    objectMgr.items[131103].RequiredLevel = 60;
+    objectMgr.items[131103].Description = "@Mythic@Also serves as a mining pick.";
+    Index();
+    Loot pick;
+    pick.lootOwnerGUID = owner.guid;
+    assert(AddLoot(&kobold, pick, 1) && pick.items.front().itemid == 756);
 
     Reset();
     Outfit(1, 6000);
@@ -272,4 +289,45 @@ int main()
     auto const firstAliases = mappings;
     AscensionItemAppearanceAliases::AddAliases(mappings, sources);
     assert(mappings == firstAliases);
+
+    Reset();
+    auto chestVisual = [](uint32 id, std::string const& torso, std::string const& icon)
+    {
+        ItemDisplayInfoRow row;
+        row.ints[0] = id;
+        row.strings[5] = icon;
+        row.strings[18] = torso;
+        return row;
+    };
+    itemDisplayInfos.push_back(chestVisual(3511, "Plate_B_03Sentinel_Chest_TU", "INV_Chest_Plate08"));
+    itemDisplayInfos.push_back(chestVisual(147451, "Plate_B_03Sentinel_Chest_TU", "INV_Chest_Plate08"));
+    itemDisplayInfos.push_back(chestVisual(148534, "Plate_B_03Sentinel_Chest_TU", "INV_Chest_Plate08"));
+    itemDisplayInfos.push_back(chestVisual(9999, "Other_Chest_TU", "INV_Chest_Plate08"));
+    auto particleDiff = chestVisual(7777, "Plate_B_03Sentinel_Chest_TU", "INV_Chest_Plate08");
+    particleDiff.ints[24] = 5;
+    itemDisplayInfos.push_back(particleDiff);
+    itemDisplayInfos.push_back(chestVisual(8881, "", "INV_Misc_QuestionMark"));
+    itemDisplayInfos.push_back(chestVisual(8882, "", "INV_Misc_QuestionMark"));
+    Outfit(12270, 3511);
+    objectMgr.items[2062669] = Gear(147451, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 56);
+    objectMgr.items[2063780] = Gear(148534, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 58);
+    objectMgr.items[99999] = Gear(9999, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 56);
+    objectMgr.items[77777] = Gear(7777, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 56);
+    objectMgr.items[88888] = Gear(8882, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 56);
+    Index();
+    assert(SameAppearance(3511, 147451));
+    assert(!SameAppearance(3511, 9999));
+    assert(!SameAppearance(3511, 7777));
+    assert(!SameAppearance(8881, 8882));
+    Creature sentinel;
+    sentinel.display = 12270;
+    sentinel.level = 56;
+    Loot sentinelLoot;
+    sentinelLoot.lootOwnerGUID = owner.guid;
+    assert(AddLoot(&sentinel, sentinelLoot, 1) && sentinelLoot.items.front().itemid == 2062669);
+    objectMgr.items[11111] = Gear(3511, ITEM_MOD_STRENGTH, INVTYPE_CHEST, 40);
+    Index();
+    Loot exactWins;
+    exactWins.lootOwnerGUID = owner.guid;
+    assert(AddLoot(&sentinel, exactWins, 1) && exactWins.items.front().itemid == 11111);
 }

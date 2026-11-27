@@ -21,6 +21,17 @@ public:
     bool Execute(Event event) override;
     void Sell(FindItemVisitor* visitor);
     void Sell(Item* item);
+
+private:
+    void TellSummary();
+    bool VendorInReach();
+    bool WalkToMasterVendor(std::string const& text);
+
+    bool batch = false;
+    ObjectGuid walkedTo;
+    time_t walkedUntil = 0;
+    uint32 soldCount = 0;
+    uint32 soldMoney = 0;
 };
 
 #endif

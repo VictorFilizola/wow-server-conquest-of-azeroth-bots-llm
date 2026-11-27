@@ -7,6 +7,7 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -21,23 +22,38 @@ bool IsVisiblePosition(uint8 bag, uint8 slot)
     return bag >= INVENTORY_SLOT_BAG_START && bag < INVENTORY_SLOT_BAG_END;
 }
 
+bool FitsAt(Player* player, uint8 bag, uint8 slot, uint32 itemId, uint32 count, bool onExistingStack,
+    ItemPosCountVec& dest)
+{
+    Item const* held = player->GetItemByPos(bag, slot);
+    if (onExistingStack != (held && held->GetEntry() == itemId))
+        return false;
+
+    dest.clear();
+    return player->CanStoreItem(bag, slot, dest, itemId, count) == EQUIP_ERR_OK;
+}
+
 bool FindVisibleDestination(Player* player, uint32 itemId, uint32 count, ItemPosCountVec& dest)
 {
-    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-        if (player->CanStoreItem(INVENTORY_SLOT_BAG_0, slot, dest, itemId, count) == EQUIP_ERR_OK)
-            return true;
-
-    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    for (bool const onExistingStack : { true, false })
     {
-        Bag* container = player->GetBagByPos(bag);
-        if (!container)
-            continue;
-
-        for (uint8 slot = 0; slot < container->GetBagSize(); ++slot)
-            if (player->CanStoreItem(bag, slot, dest, itemId, count) == EQUIP_ERR_OK)
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (FitsAt(player, INVENTORY_SLOT_BAG_0, slot, itemId, count, onExistingStack, dest))
                 return true;
+
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        {
+            Bag* container = player->GetBagByPos(bag);
+            if (!container)
+                continue;
+
+            for (uint8 slot = 0; slot < container->GetBagSize(); ++slot)
+                if (FitsAt(player, bag, slot, itemId, count, onExistingStack, dest))
+                    return true;
+        }
     }
 
+    dest.clear();
     return false;
 }
 
@@ -57,25 +73,26 @@ InventoryResult StoreOne(Player* player, Reward const& reward, Item*& stored)
     return EQUIP_ERR_OK;
 }
 
-bool PostOne(Player* player, Reward const& reward)
+bool PrepareMail(Player* player, std::vector<Reward> const& rewards, std::vector<std::unique_ptr<Item>>& items)
 {
-    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reward.itemId);
-    if (!proto)
-        return false;
-
-    uint32 remaining = reward.count;
-    uint32 const perStack = std::max<uint32>(1, proto->GetMaxStackSize());
-    while (remaining)
+    for (Reward const& reward : rewards)
     {
-        uint32 const chunk = std::min<uint32>(remaining, perStack);
-        Item* posted = Item::CreateItem(reward.itemId, chunk, player, false, reward.randomPropertyId);
-        if (!posted)
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reward.itemId);
+        if (!proto)
             return false;
 
-        player->SendItemRetrievalMail(posted);
-        remaining -= chunk;
+        uint32 remaining = reward.count;
+        uint32 const perStack = std::max<uint32>(1, proto->GetMaxStackSize());
+        while (remaining)
+        {
+            uint32 const chunk = std::min<uint32>(remaining, perStack);
+            std::unique_ptr<Item> item(Item::CreateItem(reward.itemId, chunk, player, false, reward.randomPropertyId));
+            if (!item)
+                return false;
+            items.push_back(std::move(item));
+            remaining -= chunk;
+        }
     }
-
     return true;
 }
 
@@ -129,17 +146,18 @@ bool Deliver(Player* player, std::vector<Reward> const& rewards, Item* cache)
         posted.push_back(reward);
     }
 
-    for (Reward const& reward : posted)
-        if (!PostOne(player, reward))
-        {
-            for (auto const& given : stored)
-                UndoOne(player, given.first, given.second);
-            LOG_ERROR("coa",
-                "cache {} reward {} x{} could not be taken by the bags or posted to {}; cache kept",
-                cache ? cache->GetEntry() : 0, reward.itemId, reward.count,
-                player->GetGUID().ToString());
-            return false;
-        }
+    std::vector<std::unique_ptr<Item>> mailItems;
+    if (!PrepareMail(player, posted, mailItems))
+    {
+        for (auto given = stored.rbegin(); given != stored.rend(); ++given)
+            UndoOne(player, given->first, given->second);
+        LOG_ERROR("coa", "cache {} rewards could not be prepared for {}; cache kept",
+            cache ? cache->GetEntry() : 0, player->GetGUID().ToString());
+        return false;
+    }
+
+    for (std::unique_ptr<Item>& item : mailItems)
+        player->SendItemRetrievalMail(item.release());
 
     for (auto const& given : stored)
         player->SendNewItem(given.first, given.second, true, false, false);

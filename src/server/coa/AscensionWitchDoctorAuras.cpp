@@ -16,6 +16,8 @@ namespace AscensionWitchDoctor
 {
 void SyncReplacements(Player* player)
 {
+    if (!player->HasAura(MassAllcureTalent) && player->HasSpell(MassAllcure))
+        player->removeSpell(MassAllcure, SPEC_MASK_ALL, false);
     std::vector<uint32> known;
     for (auto const& [id, state] : player->GetSpellMap())
         if (state->State != PLAYERSPELL_REMOVED)
@@ -35,13 +37,13 @@ void SyncReplacements(Player* player)
         else if (IsHex(info))
         {
             selected = true;
-            if (player->HasAura(UmbralReady))
+            if (player->HasAura(UmbralReady) && id == KnownRank(player, id))
                 child = Umbral;
         }
         else if (Family(info, 1, 32768) && !IsArrow(info) && id != HexfireWrath)
         {
             selected = true;
-            if (player->HasAura(HexfireReady))
+            if (id == KnownRank(player, id) && player->HasAura(HexfireReady))
                 child = HexfireWrath;
             else if (player->HasAura(Shadowhunter) || player->HasAura(ArrowTalent))
             {
@@ -219,7 +221,7 @@ class aura_ascension_witch_doctor_lifecycle : public AuraScript
             if (player == target)
                 player->RemoveAurasDueToSpell(id == Beast ? Crystal : Beast);
             if (id == Beast)
-                Cast(player, target, BeastShield);
+                target->CastSpell(target, BeastShield, true, nullptr, nullptr, player->GetGUID());
         }
         if (Family(GetSpellInfo(), 0, 536870912))
         {
@@ -292,7 +294,7 @@ class aura_ascension_witch_doctor_lifecycle : public AuraScript
             player->CastCustomSpell(EclipseHit, SPELLVALUE_BASE_POINT0, effect->GetAmount(), GetTarget(), true, nullptr,
                                     effect);
             uint32 hits = 0;
-            for (Unit* enemy : Nearby(GetTarget(), 10.0f))
+            for (Unit* enemy : Nearby(GetTarget(), Radius(EclipseSplash)))
                 if (enemy != GetTarget() && player->IsValidAttackTarget(enemy))
                 {
                     Copy(player, enemy, EclipseSplash, _splash);
@@ -408,7 +410,7 @@ class aura_ascension_witch_doctor_lifecycle : public AuraScript
             if (Family(GetSpellInfo(), 0, 33554432) && player->HasAura(Godslayer))
             {
                 Cast(player, GetTarget(), GlaiveExplosion);
-                for (Unit* enemy : Nearby(GetTarget(), 10.0f))
+                for (Unit* enemy : Nearby(GetTarget(), Radius(GlaiveExplosion)))
                     if (enemy != GetTarget() && player->IsValidAttackTarget(enemy))
                         Cast(player, enemy, GlaiveExplosion);
             }

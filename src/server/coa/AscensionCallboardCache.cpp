@@ -55,8 +55,8 @@ struct StagedCache
 std::array<StagedCache, 9> const CallboardTiers = {{
     { RaidRelease::StageHeroicDungeons, 1615001 },
     { RaidRelease::StageMythicDungeons, 1615002 },
-    { RaidRelease::StageMoltenCore, 1615004 },
     { RaidRelease::StageZulGurub, 1615003 },
+    { RaidRelease::StageMoltenCore, 1615004 },
     { RaidRelease::StageOnyxiasLair, 1615005 },
     { RaidRelease::StageBlackwingLair, 1615006 },
     { RaidRelease::StageAhnQiraj, 1615007 },
@@ -223,6 +223,23 @@ uint32 ResolveGenericTier(Player* player, uint32 cacheItemId)
     return chosen ? chosen : lowest;
 }
 
+uint32 BestArmorClass(Player const* player)
+{
+    if (player->HasSkill(SKILL_PLATE_MAIL))
+        return ITEM_SUBCLASS_ARMOR_PLATE;
+    if (player->HasSkill(SKILL_MAIL))
+        return ITEM_SUBCLASS_ARMOR_MAIL;
+    if (player->HasSkill(SKILL_LEATHER))
+        return ITEM_SUBCLASS_ARMOR_LEATHER;
+    return ITEM_SUBCLASS_ARMOR_CLOTH;
+}
+
+bool IsLowerArmorClass(ItemTemplate const* item, uint32 bestArmorClass)
+{
+    return item->Class == ITEM_CLASS_ARMOR && item->InventoryType != INVTYPE_CLOAK &&
+        item->SubClass >= ITEM_SUBCLASS_ARMOR_CLOTH && item->SubClass < bestArmorClass;
+}
+
 bool PickReward(Player* player, CallboardPool const& pool, uint32 averageItemLevel,
     AscensionCacheRewards::Reward& out)
 {
@@ -230,9 +247,19 @@ bool PickReward(Player* player, CallboardPool const& pool, uint32 averageItemLev
     for (AscensionCacheRewards::Reward const& reward : pool)
     {
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reward.itemId);
-        if (proto && player->CanUseItem(proto) == EQUIP_ERR_OK)
+        if (proto && player->CanUseItem(proto) == EQUIP_ERR_OK &&
+            (!proto->GetSkill() || player->GetSkillValue(proto->GetSkill())))
             usable.push_back(&reward);
     }
+
+    uint32 const bestArmorClass = BestArmorClass(player);
+    std::vector<AscensionCacheRewards::Reward const*> bestArmor;
+    for (AscensionCacheRewards::Reward const* reward : usable)
+        if (!IsLowerArmorClass(sObjectMgr->GetItemTemplate(reward->itemId), bestArmorClass))
+            bestArmor.push_back(reward);
+    if (!bestArmor.empty())
+        usable = std::move(bestArmor);
+
     usable = AscensionSpecLoot::PreferSpecialization(player, usable,
         [](AscensionCacheRewards::Reward const* reward) { return sObjectMgr->GetItemTemplate(reward->itemId); });
 
@@ -416,7 +443,7 @@ void SendCacheConfig(Player* player)
     player->SendDirectMessage(&config);
 }
 
-void GrantCache(Player* player, uint32 cacheItemId)
+bool GrantCache(Player* player, uint32 cacheItemId)
 {
     ItemPosCountVec dest;
     if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, cacheItemId, 1) == EQUIP_ERR_OK)
@@ -424,13 +451,13 @@ void GrantCache(Player* player, uint32 cacheItemId)
         if (Item* item = player->StoreNewItem(dest, cacheItemId, true))
         {
             player->SendNewItem(item, 1, true, false);
-            return;
+            return true;
         }
     }
 
     Item* item = Item::CreateItem(cacheItemId, 1, player);
     if (!item)
-        return;
+        return false;
 
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
     item->SaveToDB(trans);
@@ -438,6 +465,7 @@ void GrantCache(Player* player, uint32 cacheItemId)
         .AddItem(item)
         .SendMailTo(trans, MailReceiver(player), MailSender(player));
     CharacterDatabase.CommitTransaction(trans);
+    return true;
 }
 
 void AwardQuestPoints(Player* player, uint32 questId)
@@ -457,7 +485,8 @@ void AwardQuestPoints(Player* player, uint32 questId)
     uint32 const threshold = PointsPerCache();
     while (points >= threshold)
     {
-        GrantCache(player, cacheItemId);
+        if (!GrantCache(player, cacheItemId))
+            break;
         points -= threshold;
         SetPoints(player, points);
     }
@@ -501,8 +530,12 @@ public:
 
     bool OnPlayerBeforeOpenItem(Player* player, Item* item) override
     {
-        if (!item || !OpenCallboardCache(player, item))
+        if (!item)
             return true;
+        ObjectGuid const cache = item->GetGUID();
+        if (!OpenCallboardCache(player, item))
+            return true;
+        player->SendLootRelease(cache);
         return false;
     }
 };

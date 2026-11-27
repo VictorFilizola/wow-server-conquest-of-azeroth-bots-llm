@@ -5,8 +5,11 @@
  */
 
 #include "TankTargetValue.h"
+#include "CoaOffTank.h"
 #include "AiObjectContext.h"
 #include "AttackersValue.h"
+#include "CoaAltAddon.h"
+#include "CoaPlayerMainTank.h"
 #include "Group.h"
 #include "PlayerbotAI.h"
 #include "Playerbots.h"
@@ -30,7 +33,7 @@ public:
             result = creature;
         }
         // neglect if victim is main tank, or no victim (for untauntable target)
-        if (Unit* victim = threatMgr->GetCurrentVictim())
+        if (Unit* victim = threatMgr->CanHaveThreatList() ? threatMgr->GetCurrentVictim() : creature->GetVictim())
         {
             if (victim->ToPlayer() && botAI->IsMainTank(victim->ToPlayer()))
                 return;
@@ -63,6 +66,12 @@ public:
         if (!attacker->IsAlive())
             return;
 
+        // A player who tanks for the group ("tank main on") keeps what is on the player; a target this bot gave back
+        // after a swap stays the player's to taunt (SquidBots Lite Main Tank bar).
+        Player* bot = botAI->GetBot();
+        if (CoaPlayerMainTank::HeldByPlayer(bot, attacker) || CoaPlayerMainTank::Released(bot, attacker->GetGUID()))
+            return;
+
         // Passive summons that hit nobody never give aggro: the tank walked to them (Amanitar mushrooms).
         if (Creature* creature = attacker->ToCreature())
             if (creature->HasReactState(REACT_PASSIVE) && !creature->GetVictim())
@@ -78,6 +87,15 @@ public:
         // packs, 7 to 17 times a dungeon (headless runs, 11/10): it comes last (AiPlayerbot.CoaSmartTank).
         if (sPlayerbotAIConfig.coaSmartTank && IsFleeing(new_unit) != IsFleeing(old_unit))
             return IsFleeing(old_unit);
+        // CoA Combat, off-tank: what another tank holds comes after every other mob (AiPlayerbot.CoaCombat.OffTank).
+        if (CoaOffTank::IsOffTank(bot))
+        {
+            bool decided = false;
+            bool const before = CoaOffTank::RanksBefore(CoaOffTank::HeldByOtherTank(bot, new_unit),
+                                                        CoaOffTank::HeldByOtherTank(bot, old_unit), decided);
+            if (decided)
+                return before;
+        }
         // if group has multiple tanks, explicit main tank just focus on the current target
         Unit* currentTarget = botAI->GetAiObjectContext()->GetValue<Unit*>("current target")->Get();
         if (currentTarget && botAI->IsExplicitMainTank(bot) && botAI->GetGroupTankNum(bot) > 1)
@@ -155,11 +173,52 @@ public:
     }
 };
 
+// The target the player gave this bot ("tank target", "tank swap"): first, while it lives. Once it dies the order
+// ends, its icon goes, the addon hears it, and the bot helps the player main tank on the player's target.
+Unit* TankTargetValue::PinnedOrAssist()
+{
+    uint8 icon = 0xFF;
+    ObjectGuid const pinned = CoaPlayerMainTank::Pinned(bot, &icon);
+    if (!pinned)
+        return nullptr;
+
+    // An enemy back to its spawn after a wipe or a leash (evade) is no order any more (06/11 review, point 8).
+    Unit* target = ObjectAccessor::GetUnit(*bot, pinned);
+    Creature* creature = target ? target->ToCreature() : nullptr;
+    CoaPinEnd const end = CoaPinnedTargetEnd(target != nullptr, target && target->IsAlive(),
+                                             target && target->IsInWorld() && target->GetMap() == bot->GetMap(),
+                                             creature && creature->IsInEvadeMode(),
+                                             target && bot->IsValidAttackTarget(target));
+    if (end == CoaPinEnd::Keep)
+        return target;
+
+    // The order ends like "tank clear" (placement lifted, back to assisting, said and told to the bar): done by the
+    // bot's own update before its engine runs (CoaTankOrderTick), not while the engine reads this value (RC11).
+    CoaPlayerMainTank::MarkEnded(bot, target ? target->GetName() : std::string(), end == CoaPinEnd::Dead);
+    CoaPlayerMainTank::Unpin(bot);
+    if (CoaAltAddon::MasterHasAddon(botAI->GetMaster()))
+        CoaAltAddon::SendToMaster(botAI, "TK\ttarget\tdead\t" + std::to_string(icon == 0xFF ? 0 : uint32(icon) + 1) +
+                                             "\t" + (target ? target->GetName() : std::string("-")));
+    Player* mainTank = CoaPlayerMainTank::FlaggedInGroup(bot->GetGroup(), bot);
+    Unit* assist = mainTank && mainTank->GetTarget() ? ObjectAccessor::GetUnit(*mainTank, mainTank->GetTarget()) : nullptr;
+    if (assist && assist->IsAlive() && assist->GetMap() == bot->GetMap() && bot->IsValidAttackTarget(assist))
+        return assist;
+    return nullptr;
+}
+
 Unit* TankTargetValue::Calculate()
 {
+    if (Unit* pinned = PinnedOrAssist())
+        return pinned;
+
     GuidSet const exclusions = GatherStrategyTargetExclusions(botAI, TargetValueExclusionType::TankTarget);
     std::string const rti = botAI->GetAiObjectContext()->GetValue<std::string>("rti")->Get();
     Unit* rtiTarget = RtiTargetValue::Calculate();
+    // The skull the player put on the boss the player tanks is the player's, not an order to the bot tanks: they took
+    // the boss, its victim being no bot (06/11 review, point 1).
+    if (rtiTarget &&
+        (CoaPlayerMainTank::HeldByPlayer(bot, rtiTarget) || CoaPlayerMainTank::Released(bot, rtiTarget->GetGUID())))
+        rtiTarget = nullptr;
     if (rtiTarget &&
         (!sPlayerbotAIConfig.coaExclusionsEverywhere || exclusions.find(rtiTarget->GetGUID()) == exclusions.end()))
     {

@@ -1,16 +1,22 @@
 #ifndef MANASTORM_REWARDS_H
 #define MANASTORM_REWARDS_H
 
+#include "AscensionBazaarTokenCap.h"
 #include "DatabaseEnv.h"
 #include "ManastormDefines.h"
+#include "ManastormReleaseStage.h"
+#include "ManastormCoALootPolicy.h"
 
+#include <array>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 #include <utility>
 
 class Creature;
 class ManastormRun;
+class Player;
 
 struct ManastormRewardPublication;
 
@@ -22,6 +28,18 @@ struct ManastormRewardStateSnapshot
     uint32 CachesEarned = 0;
     uint64 BedlamEarned = 0;
     uint64 BonzoEarned = 0;
+};
+
+struct ManastormWeeklyCacheAllowance
+{
+    bool Enabled = false;
+    uint32 SavedResetTime = 0;
+    uint32 SavedEarned = 0;
+    uint32 Earned = 0;
+    uint32 Limit = 0;
+    uint32 ResetTime = 0;
+
+    bool CanEarn() const { return !Enabled || Earned < Limit; }
 };
 
 struct ManastormRewardVisibilityRecord
@@ -37,6 +55,28 @@ struct ManastormRewardVisibilityRecord
     uint32 WindowEnd = 0;
 };
 
+struct ManastormCoATokenState
+{
+    ManastormCoALoot::Window Window;
+    uint64 Revision = 0;
+    std::vector<std::array<uint32, 3>> Clears;
+};
+
+class ManastormCoATokenClaims
+{
+public:
+    ManastormCoATokenClaims() = default;
+    ManastormCoATokenClaims(ManastormCoATokenClaims const&) = delete;
+    ManastormCoATokenClaims& operator=(ManastormCoATokenClaims const&) = delete;
+    ~ManastormCoATokenClaims();
+
+    uint32 Claim(ObjectGuid::LowType characterGuid, uint32 requested);
+    void Keep();
+
+private:
+    std::vector<std::pair<uint32, uint32>> _claims;
+};
+
 class ManastormRewards
 {
 public:
@@ -44,6 +84,17 @@ public:
 
     bool Load();
     bool IsLoaded() const { return _loaded; }
+    bool AwardCoAGreedyReward(Player* player, ManastormRun const& run, uint64 objectGuid,
+        uint8 quality, uint32 gold, std::string& error) const;
+    uint32 CoAEncounterTokens(uint8 source, uint8 quality) const;
+    bool IsCoAMaterialCache(uint32 entry) const;
+    bool IsCoALootMode(ObjectGuid::LowType characterGuid) const;
+    bool LoadCoATokenState(ObjectGuid::LowType characterGuid, ManastormCoATokenState& state) const;
+    bool IsCoAFirstClear(ManastormCoATokenState const& state, ManastormMode mode, bool endgame, uint32 depth) const;
+    uint32 CoATokenReward(ManastormMode mode, bool endgame, uint32 depth, bool firstClear) const;
+    std::string CoATokenClientState(ObjectGuid::LowType characterGuid, ManastormRun const* run,
+        bool includeClock = true) const;
+    AscensionBazaarTokenCap::Allowance CoAAccountAllowance(ObjectGuid::LowType characterGuid) const;
 
     bool LoadState(
         ObjectGuid::LowType characterGuid,
@@ -55,8 +106,12 @@ public:
     bool PrepareStageCompletion(
         ManastormRun const& run,
         CharacterDatabaseTransaction const& transaction,
+        ManastormCoATokenClaims& claims,
         std::vector<std::shared_ptr<ManastormRewardPublication>>& publications,
         std::string& error) const;
+
+    bool LoadWeeklyCacheAllowance(ObjectGuid::LowType characterGuid,
+        ManastormWeeklyCacheAllowance& allowance) const;
 
     bool SettlePendingCurrency(ObjectGuid::LowType characterGuid) const;
 
@@ -64,7 +119,7 @@ public:
         std::vector<std::shared_ptr<ManastormRewardPublication>>& publications) const;
 
     std::vector<ManastormRewardVisibilityRecord>
-        BuildVisibilityRecords(ObjectGuid::LowType characterGuid) const;
+        BuildVisibilityRecords(ObjectGuid::LowType characterGuid, bool endgame, uint32 bonusCaches = 0) const;
 
     bool ResolveCacheItemEntry(
         bool endgame,
@@ -77,6 +132,8 @@ public:
 
     bool IsCacheItemEntry(
         uint32 itemEntry) const;
+
+    uint32 GetReleasedItemLevelCap() const;
 
     double GetGroupRewardMultiplier(
         uint32 memberCount) const;
@@ -144,6 +201,18 @@ private:
         double Multiplier = 1.0;
     };
 
+    struct CoATokenRule
+    {
+        uint8 Mode = 0;
+        uint8 Track = 0;
+        uint32 MinDepth = 1;
+        uint32 MaxDepth = 0;
+        uint32 FirstClearTokens = 25;
+        uint32 RepeatTokens = 10;
+        uint32 MilestoneEvery = 0;
+        uint32 MilestoneTokens = 0;
+    };
+
     struct PotentialReward
     {
         uint8 DisplayOrder = 0;
@@ -165,6 +234,11 @@ private:
         uint32 CaseCount = 0;
     };
 
+    bool PrepareNormalCacheReward(ObjectGuid::LowType characterGuid, bool endgame,
+        ManastormRewardStateSnapshot const& state, CharacterDatabaseTransaction const& transaction,
+        bool& wonNormalCache, uint32& nextCacheChance, ManastormWeeklyCacheAllowance& allowance,
+        std::string& error) const;
+
     bool PrepareItemDelivery(
         ObjectGuid::LowType characterGuid,
         std::vector<std::pair<uint32, uint32>> const& stacks,
@@ -176,7 +250,15 @@ private:
     uint32 GetActiveGameModeMask(ObjectGuid::LowType characterGuid) const;
 
     bool LoadCacheBrackets();
+    bool LoadCoATokenRules();
+    void AppendCoAAllowance(ObjectGuid::LowType guid, uint32 requested,
+        CharacterDatabaseTransaction const& transaction, ManastormCoATokenClaims& claims,
+        ManastormCoATokenState& state, uint32& quantity) const;
+    bool PrepareCoATokenReward(ObjectGuid::LowType characterGuid, ManastormRun const& run,
+        CharacterDatabaseTransaction const& transaction, ManastormCoATokenClaims& claims, uint32& quantity,
+        ManastormCoATokenState& state, std::string& error, uint32 extraTokens = 0) const;
     bool LoadCacheUnlockRequirements();
+    void LoadReleasedItemLevelCaps();
     bool LoadRewardRules();
     bool LoadGroupRewardMultipliers();
     bool LoadPotentialRewards();
@@ -197,11 +279,14 @@ private:
 
     std::vector<CacheBracket> _cacheBrackets;
     std::vector<CacheUnlockRequirement> _cacheUnlockRequirements;
+    std::array<uint32, ManastormReleaseStage::AllReleased + 1> _releasedItemLevelCaps{};
     RewardRule _bedlam;
     RewardRule _bonzo;
     std::vector<RewardRule> _completionRewards;
     std::vector<GroupRewardRange> _groupRewardRanges;
     std::vector<PotentialReward> _potentialRewards;
+    std::vector<CoATokenRule> _coaTokenRules;
+    std::map<std::pair<uint8, uint8>, uint32> _coaEncounterTokens;
     TreasureKeeperRule _treasureKeeper;
     bool _loaded = false;
 };

@@ -5,6 +5,7 @@
  */
 
 #include "SuggestWhatToDoAction.h"
+#include "CoaLive.h"
 #include "AiFactory.h"
 #include "BroadcastHelper.h"
 #include "Channel.h"
@@ -42,6 +43,9 @@ SuggestWhatToDoAction::SuggestWhatToDoAction(PlayerbotAI* botAI, std::string con
 
 bool SuggestWhatToDoAction::isUseful()
 {
+    // RandomBotTalk suggestions: silent while the living chat speaks (AiPlayerbot.CoaLive.LegacyChat).
+    if (!CoaLive::LegacyChatOn())
+        return false;
     if (!sRandomPlayerbotMgr.IsRandomBot(bot) || bot->GetGroup() || bot->GetInstanceId() || bot->GetBattleground())
         return false;
 
@@ -314,6 +318,11 @@ SuggestTradeAction::SuggestTradeAction(PlayerbotAI* botAI) : SuggestWhatToDoActi
 
 bool SuggestTradeAction::Execute(Event /*event*/)
 {
+    // CoA Economy: no offer stands behind this WTS (a player asking its price got small talk): while the living chat
+    // speaks, CoA Live's Trade WTS (offer, quote, COD) are the only ones.
+    if (!CoaLive::LegacySellOn())
+        return false;
+
     uint32 quality = urand(0, 100);
     if (quality > 95)
         quality = ITEM_QUALITY_LEGENDARY;

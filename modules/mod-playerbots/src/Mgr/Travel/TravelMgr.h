@@ -13,7 +13,9 @@
 #include "GridDefines.h"
 #include "PlayerbotAIConfig.h"
 #include <boost/functional/hash.hpp>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <random>
 
 class Creature;
@@ -881,7 +883,66 @@ public:
     std::vector<WorldLocation> GetCityLocations(Player* bot);
     std::vector<uint32> GetFlightNodesInZone(uint32 zoneId, TeamId team, uint32 excludeNode = 0) const;
     bool SelectAuctioneerByMap(Player* bot, NpcLocation& outAuctioneer);
-    std::vector<WorldLocation> const& GetLocsPerLevelCache(uint8 level) { return locsPerLevelCache[level]; }
+    std::vector<WorldLocation> const& GetLocsPerLevelCache(uint8 level) { return CacheAt(locsPerLevelCache, level); }
+
+    // The per-level caches are read from the map update threads: find() never inserts, operator[] did for a level
+    // with no entry, a write racing every other reader of the map.
+    template <class T>
+    static std::vector<T> const& CacheAt(std::map<uint8, std::vector<T>> const& cache, uint32 level)
+    {
+        static std::vector<T> const empty;
+        auto const itr = cache.find(static_cast<uint8>(level));
+        return itr != cache.end() ? itr->second : empty;
+    }
+
+    // Herbs and mining veins of the world, grouped by 200-yard cell, for the gathering missions of the alts; the
+    // beasts to skin and the fishing pools too (2.8.4).
+    struct GatherPoint
+    {
+        float x;
+        float y;
+        float z;
+        uint32 reqSkill;
+        uint32 entry;               // the gameobject of the node; skinning: the creature
+        uint32 level = 0;           // skinning: the creature's level
+        uint32 areaId = 0;          // fishing: the area of the water, whose fishing loot it gives
+    };
+
+    // The "profession" of a cloth mission (humanoids killed for their cloth): no skill, the alt's level stands for it.
+    static constexpr uint32 GATHER_CLOTH = 60000;
+    // The creatures whose loot may hold cloth (humanoids of normal rank), read at the start.
+    bool DropsCloth(uint32 creatureEntry) const { return clothCreatures.count(creatureEntry) != 0; }
+
+    struct GatherCell
+    {
+        uint32 mapId = 0;
+        uint32 zoneId = 0;
+        uint32 skillId = 0;
+        // The spawn point nearest the middle of the cell, where the bot heads first.
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        // Every spawn point of the cell in walking order: only part of them is up at a time (pools).
+        std::vector<GatherPoint> points;
+        // Level of the hostile creatures of the cell (three quarters of them are at most this level); 0: none.
+        uint32 dangerLevel = 0;
+    };
+
+    // The cell of the bot's continent, in a zone of its level, where most nodes still raise skillValue.
+    // Picks at random among the best few so that several alts do not crowd the same cell.
+    // nodes: only the spawn points of these gameobjects count (a mission ordering one item).
+    GatherCell const* SelectGatherCell(Player* bot, uint32 skillId, uint32 skillValue,
+                                       GatherCell const* exclude = nullptr,
+                                       std::set<uint32> const* nodes = nullptr) const;
+    // The herb and ore nodes whose loot has this item, with their profession and the lowest skill they need; else the
+    // beasts whose skin gives it (creature entries), else the waters where it is fished (fishing pools and area ids).
+    static std::set<uint32> NodesYielding(uint32 itemId, uint32& skillId, uint32& reqSkill);
+    // NodesYielding read from the database (world database queries), cached by NodesYielding.
+    static std::set<uint32> ReadNodesYielding(uint32 itemId, uint32& skillId, uint32& reqSkill);
+    // The cell whose anchor point is (x, y), to resume a saved mission.
+    GatherCell const* FindGatherCell(uint32 mapId, uint32 skillId, float x, float y) const;
+    // A fishing cell of one point, for water found next to the bot where no pool is known; kept until the restart.
+    GatherCell const* AddFishingCell(uint32 mapId, uint32 zoneId, float x, float y, float z);
 
     template <class D, class W, class URBG>
     void weighted_shuffle(D first, D last, W first_weight, W last_weight, URBG&& g)
@@ -976,6 +1037,7 @@ private:
     // Navigation initialization
     void PrepareZone2LevelBracket();
     void PrepareDestinationCache();
+    void PrepareGatherNodeCache();
 
     // Internal types
     struct LevelBracket
@@ -1001,6 +1063,11 @@ private:
     std::map<uint8, std::vector<WorldLocation>> locsPerLevelCache;
     std::unordered_map<uint32, std::vector<WorldLocation>> creatureSpawnsByTemplate;
     std::map<uint32, LevelBracket> zone2LevelBracket;
+    std::vector<GatherCell> gatherCells;
+    std::set<uint32> clothCreatures;
+    // AddFishingCell: a deque, so that the cells already given never move.
+    std::deque<GatherCell> extraGatherCells;
+    mutable std::mutex extraGatherLock;
 };
 
 #define sTravelMgr TravelMgr::instance()

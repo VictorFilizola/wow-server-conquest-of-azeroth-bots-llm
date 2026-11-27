@@ -216,7 +216,15 @@ class aura_ascension_cultist_lifecycle : public AuraScript
         if (id == 255281 && index == 1)
             Resource(player, Insanity, -1, true);
         if (id == 520345 && !index)
-            Cast(player, GetTarget(), 520346);
+        {
+            AuraEffect* allyShield = GetTarget()->GetAuraEffect(520346, EFFECT_0, player->GetGUID());
+            AuraEffect* selfShield = player->GetAuraEffect(520346, EFFECT_1, player->GetGUID());
+            bool finalTick = GetAura()->IsExpired() ||
+                (effect->GetTotalTicks() > 0 && int32(effect->GetTickNumber()) >= effect->GetTotalTicks());
+            if (!finalTick || (allyShield && selfShield &&
+                allyShield->GetAmount() > 0 && selfShield->GetAmount() > 0))
+                Cast(player, GetTarget(), 520346);
+        }
         if (id == 704476 && !index && player->HasAura(524877))
         {
             Cast(player, GetTarget(), 704473);
@@ -227,8 +235,7 @@ class aura_ascension_cultist_lifecycle : public AuraScript
             PreventDefaultAction();
             Spell* channel = player->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
             if (channel && channel->GetSpellInfo()->Id == 804275 && channel->IsChannelActive())
-                for (Unit* ally : Allies(player, player, Radius(807219)))
-                    Cast(player, ally, 807219);
+                Cast(player, player, 807219);
             else
                 GetAura()->Remove();
         }
@@ -281,11 +288,9 @@ class aura_ascension_cultist_lifecycle : public AuraScript
         bool old = State(player).event;
         State(player).event = true;
         if (player->HasAura(681088))
-        {
-            int32 previous = player->GetAuraEffect(681067, EFFECT_0) ? player->GetAuraEffect(681067, EFFECT_0)->GetAmount() : 0;
-            Copy(player, player, 681067, std::max(0, previous) + CalculatePct(amount, Amount(681088, 1)));
-        }
-        if (Named(GetSpellInfo(), 500715) && GetTarget() != player && player->HasAura(525060) && damage.GetAttacker())
+            GrantEmbodiment(player, CalculatePct(amount, Amount(681088, 1)));
+        if (Named(GetSpellInfo(), 500715) && player->HasAura(525060) && damage.GetAttacker() &&
+            damage.GetAttacker() != player)
             Copy(player, damage.GetAttacker(), 525062, CalculatePct(amount, Amount(525060)));
         State(player).event = old;
     }

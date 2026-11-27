@@ -236,6 +236,7 @@ enum PlayerHook
     PLAYERHOOK_ON_SPELL_CHARGE_CONSUMED,
     PLAYERHOOK_ON_SPELL_COOLDOWN_CALCULATED,
     PLAYERHOOK_CAN_ENTER_MANASTORM,
+    PLAYERHOOK_CAN_RELEASE_SPIRIT,
     PLAYERHOOK_ON_PLAYER_ENVIRONMENTAL_DAMAGE,
     PLAYERHOOK_ON_PLAYER_BREATH_INVERTED,
     PLAYERHOOK_ON_CAN_REGENERATE,
@@ -251,6 +252,7 @@ enum PlayerHook
     PLAYERHOOK_ON_TAKE_MAIL_ITEM,
     PLAYERHOOK_CAN_TAKE_QUEST,
     PLAYERHOOK_CAN_REWARD_QUEST,
+    PLAYERHOOK_CAN_REPEAT_DAILY_QUEST,
     PLAYERHOOK_ON_QUEST_GIVER_CHOOSE_REWARD,
     PLAYERHOOK_ON_REFRESH_QUEST_GIVER,
     PLAYERHOOK_ON_COA_PROGRESS,
@@ -260,6 +262,16 @@ enum PlayerHook
     PLAYERHOOK_ON_COA_PRESTIGE_SAVED,
     PLAYERHOOK_ON_MASTER_LOOT_ITEM,
     PLAYERHOOK_ON_GET_SHAPESHIFT_MODEL,
+    PLAYERHOOK_ON_GET_NAME_QUERY_RACE,
+    PLAYERHOOK_CAN_LFG_TELEPORT,
+    PLAYERHOOK_ON_HOLDS_TANK_OR_HEALER_ROLE,
+    PLAYERHOOK_ON_SAVE_INVENTORY,
+    PLAYERHOOK_ON_AFTER_CHAT,
+    PLAYERHOOK_ON_AFTER_PRIVATE_CHAT,
+    PLAYERHOOK_ON_AFTER_GROUP_CHAT,
+    PLAYERHOOK_ON_AFTER_GUILD_CHAT,
+    PLAYERHOOK_ON_AFTER_CHANNEL_CHAT,
+    PLAYERHOOK_ON_AFTER_SEND_MAIL,
     PLAYERHOOK_END
 };
 
@@ -277,7 +289,25 @@ enum class CoAProgressEvent : uint8
     VanityDelivered,
     VanityCollected,
     AppearanceCollected,
-    ExperimentalTeleporter
+    ExperimentalTeleporter,
+    OutfitSaved,
+    MysticScrollPurchased,
+    MysticScrollReforged,
+    MysticExtractEarned,
+    MysticEnchantExtracted,
+    MysticCollectionApplied,
+    MysticScrollApplied,
+    MysticPresetActivated,
+    ArchitectOpened,
+    BuildActivated,
+    SoloArenaQueued,
+    WildcardScrollUnlearned,
+    WildcardEntryLocked,
+    WildcardCardPackOpened,
+    WildcardStarterCardSet,
+    WildcardScrollsClaimed,
+    WildcardScrollsRepurchased,
+    WildcardRapidRolled
 };
 
 class PlayerScript : public ScriptObject
@@ -364,6 +394,10 @@ public:
     // returns true.
     virtual bool OnPlayerHasNoBonusExperience(Player* /*player*/) { return false; }
 
+    // Whether the player's active specialization tanks or heals. Vanilla 5-player dungeon bosses never use
+    // sleep, charm or possession on such a player (BossControlTargeting.h).
+    virtual bool OnPlayerHoldsTankOrHealerRole(Player const* /*player*/) { return false; }
+
     // Called when a player, or a unit they control, lands the killing blow on a player that counted as an honorable kill
     virtual void OnPlayerHonorableKillingBlow(Player* /*killer*/, Player* /*victim*/) { }
 
@@ -430,6 +464,7 @@ public:
 
     // Called when a player is about to be saved.
     virtual void OnPlayerSave(Player* /*player*/) { }
+    virtual void OnPlayerSaveInventory(Player* /*player*/, CharacterDatabaseTransaction /*trans*/) { }
 
     virtual void OnPlayerNormalizeActionButtonSpell(Player* /*player*/, uint32& /*action*/, bool /*loading*/) { }
 
@@ -701,6 +736,9 @@ public:
     // Model the player takes in a shapeshift form; leaving modelId at 0 keeps the form's own model.
     virtual void OnPlayerGetShapeshiftModel(Player* /*player*/, uint8 /*form*/, uint32 /*spellId*/, uint32& /*modelId*/) { }
 
+    // Race sent in name query responses; the client places a battleground scoreboard row by its faction.
+    virtual void OnPlayerGetNameQueryRace(Player* /*player*/, uint8& /*race*/) { }
+
     [[nodiscard]] virtual bool OnPlayerCanEquipItem(Player* /*player*/, uint8 /*slot*/, uint16& /*dest*/, Item* /*pItem*/, bool /*swap*/, bool /*not_loading*/) { return true; }
 
     [[nodiscard]] virtual bool OnPlayerCanUnequipItem(Player* /*player*/, uint16 /*pos*/, bool /*swap*/) { return true; }
@@ -737,6 +775,8 @@ public:
     [[nodiscard]] virtual bool OnPlayerNotSetArenaTeamInfoField(Player* /*player*/, uint8 /*slot*/, ArenaTeamInfoType /*type*/, uint32 /*value*/) { return true; } // Whats that?
 
     [[nodiscard]] virtual bool OnPlayerCanJoinLfg(Player* /*player*/, uint8 /*roles*/, std::set<uint32>& /*dungeons*/, std::string const& /*comment*/) { return true; }
+
+    [[nodiscard]] virtual bool OnPlayerCanLfgTeleport(Player* /*player*/) { return true; }
 
     [[nodiscard]] virtual bool OnPlayerCanEnterMap(Player* /*player*/, MapEntry const* /*entry*/, InstanceTemplate const* /*instance*/, MapDifficulty const* /*mapDiff*/, bool /*loginCheck*/) { return true; }
 
@@ -824,6 +864,14 @@ public:
      * @return True if you want to continue sending the message, false if you want to disable sending the message
      */
     [[nodiscard]] virtual bool OnPlayerCanUseChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string& /*msg*/, Channel* /*channel*/) { return true; }
+
+    virtual void OnPlayerAfterChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string const& /*msg*/) { }
+    virtual void OnPlayerAfterChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string const& /*msg*/, Player* /*receiver*/) { }
+    virtual void OnPlayerAfterChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string const& /*msg*/, Group* /*group*/) { }
+    virtual void OnPlayerAfterChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string const& /*msg*/, Guild* /*guild*/) { }
+    virtual void OnPlayerAfterChat(Player* /*player*/, uint32 /*type*/, uint32 /*language*/, std::string const& /*msg*/, Channel* /*channel*/) { }
+    virtual void OnPlayerAfterSendMail(Player* /*player*/, ObjectGuid /*receiverGuid*/, uint32 /*receiverAccount*/, std::string const& /*receiverName*/,
+        uint32 /*mailId*/, std::string const& /*subject*/, std::string const& /*body*/) { }
 
     /**
      * @brief This hook called after player learning talents
@@ -931,6 +979,15 @@ public:
      * @return true if player is allowed to enter the Manastorm
      */
     virtual bool OnPlayerCanEnterManastorm(Player* /*player*/) { return true; }
+
+    /**
+     * @brief This hook is called when a dead player asks to release their spirit.
+     *
+     * @param player Contains information about the Player
+     *
+     * @return true if the player may release now
+     */
+    virtual bool OnPlayerCanReleaseSpirit(Player* /*player*/) { return true; }
 
     // Called when a player withdraws from a bank the Ascension personal/realm bank items
     // open (an item moved out, or money taken out). `kind`: 0 = personal, 1 = realm.
@@ -1074,6 +1131,18 @@ public:
      * @return false to refuse the ordinary quest reward
      */
     [[nodiscard]] virtual bool OnPlayerCanRewardQuest(Player const* /*player*/, Quest const* /*quest*/) { return true; }
+
+    /**
+     * @brief This hook is called when the player already did a daily quest today and the core checks it again.
+     *
+     * @param player Contains information about the Player
+     * @param quest The daily quest
+     * @return true to let the player take and turn in the daily quest once more today
+     */
+    [[nodiscard]] virtual bool OnPlayerCanRepeatDailyQuest(Player const* /*player*/, Quest const* /*quest*/)
+    {
+        return false;
+    }
 
     /**
      * @brief This hook is called after a quest reward request from a validated quest giver, before the core rewards it.
