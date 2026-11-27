@@ -14,10 +14,15 @@ from chatter_constants import (
     CLASS_NAMES,
     EMOTE_LIST,
     RACE_NAMES,
+    ALLIANCE_RACE_IDS,
+    HORDE_RACE_IDS,
+    WEAPON_SUBCLASS_NAMES,
     ZONE_COORDINATES,
     ZONE_LEVELS,
 )
+from chatter_text import split_action_prefix, strip_emojis
 from spell_names import SPELL_DESCRIPTIONS, SPELL_NAMES
+from talent_data import TALENT_SPELLS, TALENT_TABS
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,13 @@ logger = logging.getLogger(__name__)
 _char_info_cache: dict = {}
 _talent_cache: dict = {}
 _online_cache: dict = {}
+_weapon_cache: dict = {}
+_pet_cache: dict = {}
+# Shorter than the other caches because this one answers
+# "is a pet out right now", which a hunter changes mid-play
+# by dismissing or calling one, rather than the far more
+# stable "does this character own a pet".
+_PET_CACHE_TTL = 60
 _cache_lock = threading.Lock()
 
 
@@ -53,7 +65,7 @@ def _cache_put(cache: dict, key, value, max_size: int = 500):
 
 
 class ZoneDataCache:
-    """Cache for zone-specific quest, loot, and mob data.
+    """Cache for zone-specific quest and mob data.
 
     Thread-safe: all methods are protected by a lock
     for concurrent access from worker threads.
@@ -63,9 +75,7 @@ class ZoneDataCache:
         self.ttl = ttl_seconds
         self._lock = threading.Lock()
         self.quest_cache: Dict[int, Tuple[List[dict], float]] = {}
-        self.loot_cache: Dict[Tuple[int, int], Tuple[List[dict], float]] = {}
         self.mob_cache: Dict[Tuple[int, int], Tuple[List[str], float]] = {}
-        self.recent_loot: Dict[int, Dict[int, float]] = {}
 
     def get_quests(self, zone_id: int) -> Optional[List[dict]]:
         with self._lock:
@@ -78,25 +88,6 @@ class ZoneDataCache:
     def set_quests(self, zone_id: int, quests: List[dict]):
         with self._lock:
             self.quest_cache[zone_id] = (quests, time.time())
-
-    def get_loot(
-        self, min_level: int, max_level: int
-    ) -> Optional[List[dict]]:
-        with self._lock:
-            key = (min_level, max_level)
-            if key in self.loot_cache:
-                data, timestamp = self.loot_cache[key]
-                if time.time() - timestamp < self.ttl:
-                    return data
-            return None
-
-    def set_loot(
-        self, min_level: int, max_level: int, loot: List[dict]
-    ):
-        with self._lock:
-            self.loot_cache[(min_level, max_level)] = (
-                loot, time.time()
-            )
 
     def get_mobs(
         self, zone_id: int, bot_level: int
@@ -116,28 +107,6 @@ class ZoneDataCache:
             self.mob_cache[(zone_id, bot_level)] = (
                 mobs, time.time()
             )
-
-    def get_recent_loot_ids(
-        self, zone_id: int, cooldown_seconds: int
-    ) -> set:
-        with self._lock:
-            now = time.time()
-            if zone_id not in self.recent_loot:
-                return set()
-            recent = {
-                item_id: ts
-                for item_id, ts
-                in self.recent_loot[zone_id].items()
-                if now - ts < cooldown_seconds
-            }
-            self.recent_loot[zone_id] = recent
-            return set(recent.keys())
-
-    def mark_loot_seen(self, zone_id: int, item_id: int):
-        with self._lock:
-            if zone_id not in self.recent_loot:
-                self.recent_loot[zone_id] = {}
-            self.recent_loot[zone_id][item_id] = time.time()
 
 
 # Global cache instance
@@ -193,6 +162,43 @@ def get_creature_entry_column(db):
     except Exception:
         _creature_entry_col = 'id'
     return _creature_entry_col
+
+
+# Race names the worldserver wrote at startup, for races outside
+# RACE_NAMES (added through ChrRaces). Replaced, never mutated, by
+# load_race_names() so worker threads always read a whole dict.
+_server_race_names: Dict[int, str] = {}
+
+
+def load_race_names(db) -> None:
+    """Refresh the race names from llm_chatter_race_names.
+
+    Keeps the previous names when the table cannot be read (not
+    created yet, or the worldserver has not started).
+    """
+    global _server_race_names
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT race_id, name FROM llm_chatter_race_names"
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+    except Exception:
+        logger.debug("Could not read race names", exc_info=True)
+        return
+    _server_race_names = {
+        int(row['race_id']): row['name']
+        for row in rows if row.get('name')
+    }
+
+
+def get_race_name(race_id: int, default: str = "Unknown") -> str:
+    """Get human-readable race name from race ID."""
+    return (
+        RACE_NAMES.get(race_id)
+        or _server_race_names.get(race_id, default)
+    )
 
 
 def wait_for_database(
@@ -270,123 +276,6 @@ def query_zone_quests(
 
         zone_cache.set_quests(zone_id, quests)
         return quests
-
-    except Exception:
-        return []
-
-
-def query_zone_loot(
-    config: dict, zone_id: int, bot_level: int
-) -> List[dict]:
-    """Query loot appropriate for the zone."""
-    # No loot drops in capital cities
-    if zone_id in CAPITAL_CITY_ZONES:
-        return []
-
-    min_level, max_level = _get_zone_level_range(zone_id, bot_level)
-
-    cached = zone_cache.get_loot(zone_id, 0)
-    if cached is not None:
-        return cached
-
-    try:
-        db = get_db_connection(config, 'acore_world')
-        cursor = db.cursor(dictionary=True)
-
-        loot = []
-
-        if zone_id in ZONE_COORDINATES:
-            map_id, min_x, max_x, min_y, max_y = (
-                ZONE_COORDINATES[zone_id]
-            )
-            entry_col = get_creature_entry_column(db)
-            cursor.execute(f"""
-                SELECT DISTINCT
-                    i.entry as item_id,
-                    i.name as item_name,
-                    i.Quality as item_quality,
-                    i.AllowableClass as allowable_class,
-                    i.SellPrice as sell_price,
-                    ct.name as drops_from
-                FROM creature c
-                JOIN creature_template ct ON c.{entry_col} = ct.entry
-                JOIN creature_loot_template clt
-                    ON ct.lootid = clt.Entry
-                JOIN item_template i ON clt.Item = i.entry
-                WHERE c.map = %s
-                  AND c.position_x BETWEEN %s AND %s
-                  AND c.position_y BETWEEN %s AND %s
-                  AND ct.minlevel >= %s
-                  AND ct.maxlevel <= %s
-                  AND i.Quality IN (0, 1)
-                  AND i.class IN (2, 4, 7)
-                  AND clt.Chance >= 5
-                ORDER BY RAND()
-                LIMIT 15
-            """, (
-                map_id, min_x, max_x, min_y, max_y,
-                max(1, min_level - 3), max_level + 5
-            ))
-            loot.extend(cursor.fetchall())
-        else:
-            cursor.execute("""
-                SELECT DISTINCT
-                    i.entry as item_id,
-                    i.name as item_name,
-                    i.Quality as item_quality,
-                    i.AllowableClass as allowable_class,
-                    i.SellPrice as sell_price,
-                    ct.name as drops_from
-                FROM creature_template ct
-                JOIN creature_loot_template clt
-                    ON ct.lootid = clt.Entry
-                JOIN item_template i ON clt.Item = i.entry
-                WHERE ct.minlevel >= %s
-                  AND ct.maxlevel <= %s
-                  AND i.Quality IN (0, 1)
-                  AND i.class IN (2, 4, 7)
-                  AND clt.Chance >= 5
-                ORDER BY RAND()
-                LIMIT 15
-            """, (max(1, min_level - 3), max_level + 5))
-            loot.extend(cursor.fetchall())
-
-        # Green/Blue/Epic from reference loot tables
-        green_ref_min = 1020000 + (min_level * 100) + min_level
-        green_ref_max = 1020000 + (max_level * 100) + max_level
-        blue_ref_min = 1030000 + (min_level * 100) + min_level
-        blue_ref_max = 1030000 + (max_level * 100) + max_level
-        epic_ref_min = 1040000 + (min_level * 100) + min_level
-        epic_ref_max = 1040000 + (max_level * 100) + max_level
-
-        ref_filter = f"""
-            (rlt.Entry BETWEEN {green_ref_min} AND {green_ref_max}
-             OR rlt.Entry BETWEEN {blue_ref_min} AND {blue_ref_max}
-             OR rlt.Entry BETWEEN {epic_ref_min} AND {epic_ref_max})
-        """
-
-        cursor.execute(f"""
-            SELECT DISTINCT
-                i.entry as item_id,
-                i.name as item_name,
-                i.Quality as item_quality,
-                i.AllowableClass as allowable_class,
-                i.SellPrice as sell_price,
-                'world drop' as drops_from
-            FROM reference_loot_template rlt
-            JOIN item_template i ON rlt.Item = i.entry
-            WHERE {ref_filter}
-              AND i.class IN (2, 4)
-              AND i.RequiredLevel BETWEEN %s AND %s
-            ORDER BY RAND()
-            LIMIT 15
-        """, (max(1, min_level - 5), max_level + 5))
-        loot.extend(cursor.fetchall())
-
-        db.close()
-
-        zone_cache.set_loot(zone_id, 0, loot)
-        return loot
 
     except Exception:
         return []
@@ -545,6 +434,28 @@ def _unit_class_name(unit_class: int) -> str:
     }.get(int(unit_class or 0), '')
 
 
+# Gender of a creature template from its models (world DB), or NULL.
+# Conservative: every model needs creature_model_info metadata, none may
+# have a DisplayID_Other_Gender alternate (the core can swap a spawn to it
+# at random), and all models must agree on male (0) or female (1);
+# GENDER_NONE (2), mixed or missing models stay unknown.
+NPC_MODEL_GENDER_SQL = """(
+    SELECT CASE
+        WHEN COUNT(*) > 0
+         AND COUNT(cmi.DisplayID) = COUNT(*)
+         AND SUM(CASE WHEN cmi.DisplayID_Other_Gender <> 0
+                      THEN 1 ELSE 0 END) = 0
+         AND COUNT(DISTINCT cmi.Gender) = 1
+         AND MIN(cmi.Gender) IN (0, 1)
+        THEN MIN(cmi.Gender)
+    END
+    FROM creature_template_model ctm
+    LEFT JOIN creature_model_info cmi
+        ON cmi.DisplayID = ctm.CreatureDisplayID
+    WHERE ctm.CreatureID = ct.entry
+)"""
+
+
 def query_zone_npcs(
     config: dict, zone_id: int, limit: int = 40
 ) -> List[dict]:
@@ -554,6 +465,10 @@ def query_zone_npcs(
     """
     if not zone_id:
         return []
+
+    # Deferred: chatter_member_gender imports chatter_shared, which
+    # imports chatter_db.
+    from chatter_member_gender import gender_from_id
 
     try:
         db = get_db_connection(config, 'acore_world')
@@ -588,13 +503,25 @@ def query_zone_npcs(
                 ZONE_COORDINATES[zone_id]
             )
             entry_col = get_creature_entry_column(db)
+            # Deferred import -- chatter_shared imports
+            # FROM chatter_db, so a top-level import here
+            # would be circular.
+            from chatter_shared import (
+                get_language_locale_code,
+            )
+            locale = get_language_locale_code()
             cursor.execute(f"""
                 SELECT DISTINCT
                     ct.entry, ct.name, ct.subname,
+                    ctl.Title AS subname_locale,
                     ct.npcflag, ct.type, ct.unit_class,
-                    ct.minlevel, ct.maxlevel
+                    ct.minlevel, ct.maxlevel,
+                    {NPC_MODEL_GENDER_SQL} AS model_gender
                 FROM creature c
                 JOIN creature_template ct ON c.{entry_col} = ct.entry
+                LEFT JOIN creature_template_locale ctl
+                    ON ctl.entry = ct.entry
+                    AND ctl.locale = %s
                 WHERE c.map = %s
                   AND c.position_x BETWEEN %s AND %s
                   AND c.position_y BETWEEN %s AND %s
@@ -602,7 +529,7 @@ def query_zone_npcs(
                 ORDER BY RAND()
                 LIMIT %s
             """, (
-                map_id, min_x, max_x, min_y, max_y,
+                locale, map_id, min_x, max_x, min_y, max_y,
                 limit,
             ))
             rows = cursor.fetchall()
@@ -613,10 +540,18 @@ def query_zone_npcs(
         for row in rows:
             npcflag = int(row.get('npcflag') or 0)
             subname = row.get('subname') or ''
+            # Blizzard-localized Title when available
+            # (creature_template_locale); function-role
+            # keyword matching below still uses the raw
+            # English subname since flag_roles/keywords
+            # are English-only.
+            subname_display = (
+                row.get('subname_locale') or subname
+            )
             results.append({
                 'entry': int(row.get('entry') or 0),
                 'name': row.get('name') or 'Unknown NPC',
-                'subname': subname,
+                'subname': subname_display,
                 'function': _npc_function_from_flags(
                     npcflag, subname
                 ),
@@ -626,6 +561,7 @@ def query_zone_npcs(
                 ),
                 'minlevel': int(row.get('minlevel') or 0),
                 'maxlevel': int(row.get('maxlevel') or 0),
+                'gender': gender_from_id(row.get('model_gender')),
             })
         return results
 
@@ -637,6 +573,9 @@ def query_zone_bot_gossip_targets(
     cursor, zone_id: int, exclude_guids=None, limit: int = 30
 ) -> List[dict]:
     """Return online random bots in a zone for gossip targets."""
+    # Local import: chatter_shared imports chatter_db at load time.
+    from chatter_shared import get_gender_label
+
     if not zone_id:
         return []
 
@@ -646,7 +585,7 @@ def query_zone_bot_gossip_targets(
     cursor.execute("""
         SELECT DISTINCT
             c.guid, c.name, c.class, c.race,
-            c.level, c.zone
+            c.level, c.zone, c.gender
         FROM characters c
         JOIN acore_auth.account a
             ON c.account = a.id
@@ -668,11 +607,13 @@ def query_zone_bot_gossip_targets(
             'class': CLASS_NAMES.get(
                 int(row.get('class') or 0), 'Adventurer'
             ),
-            'race': RACE_NAMES.get(
-                int(row.get('race') or 0), 'Unknown'
-            ),
+            'race': get_race_name(int(row.get('race') or 0)),
             'level': int(row.get('level') or 0),
             'zone_id': int(row.get('zone') or 0),
+            'gender': (
+                get_gender_label(int(row['gender']))
+                if row.get('gender') is not None else ''
+            ),
         })
     return targets
 
@@ -777,12 +718,19 @@ def insert_chat_message(
     delivery_policy: str = None,
     delivery_reason: str = None,
     owner_subsystem: str = None,
+    addressee_player_guid: int = None,
+    addressee_bot_guid: int = None,
+    addressee_npc_spawn_id: int = None,
+    held: bool = False,
 ):
     """Insert a message into llm_chatter_messages.
 
+    held=True stores the row with no deliver_at, so delivery never
+    picks it up until something releases it (sets deliver_at).
+
     Centralised helper replacing individual INSERT
     statements across the codebase. Handles the emote
-    column transparently.
+    column transparently. Returns the new row id.
 
     owner_subsystem is the authoritative classifier read by
     C++ delivery to honor per-subsystem master toggles (e.g.
@@ -831,28 +779,49 @@ def insert_chat_message(
             delivery_reason,
         )
 
+    # cleanup_message() inlines the LLM's action field as a
+    # leading *asterisk* prefix. Pull it back out here so C++
+    # delivery can send it as a /e text emote ahead of the
+    # spoken line. Doing it at the single insert chokepoint
+    # covers every producer without touching each call site.
+    message, action = split_action_prefix(message)
+    had_text = bool(message)
+    message = strip_emojis(message)
+    action = strip_emojis(action) or None
+    if had_text and not message:
+        logger.info(
+            "skipping emoji-only message from %s (%s)", bot_name, channel,
+        )
+        return
+
     cursor = db.cursor()
     cursor.execute("""
         INSERT INTO llm_chatter_messages
         (event_id, queue_id, sequence, bot_guid,
-         bot_name, message, emote, npc_spawn_id,
+         bot_name, message, emote, action, npc_spawn_id,
          player_guid, channel, owner_subsystem,
          delivered, deliver_at,
-         group_id, delivery_policy, delivery_reason)
+         group_id, delivery_policy, delivery_reason,
+         addressee_player_guid, addressee_bot_guid,
+         addressee_npc_spawn_id)
         VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0,
-            DATE_ADD(NOW(), INTERVAL %s SECOND),
-            %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0,
+            CASE WHEN %s THEN NULL
+                 ELSE DATE_ADD(NOW(), INTERVAL %s SECOND) END,
+            %s, %s, %s, %s, %s, %s
         )
     """, (
         event_id, queue_id, sequence,
         bot_guid, bot_name, message,
-        validate_emote(emote), npc_spawn_id,
+        validate_emote(emote), action, npc_spawn_id,
         player_guid, channel, owner_subsystem,
-        int(final_delay),
+        1 if held else 0, int(final_delay),
         group_id, delivery_policy, delivery_reason,
+        addressee_player_guid, addressee_bot_guid,
+        addressee_npc_spawn_id,
     ))
     db.commit()
+    return getattr(cursor, 'lastrowid', None)
 
 
 def query_item_details(
@@ -912,10 +881,50 @@ def query_quest_turnin_npc(
             pass
 
 
+def get_recent_bg_messages(
+    db, match_token: str, group_id: int,
+    limit: int = 20,
+    minutes: int = 20,
+) -> list:
+    """Recent lines actually spoken to this BG match and group.
+
+    Scoped by the event envelope's match token and group, so concurrent
+    matches, the other team, other groups and earlier matches never fill
+    the window. Rows finalized with a drop_reason were never spoken.
+    Returns message strings, newest first.
+    """
+    if not match_token or not group_id:
+        return []
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT m.message
+            FROM llm_chatter_messages m
+            JOIN llm_chatter_events e
+                ON m.event_id = e.id
+            WHERE m.delivered = 1
+              AND m.drop_reason IS NULL
+              AND m.channel IN ('party', 'battleground')
+              AND m.delivered_at > DATE_SUB(
+                  NOW(), INTERVAL %s MINUTE
+              )
+              AND JSON_UNQUOTE(JSON_EXTRACT(
+                  e.extra_data, '$.bg_match_token')) = %s
+              AND JSON_EXTRACT(e.extra_data, '$.group_id') = %s
+            ORDER BY m.delivered_at DESC
+            LIMIT %s
+        """, (minutes, match_token, group_id, limit))
+        rows = cursor.fetchall()
+        return [r['message'] for r in rows if r.get('message')]
+    except Exception:
+        return []
+
+
 def get_recent_zone_messages(
     db, zone_id: int,
     limit: int = 15,
-    minutes: int = 30
+    minutes: int = 30,
+    faction: str = '',
 ) -> list:
     """Fetch recent delivered messages for a zone.
 
@@ -926,14 +935,30 @@ def get_recent_zone_messages(
     if not zone_id:
         return []
     try:
+        race_ids = {
+            'Alliance': ALLIANCE_RACE_IDS,
+            'Horde': HORDE_RACE_IDS,
+        }.get(faction)
+        faction_filter = (
+            'AND c.race IN ('
+            + ', '.join(str(i) for i in race_ids) + ')'
+            if race_ids else ''
+        )
+        # Faction-scoped anti-repetition context fails closed when
+        # the speaking character can no longer be identified.
+        character_join = (
+            'JOIN characters c ON c.guid = m.bot_guid'
+            if faction_filter else ''
+        )
         cursor = db.cursor(dictionary=True)
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT m.message
             FROM llm_chatter_messages m
             LEFT JOIN llm_chatter_queue q
                 ON m.queue_id = q.id
             LEFT JOIN llm_chatter_events e
                 ON m.event_id = e.id
+            {character_join}
             WHERE m.delivered = 1
               AND m.channel IN (
                   'general', 'say', 'party',
@@ -944,6 +969,7 @@ def get_recent_zone_messages(
               )
               AND (q.zone_id = %s
                    OR e.zone_id = %s)
+              {faction_filter}
             ORDER BY m.delivered_at DESC
             LIMIT %s
         """, (minutes, zone_id, zone_id, limit))
@@ -1141,6 +1167,33 @@ def is_player_online(
         return True  # assume online on error
 
 
+def get_character_location(db, char_name: str) -> tuple:
+    """(zone, map) of a character, or (0, 0).
+
+    Not cached: the worldserver writes a real player's zone and map
+    to characters as soon as they change zone, and callers compare
+    them with where the bots are right now.
+    """
+    if not char_name:
+        return (0, 0)
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT zone, map FROM characters "
+            "WHERE name = %s LIMIT 1",
+            (char_name,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return (
+                int(row.get('zone') or 0),
+                int(row.get('map') or 0),
+            )
+    except Exception:
+        pass
+    return (0, 0)
+
+
 def get_character_talents(
     db, char_guid: int
 ) -> dict:
@@ -1176,53 +1229,46 @@ def get_character_talents(
     if cached is not None:
         return cached
 
+    # acore_world.talent_dbc is empty by design (the core loads
+    # Talent.dbc from the client data), so talent spells are mapped
+    # through talent_data.json instead of a SQL join.
     try:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT
-                tt.Name_Lang_enUS AS tree_name,
-                s.Name_Lang_enUS AS talent_name,
-                CASE
-                    WHEN ct.spell = t.SpellRank_1 THEN 1
-                    WHEN ct.spell = t.SpellRank_2 THEN 2
-                    WHEN ct.spell = t.SpellRank_3 THEN 3
-                    WHEN ct.spell = t.SpellRank_4 THEN 4
-                    WHEN ct.spell = t.SpellRank_5 THEN 5
-                    ELSE 0
-                END AS points
-            FROM acore_characters.character_talent ct
-            JOIN acore_world.talent_dbc t
-                ON ct.spell IN (
-                    t.SpellRank_1, t.SpellRank_2,
-                    t.SpellRank_3, t.SpellRank_4,
-                    t.SpellRank_5
-                )
-            JOIN acore_world.talenttab_dbc tt
-                ON tt.ID = t.TabID
-            JOIN acore_world.spell_dbc s
-                ON s.ID = t.SpellRank_1
-            WHERE ct.guid = %s
-              AND (ct.specMask & (1 << %s)) <> 0
-            ORDER BY tt.OrderIndex, t.TierID,
-                     t.ColumnIndex
+            SELECT spell
+            FROM acore_characters.character_talent
+            WHERE guid = %s
+              AND (specMask & (1 << %s)) <> 0
         """, (char_guid, active_spec))
 
-        rows = cursor.fetchall()
-        if not rows:
+        learned: Dict[int, dict] = {}
+        for row in cursor.fetchall():
+            info = TALENT_SPELLS.get(int(row['spell'] or 0))
+            if not info:
+                continue
+            known = learned.get(info['talent_id'])
+            if not known or info['rank'] > known['rank']:
+                learned[info['talent_id']] = info
+        if not learned:
             _cache_put(
                 _talent_cache, cache_key, empty, 500
             )
             return empty
 
+        def _order(info):
+            tab = TALENT_TABS.get(info['tab_id']) or {}
+            return (tab.get('order', 99), info['tier'],
+                    info['column'])
+
         talents = []
         tree_totals: Dict[str, int] = {}
-        for row in rows:
-            tree = row['tree_name'] or 'Unknown'
-            name = row['talent_name'] or 'Unknown'
-            pts = int(row['points'] or 0)
+        for info in sorted(learned.values(), key=_order):
+            tree = (TALENT_TABS.get(info['tab_id']) or {}).get(
+                'name') or 'Unknown'
+            pts = info['rank']
             talents.append({
                 'tree_name': tree,
-                'talent_name': name,
+                'talent_name': info['name'] or 'Unknown',
                 'points': pts,
             })
             tree_totals[tree] = (
@@ -1240,6 +1286,143 @@ def get_character_talents(
 
     except Exception:
         return empty
+
+
+# Equipment slots holding what a character fights with.
+_MAIN_HAND_SLOT = 15
+_OFF_HAND_SLOT = 16
+_RANGED_SLOT = 17
+
+# The off hand and ranged slots also accept armor-class
+# items: shields, held items, and the class relics.
+_ARMOR_ITEM_KINDS = {
+    0: "held item",
+    6: "shield",
+    7: "libram",
+    8: "idol",
+    9: "totem",
+    10: "sigil",
+}
+
+_ITEM_CLASS_WEAPON = 2
+_ITEM_CLASS_ARMOR = 4
+
+
+def _describe_item_kind(item_class: int, subclass: int):
+    """Return a readable weapon/off-hand type, or None."""
+    if item_class == _ITEM_CLASS_WEAPON:
+        name = WEAPON_SUBCLASS_NAMES.get(subclass)
+        return name.lower() if name else None
+    if item_class == _ITEM_CLASS_ARMOR:
+        return _ARMOR_ITEM_KINDS.get(subclass)
+    return None
+
+
+def get_character_weapons(db, char_guid: int) -> List[dict]:
+    """Return what a character is currently wielding.
+
+    Each entry has 'name', 'kind' (readable type such as
+    "two-handed sword" or "shield") and 'slot'. Ordered
+    main hand, off hand, ranged.
+    """
+    cached = _cache_get(_weapon_cache, char_guid, 300)
+    if cached is not None:
+        return cached
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT ci.slot,
+                   it.name AS item_name,
+                   it.class AS item_class,
+                   it.subclass AS item_subclass
+            FROM acore_characters.character_inventory ci
+            JOIN acore_characters.item_instance ii
+                ON ii.guid = ci.item
+            JOIN acore_world.item_template it
+                ON it.entry = ii.itemEntry
+            WHERE ci.guid = %s
+              AND ci.bag = 0
+              AND ci.slot IN (%s, %s, %s)
+            ORDER BY ci.slot
+        """, (
+            char_guid,
+            _MAIN_HAND_SLOT,
+            _OFF_HAND_SLOT,
+            _RANGED_SLOT,
+        ))
+        rows = cursor.fetchall()
+        cursor.close()
+    except Exception:
+        return []
+
+    weapons = []
+    for row in rows:
+        name = (row.get('item_name') or '').strip()
+        if not name:
+            continue
+        kind = _describe_item_kind(
+            int(row.get('item_class') or 0),
+            int(row.get('item_subclass') or 0),
+        )
+        if not kind:
+            continue
+        weapons.append({
+            'name': name,
+            'kind': kind,
+            'slot': int(row.get('slot') or 0),
+        })
+
+    _cache_put(_weapon_cache, char_guid, weapons, 500)
+    return weapons
+
+
+def get_character_pet(db, char_guid: int) -> Optional[dict]:
+    """Return the pet at a character's side as
+    {'name', 'species'}, or None when none is out.
+
+    Only slot 0 counts. AzerothCore stores that as
+    PET_SAVE_AS_CURRENT, the pet actually summoned; slots 1-4
+    are the stable and slot 100 is owned but dismissed. Those
+    are pets the character has, not pets standing next to
+    them, and a bot told about one would talk to a companion
+    that is not there.
+    """
+    cached = _cache_get(_pet_cache, char_guid, _PET_CACHE_TTL)
+    if cached is not None:
+        # Absence is cached as an empty dict so that
+        # petless characters skip the query too.
+        return cached or None
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT cp.name AS pet_name,
+                   ct.name AS species
+            FROM acore_characters.character_pet cp
+            JOIN acore_world.creature_template ct
+                ON ct.entry = cp.entry
+            WHERE cp.owner = %s
+              AND cp.slot = 0
+            LIMIT 1
+        """, (char_guid,))
+        row = cursor.fetchone()
+        cursor.close()
+    except Exception:
+        return None
+
+    pet = {}
+    if row:
+        name = (row.get('pet_name') or '').strip()
+        species = (row.get('species') or '').strip()
+        if name or species:
+            pet = {
+                'name': name or species,
+                'species': species,
+            }
+
+    _cache_put(_pet_cache, char_guid, pet, 500)
+    return pet or None
 
 
 def any_real_players_online(db) -> bool:
@@ -1402,6 +1585,18 @@ def cleanup_stale_groups(db) -> int:
                 teardown_group_session(gid)
             except Exception:
                 pass
+            try:
+                from chatter_threads import clear_group
+                clear_group(gid)
+            except Exception:
+                pass
+            try:
+                from chatter_party_presence import (
+                    clear_group as clear_presence,
+                )
+                clear_presence(gid)
+            except Exception:
+                pass
             cleaned += 1
 
         db.commit()
@@ -1440,6 +1635,7 @@ def get_zone_bot_candidates(
                 c.class as bot1_class,
                 c.race as bot1_race,
                 c.level as bot1_level,
+                c.gender as bot1_gender,
                 c.zone as zone_id
             FROM characters c
             JOIN acore_auth.account a
@@ -1472,6 +1668,7 @@ def get_zone_bot_candidates(
                 c.class as bot1_class,
                 c.race as bot1_race,
                 c.level as bot1_level,
+                c.gender as bot1_gender,
                 c.zone as zone_id
             FROM characters c
             JOIN acore_auth.account a
@@ -1500,8 +1697,13 @@ def get_zone_bot_candidates(
 
 def get_bots_by_guid(cursor, guid_list):
     """Return bot rows for a list of GUIDs, preserving
-    caller order. Used by transport_arrives verified
-    bots.
+    caller order. Used for bots C++ already verified
+    (transport_arrives, loot, world events).
+
+    No RNDBOT account filter: C++ selection includes
+    alt bots (issue #98), whose accounts are ordinary
+    player accounts, and delivery re-checks that the
+    speaker is still a bot.
 
     Returns list of dicts with bot1_guid, bot1_name,
     bot1_class, bot1_race, bot1_level, zone_id keys.
@@ -1518,12 +1720,10 @@ def get_bots_by_guid(cursor, guid_list):
             c.class as bot1_class,
             c.race as bot1_race,
             c.level as bot1_level,
+            c.gender as bot1_gender,
             c.zone as zone_id
         FROM characters c
-        JOIN acore_auth.account a
-            ON c.account = a.id
         WHERE c.online = 1
-          AND a.username LIKE 'RNDBOT%%%%'
           AND c.guid IN ({placeholders})
     """, tuple(guid_list))
     rows = cursor.fetchall()
@@ -1609,12 +1809,21 @@ def cleanup_all_session_data(db):
     - llm_group_chat_history
     - llm_group_cached_responses
     - llm_general_chat_history
+    - llm_guild_session_history
+    - llm_guild_chat_sessions
     - llm_chatter_queue (pending/processing)
     - llm_chatter_messages (undelivered)
     - llm_chatter_events (pending/processing)
     """
     try:
         cursor = db.cursor()
+        try:
+            from chatter_party_presence import (
+                end_all_sessions as end_presence_sessions,
+            )
+            end_presence_sessions()
+        except Exception:
+            pass
         cursor.execute(
             "DELETE FROM llm_group_bot_traits"
         )
@@ -1628,15 +1837,30 @@ def cleanup_all_session_data(db):
             "DELETE FROM llm_general_chat_history"
         )
         cursor.execute(
+            "DELETE FROM llm_guild_session_history"
+        )
+        cursor.execute(
+            "DELETE FROM llm_guild_chat_sessions"
+        )
+        cursor.execute(
             "DELETE FROM llm_chatter_queue"
         )
         cursor.execute(
             "DELETE FROM llm_chatter_messages"
         )
+        # Finished meet greetings are the persisted cooldown for
+        # guild_meet_greeting (IsPersistedEventOnCooldown).
         cursor.execute(
-            "DELETE FROM llm_chatter_events"
+            "DELETE FROM llm_chatter_events "
+            "WHERE event_type <> 'guild_meet_greeting' "
+            "OR status IN ('pending', 'processing')"
         )
         db.commit()
+        try:
+            from chatter_threads import clear_all
+            clear_all()
+        except Exception:
+            pass
         logger.info(
             "[CLEANUP] All session data cleared"
             " — no players online"

@@ -10,6 +10,126 @@ from chatter_constants import EMOTE_LIST
 
 logger = logging.getLogger(__name__)
 
+_SENTENCE_END = re.compile(
+    r'[.!?]["\']?(?=\s)|'
+    r'[\u3002\uff01\uff1f]["\'\u300d\u300f]?'
+)
+
+# WoW links and {item:...}-style placeholders must never be split: the
+# client drops or garbles a partial link.
+_UNSPLITTABLE_RE = re.compile(
+    # The colour wrapper is optional: a model may write a bare |H...|h link.
+    r'(?:\|c[0-9A-Fa-f]{8})?\|H[^|]*\|h\[[^\]]*\]\|h(?:\|r)?'
+    r'|\{\{?(?:quest|item|spell):[^}]+\}\}?'
+)
+
+
+# The WoW client font has no emoji glyphs. Besides the pictographs this
+# covers the invisible joiners, variation selectors, keycap and tag
+# characters that survive when only the base emoji is removed.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U00002190-\U000021FF"
+    "\U00002300-\U000023FF"
+    "\U000025A0-\U000025FF"
+    "\U00002B00-\U00002BFF"
+    "\U00002934\U00002935"
+    "\U0000203C\U00002049\U00002139\U000024C2"
+    "\U00003030\U0000303D\U00003297\U00003299"
+    "\U0000200D\U000020E3\U0000FE0E\U0000FE0F"
+    "\U000E0020-\U000E007F"
+    "]+"
+)
+
+
+def strip_emojis(message: str) -> str:
+    """Remove emojis and tidy the spaces they leave behind."""
+    if not message or not isinstance(message, str):
+        return message
+    result = _EMOJI_RE.sub('', message)
+    if result == message:
+        return message
+    result = re.sub(r'[ \t]{2,}', ' ', result)
+    result = re.sub(r' +([,.!?;:])', r'\1', result)
+    return result.strip()
+
+
+def _link_safe_cut(message: str, cut: int) -> int:
+    """Move a cut position that falls inside a link to the link start."""
+    for match in _UNSPLITTABLE_RE.finditer(message):
+        if match.start() < cut < match.end():
+            return match.start()
+        if match.start() >= cut:
+            break
+    return cut
+
+
+def _shorten_at_word_boundary(
+    message: str,
+    max_length: int,
+    suffix: str,
+) -> str:
+    cutoff = max_length - len(suffix)
+    if cutoff <= 0:
+        return message[:max_length]
+
+    if message[cutoff].isspace():
+        end = cutoff
+    else:
+        word_end = message.rfind(' ', 0, cutoff)
+        end = word_end if word_end >= cutoff // 2 else cutoff
+    shortened = message[:_link_safe_cut(message, end)]
+    return shortened.rstrip(' ,;:-') + suffix
+
+
+def shorten_chat_message(
+    message: str, max_length: int = 255,
+) -> str:
+    """Shorten chat text without cutting through a sentence or word.
+
+    LLMs occasionally ignore prompt length guidance. Prefer the last
+    complete sentence that fits. If none is available late enough in the
+    message, fall back to a word-boundary ellipsis.
+    """
+    if len(message) <= max_length:
+        return message
+    if max_length <= 0:
+        return ""
+
+    window = message[:max_length + 1]
+    sentence_end = -1
+    for match in _SENTENCE_END.finditer(window):
+        if match.end() <= max_length:
+            sentence_end = match.end()
+
+    if sentence_end >= max_length // 2:
+        sentence_end = _link_safe_cut(message, sentence_end)
+        return message[:sentence_end].rstrip()
+
+    ellipsis = "..."
+    if max_length <= len(ellipsis):
+        return message[:max_length]
+
+    return _shorten_at_word_boundary(
+        message, max_length, ellipsis,
+    )
+
+
+def shorten_chat_question(
+    message: str, max_length: int = 255,
+) -> str:
+    """Shorten a question at a safe word boundary and preserve its '?'."""
+    if len(message) <= max_length:
+        return message
+    if max_length <= 0:
+        return ""
+    shortened = _shorten_at_word_boundary(
+        message, max_length, "?",
+    )
+    return shortened.rstrip(' ,;:-.!?') + "?"
+
 
 def strip_speaker_prefix(message: str, bot_name: str) -> str:
     """Strip 'BotName:' prefix that LLMs sometimes add."""
@@ -153,6 +273,23 @@ def parse_single_response(response: str) -> dict:
     }
 
 
+def _lowercase_action_start(action: str) -> str:
+    """Lowercase an action's first letter.
+
+    The client shows an action as "<Name> <action>", so it
+    must read as the middle of a sentence ("Veliana giggles"),
+    never "Veliana Giggles". Acronyms such as "SI:7" keep
+    their case.
+    """
+    if (
+        len(action) > 1
+        and action[0].isupper()
+        and not action[1].isupper()
+    ):
+        return action[0].lower() + action[1:]
+    return action
+
+
 def _sanitize_action(raw_action) -> Optional[str]:
     """Clean and validate an action string from
     LLM JSON output.
@@ -177,7 +314,41 @@ def _sanitize_action(raw_action) -> Optional[str]:
         return None
     if len(action) < 2 or len(action) > 80:
         return None
-    return action
+    return _lowercase_action_start(action)
+
+
+def split_action_prefix(
+    message: str,
+) -> Tuple[str, Optional[str]]:
+    """Split a leading *action* off a cleaned message.
+
+    Inverts the prefix cleanup_message() adds, so the
+    action can be delivered as a /e text emote ahead of
+    the spoken line instead of riding inside it.
+    Returns (message, action), with action None when
+    there is nothing to split.
+
+    A message that is nothing but an action is left
+    alone: emitting the emote would leave an empty chat
+    line behind it.
+    """
+    if not message or not isinstance(message, str):
+        return message, None
+
+    # _sanitize_action strips '*' from the action, so the
+    # closing delimiter is unambiguous.
+    match = re.match(
+        r'^\*([^*]{2,80})\*\s*(.*)$', message
+    )
+    if not match:
+        return message, None
+
+    action = match.group(1).strip()
+    spoken = match.group(2).strip()
+    if not action or not spoken:
+        return message, None
+
+    return spoken, _lowercase_action_start(action)
 
 
 def cleanup_message(
@@ -234,9 +405,14 @@ def cleanup_message(
     # Truncate at "Name: " pattern appearing after
     # the first 20 characters (to avoid false-matching
     # legitimate uses at the start of a message).
+    # Links and placeholders are masked so names like
+    # "Power Word: Fortitude" never count as a speaker.
     if len(result) > 20:
+        masked = _UNSPLITTABLE_RE.sub(
+            lambda m: '_' * len(m.group(0)), result
+        )
         second_speaker = re.search(
-            r'\b[A-Z][a-z]{2,}:\s', result[20:]
+            r'\b[A-Z][a-z]{2,}:\s', masked[20:]
         )
         if second_speaker:
             cut_pos = 20 + second_speaker.start()
@@ -246,23 +422,7 @@ def cleanup_message(
             if len(truncated) > 10:
                 result = truncated
 
-    # Emojis
-    emoji_pattern = re.compile(
-        "["
-        "\U0001F600-\U0001F64F"
-        "\U0001F300-\U0001F5FF"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F1E0-\U0001F1FF"
-        "\U00002702-\U000027B0"
-        "\U000024C2-\U0001F251"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FA6F"
-        "\U0001FA70-\U0001FAFF"
-        "\U00002600-\U000026FF"
-        "]+",
-        flags=re.UNICODE
-    )
-    result = emoji_pattern.sub('', result)
+    result = strip_emojis(result)
 
     # NPC markers to plain text
     result = re.sub(

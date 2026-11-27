@@ -36,6 +36,7 @@
 #include "Chat.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
+#include "Config.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "GameTime.h"
@@ -52,6 +53,7 @@
 #include "ScriptMgr.h"
 #include "Spell.h"
 #include "World.h"
+#include "WorldPacket.h"
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
 
@@ -66,28 +68,509 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
 {
-    // Upstream AzerothCore renamed creature.id1 -> creature.id
-    // (PR #25197, migration 2026_06_16_00). Resolve the column
-    // name once (lazy, thread-safe magic static) so our SQL
-    // works on both the old and updated core source.
-    std::string const& GetCreatureEntryColumn()
+    char const* const kMultiBotPrefix = "MBOT";
+    char const* const kMultiBotBridgeName =
+        "mod-llm-chatter";
+    char const* const kMultiBotProtocolVersion = "1";
+    char const kMultiBotSeparator = '~';
+
+    std::string TrimMultiBot(std::string const& value)
     {
-        static std::string const column = []() -> std::string
+        size_t start = value.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos)
+            return "";
+
+        size_t end = value.find_last_not_of(" \t\r\n");
+        return value.substr(start, end - start + 1);
+    }
+
+    std::string ToUpperMultiBot(std::string value)
+    {
+        std::transform(
+            value.begin(), value.end(), value.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::toupper(c));
+            });
+        return value;
+    }
+
+    std::pair<std::string, std::string> SplitMultiBotOnce(
+        std::string const& value, char separator)
+    {
+        size_t pos = value.find(separator);
+        if (pos == std::string::npos)
+            return {value, ""};
+
+        return {
+            value.substr(0, pos),
+            value.substr(pos + 1)};
+    }
+
+    std::string EncodeMultiBotField(std::string const& value)
+    {
+        static char const* hex = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(value.size());
+
+        for (unsigned char c : value)
         {
-            if (QueryResult r = WorldDatabase.Query(
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = 'acore_world' "
-                    "AND TABLE_NAME = 'creature' "
-                    "AND COLUMN_NAME IN ('id', 'id1') "
-                    "ORDER BY (COLUMN_NAME = 'id') DESC LIMIT 1"))
-                return (*r)[0].Get<std::string>();
-            return "id";
-        }();
-        return column;
+            if (c == '%' || c == '~'
+                || c == '\r' || c == '\n')
+            {
+                out.push_back('%');
+                out.push_back(hex[(c >> 4) & 0x0F]);
+                out.push_back(hex[c & 0x0F]);
+                continue;
+            }
+
+            out.push_back(static_cast<char>(c));
+        }
+
+        return out;
+    }
+
+    bool IsMultiBotCompatEnabled()
+    {
+        return sConfigMgr->GetOption<bool>(
+            "LLMChatter.MultiBotCompat.Enable", false);
+    }
+
+    bool TryExtractMultiBotPayload(
+        uint32 language, std::string const& msg,
+        std::string& payload)
+    {
+        if (language != LANG_ADDON)
+            return false;
+
+        std::string const trimmed = TrimMultiBot(msg);
+        std::string const prefix =
+            std::string(kMultiBotPrefix) + "\t";
+        if (trimmed.rfind(prefix, 0) != 0)
+            return false;
+
+        payload = TrimMultiBot(trimmed.substr(prefix.size()));
+        return !payload.empty();
+    }
+
+    ChatMsg NormalizeMultiBotReplyType(uint32 type)
+    {
+        switch (type)
+        {
+            case CHAT_MSG_PARTY:
+            case CHAT_MSG_PARTY_LEADER:
+            case CHAT_MSG_RAID:
+            case CHAT_MSG_RAID_LEADER:
+            case CHAT_MSG_GUILD:
+            case CHAT_MSG_OFFICER:
+            case CHAT_MSG_WHISPER:
+            case CHAT_MSG_CHANNEL:
+                return static_cast<ChatMsg>(type);
+            default:
+                return CHAT_MSG_WHISPER;
+        }
+    }
+
+    void SendMultiBotAddonPacket(
+        Player* player, ChatMsg chatType,
+        std::string const& opcode,
+        std::string const& payload = "")
+    {
+        if (!player || !player->GetSession())
+            return;
+
+        std::string wire =
+            std::string(kMultiBotPrefix) + "\t" + opcode;
+        if (!payload.empty())
+        {
+            wire += std::string(1, kMultiBotSeparator)
+                + payload;
+        }
+
+        if (sLLMChatterConfig
+            && sLLMChatterConfig->IsDebugLog())
+        {
+            LOG_INFO(
+                "module",
+                "LLMChatter: MultiBotCompat TX [{}] type={}",
+                wire, static_cast<uint32>(chatType));
+        }
+
+        WorldPacket data;
+        ChatHandler::BuildChatPacket(
+            data, chatType, LANG_ADDON,
+            player, nullptr, wire.c_str());
+        player->SendDirectMessage(&data);
+    }
+
+    uint32 GetMultiBotPct(uint32 current, uint32 max)
+    {
+        if (!max)
+            return 0;
+
+        return static_cast<uint32>(
+            (current * 100u) / max);
+    }
+
+    void AppendMultiBotVisibleBot(
+        Player* bot, std::vector<Player*>& bots,
+        std::set<ObjectGuid>& seen)
+    {
+        if (!bot || !bot->IsInWorld()
+            || !sPlayerbotsMgr.GetPlayerbotAI(bot))
+            return;
+
+        if (!seen.insert(bot->GetGUID()).second)
+            return;
+
+        bots.push_back(bot);
+    }
+
+    bool CanExposeRandomMultiBot(
+        Player* requester, Player* bot)
+    {
+        if (!requester || !bot)
+            return false;
+
+        PlayerbotAI* botAI =
+            sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!botAI)
+            return false;
+
+        Group* requesterGroup = requester->GetGroup();
+        if (requesterGroup
+            && bot->GetGroup() == requesterGroup)
+            return true;
+
+        return botAI->GetMaster() == requester;
+    }
+
+    std::vector<Player*> GetMultiBotVisibleBots(
+        Player* player)
+    {
+        std::vector<Player*> bots;
+        std::set<ObjectGuid> seen;
+        if (!player)
+            return bots;
+
+        if (PlayerbotMgr* mgr =
+                sPlayerbotsMgr.GetPlayerbotMgr(player))
+        {
+            for (PlayerBotMap::const_iterator it =
+                     mgr->GetPlayerBotsBegin();
+                 it != mgr->GetPlayerBotsEnd(); ++it)
+            {
+                AppendMultiBotVisibleBot(
+                    it->second, bots, seen);
+            }
+        }
+
+        if (Group* group = player->GetGroup())
+        {
+            for (GroupReference* itr =
+                     group->GetFirstMember();
+                 itr != nullptr; itr = itr->next())
+            {
+                AppendMultiBotVisibleBot(
+                    itr->GetSource(), bots, seen);
+            }
+        }
+
+        for (PlayerBotMap::const_iterator it =
+                 sRandomPlayerbotMgr.GetPlayerBotsBegin();
+             it != sRandomPlayerbotMgr.GetPlayerBotsEnd();
+             ++it)
+        {
+            Player* bot = it->second;
+            if (CanExposeRandomMultiBot(player, bot))
+                AppendMultiBotVisibleBot(bot, bots, seen);
+        }
+
+        return bots;
+    }
+
+    Player* FindMultiBotByName(
+        Player* player, std::string const& botName)
+    {
+        std::string const wanted = TrimMultiBot(botName);
+        if (wanted.empty())
+            return nullptr;
+
+        for (Player* bot : GetMultiBotVisibleBots(player))
+        {
+            if (bot->GetName() == wanted)
+                return bot;
+        }
+
+        return nullptr;
+    }
+
+    std::string JoinMultiBotStrategies(
+        std::vector<std::string> const& strategies)
+    {
+        std::ostringstream out;
+        for (size_t i = 0; i < strategies.size(); ++i)
+        {
+            if (i)
+                out << ", ";
+
+            out << strategies[i];
+        }
+
+        return out.str();
+    }
+
+    std::string BuildMultiBotRosterPayload(Player* player)
+    {
+        std::ostringstream out;
+        bool first = true;
+
+        for (Player* bot : GetMultiBotVisibleBots(player))
+        {
+            if (!first)
+                out << ';';
+            first = false;
+
+            out << bot->GetName()
+                << ',' << static_cast<uint32>(bot->getClass())
+                << ',' << static_cast<uint32>(bot->GetLevel())
+                << ',' << static_cast<uint32>(bot->GetMapId())
+                << ',' << (bot->IsAlive() ? '1' : '0')
+                << ',' << GetMultiBotPct(
+                    bot->GetHealth(), bot->GetMaxHealth())
+                << ',' << GetMultiBotPct(
+                    bot->GetPower(POWER_MANA),
+                    bot->GetMaxPower(POWER_MANA));
+        }
+
+        return out.str();
+    }
+
+    std::string BuildMultiBotDetailPayload(Player* bot)
+    {
+        if (!bot)
+            return "";
+
+        std::string const gender =
+            static_cast<uint8>(bot->getGender()) == 1
+                ? "Female" : "Male";
+
+        std::ostringstream out;
+        out << EncodeMultiBotField(bot->GetName())
+            << kMultiBotSeparator
+            << EncodeMultiBotField(
+                GetRaceName(static_cast<uint8>(
+                    bot->getRace())))
+            << kMultiBotSeparator
+            << EncodeMultiBotField(gender)
+            << kMultiBotSeparator
+            << EncodeMultiBotField(
+                GetChatterClassName(static_cast<uint8>(
+                    bot->getClass())))
+            << kMultiBotSeparator
+            << static_cast<uint32>(bot->GetLevel())
+            << kMultiBotSeparator << 0
+            << kMultiBotSeparator << 0
+            << kMultiBotSeparator << 0
+            << kMultiBotSeparator << 0;
+
+        return out.str();
+    }
+
+    std::string BuildMultiBotDetailPayload(
+        Player* player, std::string const& botName)
+    {
+        return BuildMultiBotDetailPayload(
+            FindMultiBotByName(player, botName));
+    }
+
+    void SendMultiBotDetailPackets(
+        Player* player, ChatMsg replyType)
+    {
+        bool sent = false;
+        for (Player* bot : GetMultiBotVisibleBots(player))
+        {
+            std::string const payload =
+                BuildMultiBotDetailPayload(bot);
+            if (payload.empty())
+                continue;
+
+            SendMultiBotAddonPacket(
+                player, replyType, "DETAIL", payload);
+            sent = true;
+        }
+
+        if (!sent)
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "DETAILS", "");
+        }
+    }
+
+    std::string BuildMultiBotStatePayloadForBot(
+        Player* bot, std::string const& fallbackName)
+    {
+        if (!bot)
+        {
+            return TrimMultiBot(fallbackName)
+                + std::string(1, kMultiBotSeparator)
+                + std::string(1, kMultiBotSeparator);
+        }
+
+        PlayerbotAI* botAI =
+            sPlayerbotsMgr.GetPlayerbotAI(bot);
+        if (!botAI)
+        {
+            return bot->GetName()
+                + std::string(1, kMultiBotSeparator)
+                + std::string(1, kMultiBotSeparator);
+        }
+
+        std::ostringstream out;
+        out << bot->GetName()
+            << kMultiBotSeparator
+            << JoinMultiBotStrategies(
+                botAI->GetStrategies(BOT_STATE_COMBAT))
+            << kMultiBotSeparator
+            << JoinMultiBotStrategies(
+                botAI->GetStrategies(
+                    BOT_STATE_NON_COMBAT));
+
+        return out.str();
+    }
+
+    std::string BuildMultiBotStatePayload(
+        Player* player, std::string const& botName)
+    {
+        return BuildMultiBotStatePayloadForBot(
+            FindMultiBotByName(player, botName), botName);
+    }
+
+    void SendMultiBotStatePackets(
+        Player* player, ChatMsg replyType)
+    {
+        bool sent = false;
+        for (Player* bot : GetMultiBotVisibleBots(player))
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "STATE",
+                BuildMultiBotStatePayloadForBot(
+                    bot, bot->GetName()));
+            sent = true;
+        }
+
+        if (!sent)
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "STATES", "");
+        }
+    }
+
+    bool HandleMultiBotOpcode(
+        Player* player, ChatMsg replyType,
+        std::string const& opcode,
+        std::string const& payload)
+    {
+        std::string const normalized =
+            ToUpperMultiBot(TrimMultiBot(opcode));
+
+        if (normalized == "HELLO")
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "HELLO_ACK",
+                std::string(kMultiBotProtocolVersion)
+                    + kMultiBotSeparator
+                    + kMultiBotBridgeName);
+            return true;
+        }
+
+        if (normalized == "PING")
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "PONG", payload);
+            return true;
+        }
+
+        if (normalized != "GET")
+            return false;
+
+        std::pair<std::string, std::string> const request =
+            SplitMultiBotOnce(payload, kMultiBotSeparator);
+        std::string const requestType =
+            ToUpperMultiBot(TrimMultiBot(request.first));
+
+        if (requestType == "ROSTER")
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "ROSTER",
+                BuildMultiBotRosterPayload(player));
+            return true;
+        }
+
+        if (requestType == "STATE")
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "STATE",
+                BuildMultiBotStatePayload(
+                    player, request.second));
+            return true;
+        }
+
+        if (requestType == "STATES")
+        {
+            SendMultiBotStatePackets(player, replyType);
+            return true;
+        }
+
+        if (requestType == "DETAIL")
+        {
+            SendMultiBotAddonPacket(
+                player, replyType, "DETAIL",
+                BuildMultiBotDetailPayload(
+                    player, request.second));
+            return true;
+        }
+
+        if (requestType == "DETAILS")
+        {
+            SendMultiBotDetailPackets(player, replyType);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool TryHandleMultiBotCompatChat(
+        Player* player, uint32 type, uint32 language,
+        std::string& msg)
+    {
+        if (!IsMultiBotCompatEnabled() || !player)
+            return false;
+
+        std::string payload;
+        if (!TryExtractMultiBotPayload(
+                language, msg, payload))
+            return false;
+
+        if (sLLMChatterConfig
+            && sLLMChatterConfig->IsDebugLog())
+        {
+            LOG_INFO(
+                "module",
+                "LLMChatter: MultiBotCompat RX [{}] type={}",
+                payload, type);
+        }
+
+        std::pair<std::string, std::string> const packet =
+            SplitMultiBotOnce(payload, kMultiBotSeparator);
+        return HandleMultiBotOpcode(
+            player, NormalizeMultiBotReplyType(type),
+            packet.first, packet.second);
     }
 }
 
@@ -253,10 +736,33 @@ bool GroupHasRealPlayer(Group* group)
 // Pick a random bot from the group, optionally
 // excluding a specific player (e.g. the killer)
 Player* GetRandomBotInGroup(
-    Group* group, Player* exclude)
+    Group* group, Player* exclude,
+    bool requireAlive)
 {
     if (!group)
         return nullptr;
+
+    // BG raid: party chat only reaches the speaker's
+    // subgroup, so only bots sharing the real player's
+    // subgroup can be heard.
+    bool scopeToSubGroup = false;
+    uint8 realSubGroup = 0;
+    if (group->isBGGroup())
+    {
+        for (GroupReference* itr =
+                 group->GetFirstMember();
+             itr != nullptr; itr = itr->next())
+        {
+            Player* member = itr->GetSource();
+            if (member && !IsPlayerBot(member))
+            {
+                realSubGroup = group->GetMemberGroup(
+                    member->GetGUID());
+                scopeToSubGroup = true;
+                break;
+            }
+        }
+    }
 
     std::vector<Player*> bots;
     for (GroupReference* itr =
@@ -266,7 +772,11 @@ Player* GetRandomBotInGroup(
         Player* member = itr->GetSource();
         if (member && IsPlayerBot(member)
             && member != exclude
-            && member->IsAlive())
+            && (!requireAlive || member->IsAlive())
+            && (!scopeToSubGroup
+                || group->GetMemberGroup(
+                       member->GetGUID())
+                    == realSubGroup))
             bots.push_back(member);
     }
 
@@ -323,9 +833,6 @@ std::unordered_map<uint64, time_t>
 std::unordered_map<uint64, time_t>
     _questCompleteCd;
 
-// -- Named boss entries --
-std::unordered_set<uint32> _namedBossEntries;
-
 // -- Per-group cooldown maps --
 std::map<uint32, time_t> _groupKillCooldowns;
 std::map<uint32, time_t> _groupDeathCooldowns;
@@ -364,6 +871,7 @@ std::unordered_map<uint32, time_t>
     _emoteVerbalCooldowns;
 std::unordered_map<uint32, time_t>
     _creatureEmoteCooldowns;
+std::mutex _emoteCooldownMutex;
 
 // Group cooldown maps below, plus
 // _questAcceptTimestamps, preserve the pre-split
@@ -371,45 +879,9 @@ std::unordered_map<uint32, time_t>
 // PlayerScript, GroupScript, and CreatureScript
 // hook paths mutate them on map update threads,
 // and the world flush path does not access them.
-// If this module must support cross-map concurrent
-// writes under MapUpdate.Threads > 1, these maps
-// need explicit synchronization rather than more
-// shared callers.
-
-// ============================================================================
-// NAMED BOSS CACHE
-// ============================================================================
-
-void LoadNamedBossCache()
-{
-    _namedBossEntries.clear();
-    // Named bosses: CreatureImmunitiesId > 0 and
-    // only 1 spawn on their map (filters out trash
-    // like Molten Elementals that have immunities
-    // but spawn many times)
-    std::string query =
-        "SELECT entry FROM ("
-        "  SELECT ct.entry, ct.`rank`,"
-        "    ct.CreatureImmunitiesId,"
-        "    COUNT(*) AS spawns"
-        "  FROM creature_template ct"
-        "  JOIN creature c ON c." + GetCreatureEntryColumn() + " = ct.entry"
-        "  WHERE ct.`rank` = 3"
-        "    OR ct.CreatureImmunitiesId > 0"
-        "  GROUP BY ct.entry, c.map"
-        "  HAVING ct.`rank` = 3 OR COUNT(*) = 1"
-        ") AS bosses";
-    QueryResult result = WorldDatabase.Query(query);
-    if (result)
-    {
-        do
-        {
-            Field* fields = result->Fetch();
-            _namedBossEntries.insert(
-                fields[0].Get<uint32>());
-        } while (result->NextRow());
-    }
-}
+// Emote cooldown access is synchronized in
+// LLMChatterGroupEmote.cpp because text emotes can
+// run concurrently on map update threads.
 
 // ============================================================================
 // PLAYERBOT COMMAND FILTER
@@ -425,12 +897,12 @@ bool IsLikelyPlayerbotControlCommand(
     auto trim = [](std::string const& input)
     {
         size_t start =
-            input.find_first_not_of(" \t\n\r");
+            input.find_first_not_of(" \t\n\r\f\v");
         if (start == std::string::npos)
             return std::string();
 
         size_t end =
-            input.find_last_not_of(" \t\n\r");
+            input.find_last_not_of(" \t\n\r\f\v");
         return input.substr(start, end - start + 1);
     };
 
@@ -449,6 +921,165 @@ bool IsLikelyPlayerbotControlCommand(
     std::string msg = toLowerAscii(trim(message));
     if (msg.empty())
         return false;
+
+    // Playerbots @target selector syntax is control traffic,
+    // not conversational content.
+    if (msg[0] == '@')
+    {
+        size_t selectorEnd =
+            msg.find_first_of(" \t\n\r\f\v");
+        std::string selector =
+            msg.substr(0, selectorEnd);
+        std::string commandTail =
+            selectorEnd == std::string::npos
+                ? std::string()
+                : trim(msg.substr(selectorEnd + 1));
+
+        static std::unordered_set<std::string>
+            selectorPrefixes = {
+                // Role / combat type
+                "@tank", "@dps", "@heal",
+                "@ranged", "@melee",
+                "@rangeddps", "@meleedps",
+
+                // Classes
+                "@dk", "@druid", "@hunter",
+                "@mage", "@paladin", "@priest",
+                "@rogue", "@shaman", "@warlock",
+                "@warrior",
+
+                // Raid target icons
+                "@star", "@circle", "@diamond",
+                "@triangle", "@moon", "@square",
+                "@cross", "@skull",
+
+                // Specs
+                "@hpal", "@ppal", "@rpal",
+                "@disc", "@hpr", "@spr",
+                "@arc", "@frost", "@fire",
+                "@arms", "@fury", "@pwar",
+                "@affl", "@demo", "@dest",
+                "@ele", "@enh", "@rsha",
+                "@bal", "@rdru",
+                "@bmh", "@mmh", "@svh",
+                "@mut", "@comb", "@sub",
+                "@fdk", "@udk"
+            };
+
+        bool knownSelector =
+            selectorPrefixes.find(selector)
+                != selectorPrefixes.end();
+        bool unconditionalSelector = false;
+
+        auto isDigits = [](std::string const& value)
+        {
+            if (value.empty())
+                return false;
+
+            return std::all_of(
+                value.begin(), value.end(),
+                [](unsigned char c)
+                {
+                    return std::isdigit(c) != 0;
+                });
+        };
+
+        if (!knownSelector
+            && selector.rfind("@group", 0) == 0)
+        {
+            std::string groupSelector =
+                selector.substr(6);
+            knownSelector =
+                !groupSelector.empty()
+                && std::any_of(
+                    groupSelector.begin(),
+                    groupSelector.end(),
+                    [](unsigned char c)
+                    {
+                        return std::isdigit(c) != 0;
+                    })
+                && std::all_of(
+                    groupSelector.begin(),
+                    groupSelector.end(),
+                    [](unsigned char c)
+                    {
+                        return std::isdigit(c) != 0
+                            || c == ',' || c == '-';
+                    });
+        }
+
+        if (!knownSelector && selector.size() > 1)
+        {
+            std::string levelSelector =
+                selector.substr(1);
+            size_t dash = levelSelector.find('-');
+
+            knownSelector =
+                isDigits(levelSelector)
+                || (dash != std::string::npos
+                    && isDigits(
+                        levelSelector.substr(0, dash))
+                    && isDigits(
+                        levelSelector.substr(dash + 1)));
+        }
+
+        if (!knownSelector)
+        {
+            std::string auraPrefix;
+            if (selector.rfind("@noaura", 0) == 0)
+                auraPrefix = "@noaura";
+            else if (selector.rfind("@aura", 0) == 0)
+                auraPrefix = "@aura";
+
+            if (!auraPrefix.empty())
+            {
+                std::string auraToken =
+                    selector.substr(auraPrefix.size());
+                if (auraToken.empty()
+                    && !commandTail.empty())
+                {
+                    size_t auraEnd =
+                        commandTail.find_first_of(
+                            " \t\n\r\f\v");
+                    auraToken = commandTail.substr(
+                        0, auraEnd);
+                }
+
+                if (isDigits(auraToken))
+                {
+                    knownSelector = true;
+                    unconditionalSelector = true;
+                }
+            }
+        }
+
+        if (!knownSelector
+            && selector.rfind("@aggroby", 0) == 0)
+        {
+            knownSelector = true;
+            unconditionalSelector = true;
+        }
+
+        if (unconditionalSelector)
+            return true;
+
+        if (knownSelector)
+        {
+            msg = commandTail;
+        }
+        else
+        {
+            if (selector == "@")
+                return false;
+
+            // Support @command forms such as @follow while
+            // preserving normal @name conversation.
+            msg = trim(msg.substr(1));
+        }
+
+        if (msg.empty())
+            return false;
+    }
 
     static std::unordered_set<std::string>
         exactCommands = {
@@ -591,7 +1222,12 @@ void CleanupGroupSession(uint32 groupId)
     _groupDungeonCooldowns.erase(groupId);
     _groupWipeCooldowns.erase(groupId);
     _groupCorpseRunCooldowns.erase(groupId);
-    _emoteObserverCooldowns.erase(groupId);
+    ClearPvPCooldownsForGroup(groupId);
+    {
+        std::lock_guard<std::mutex> lock(
+            _emoteCooldownMutex);
+        _emoteObserverCooldowns.erase(groupId);
+    }
 
     // Prune combined-key (groupId<<32|questId) maps
     // unordered_map has no lower_bound — linear scan
@@ -693,7 +1329,9 @@ public:
               "LLMChatterGroupPlayerScript",
               {PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
                PLAYERHOOK_ON_CREATURE_KILL,
+               PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
                PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
+               PLAYERHOOK_ON_PVP_KILL,
                PLAYERHOOK_ON_LOOT_ITEM,
                PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
                PLAYERHOOK_ON_PLAYER_ENTER_COMBAT,
@@ -709,6 +1347,17 @@ public:
 
                PLAYERHOOK_ON_TEXT_EMOTE}) {}
 
+    bool OnPlayerCanUseChat(
+        Player* player, uint32 type, uint32 lang,
+        std::string& msg, Group* /*group*/) override
+    {
+        if (TryHandleMultiBotCompatChat(
+                player, type, lang, msg))
+            return false;
+
+        return true;
+    }
+
     // ------------------------------------------------
     // Creature Kill event (group chatter)
     // ------------------------------------------------
@@ -718,11 +1367,27 @@ public:
         HandleGroupCreatureKillImpl(killer, killed);
     }
 
+    // A pet or totem landing the killing blow fires this
+    // hook instead of OnPlayerCreatureKill; credit the owner.
+    void OnPlayerCreatureKilledByPet(
+        Player* petOwner, Creature* killed) override
+    {
+        HandleGroupCreatureKillImpl(petOwner, killed);
+    }
+
     void OnPlayerKilledByCreature(
         Creature* killer, Player* killed) override
     {
         HandleGroupPlayerKilledByCreatureImpl(
             killer, killed);
+    }
+
+    // Overworld PvP kills and deaths. Battleground kills
+    // stay with LLMChatterPlayerScript::OnPlayerPVPKill.
+    void OnPlayerPVPKill(
+        Player* killer, Player* killed) override
+    {
+        HandleGroupPvPKillImpl(killer, killed);
     }
 
     // Shared loot handler for both direct loot
@@ -854,12 +1519,14 @@ void CheckGroupCombatState()
 // Forward declarations for sub-domain registration
 void AddLLMChatterGroupJoinScripts();
 void AddLLMChatterGroupQuestScripts();
+void AddLLMChatterDuelScripts();
 
 void AddLLMChatterGroupScripts()
 {
     AddLLMChatterGroupJoinScripts();
     new LLMChatterGroupPlayerScript();
     AddLLMChatterGroupQuestScripts();
+    AddLLMChatterDuelScripts();
 }
 
 

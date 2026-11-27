@@ -5,8 +5,11 @@
 #include "LLMChatterConfig.h"
 #include "LLMChatterAmbient.h"
 #include "LLMChatterBG.h"
+#include "LLMChatterBotSource.h"
 #include "LLMChatterGroup.h"
+#include "LLMChatterGroupAwareness.h"
 #include "LLMChatterGroupInternal.h"
+#include "LLMChatterGuildPvP.h"
 #include "LLMChatterShared.h"
 
 #include "Battleground.h"
@@ -32,10 +35,10 @@
 
 #include <algorithm>
 #include <ctime>
-#include <cstdio>
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,36 +48,10 @@ void EnsureBotInGeneralChannel(
     if (!bot || !bot->IsInWorld())
         return;
 
-    uint32 zoneId = bot->GetZoneId();
-    AreaTableEntry const* area =
-        sAreaTableStore.LookupEntry(zoneId);
-    if (!area)
+    std::string newChanName =
+        GetGeneralChannelName(bot->GetZoneId());
+    if (newChanName.empty())
         return;
-
-    uint8 locale = sWorld->GetDefaultDbcLocale();
-    char const* n = area->area_name[locale];
-    std::string zoneName = n ? n : "";
-    if (zoneName.empty())
-    {
-        n = area->area_name[LOCALE_enUS];
-        zoneName = n ? n : "";
-    }
-    if (zoneName.empty())
-        return;
-
-    ChatChannelsEntry const* chEntry =
-        sChatChannelsStore.LookupEntry(
-            ChatChannelId::GENERAL);
-    if (!chEntry)
-        return;
-
-    char nameBuf[100];
-    std::snprintf(
-        nameBuf,
-        sizeof(nameBuf),
-        chEntry->pattern[locale],
-        zoneName.c_str());
-    std::string newChanName(nameBuf);
 
     ChannelMgr* cMgr =
         ChannelMgr::forTeam(bot->GetTeamId());
@@ -108,7 +85,7 @@ void EnsureBotInGeneralChannel(
         joinChan->JoinChannel(bot, "");
 }
 
-static std::map<uint32, time_t> _generalChatCooldowns;
+static std::map<uint64, time_t> _generalChatCooldowns;
 static std::mutex _generalChatCooldownsMutex;
 
 // Per-group subzone cooldown keyed by group counter.
@@ -318,6 +295,9 @@ static void HandleEnemyZoneIntrusion(
     std::string zoneName = GetZoneName(newZone);
     if (zoneName.empty())
         zoneName = "Unknown";
+    uint32 areaId = player->GetAreaId();
+    std::string subzoneName = areaId != newZone
+        ? GetAreaNameForLocale(areaId) : "";
 
     uint8 intruderClass = player->getClass();
     uint8 intruderRace = player->getRace();
@@ -331,7 +311,7 @@ static void HandleEnemyZoneIntrusion(
 
     std::string extraData = "{"
         "\"intruder_name\":\"" +
-            JsonEscape(player->GetName()) + "\","
+            ChatterJsonEscape(player->GetName()) + "\","
         "\"intruder_class\":" +
             std::to_string(intruderClass) + ","
         "\"intruder_race\":" +
@@ -343,11 +323,15 @@ static void HandleEnemyZoneIntrusion(
             std::string(
                 isCapital ? "true" : "false") + ","
         "\"zone_name\":\"" +
-            JsonEscape(zoneName) + "\","
+            ChatterJsonEscape(zoneName) + "\","
+        "\"area_id\":" +
+            std::to_string(areaId) + ","
+        "\"subzone_name\":\"" +
+            ChatterJsonEscape(subzoneName) + "\","
         "\"defender_guid\":" +
             std::to_string(defGuid) + ","
         "\"defender_name\":\"" +
-            JsonEscape(defender->GetName()) + "\","
+            ChatterJsonEscape(defender->GetName()) + "\","
         "\"defender_class\":" +
             std::to_string(defClass) + ","
         "\"defender_race\":" +
@@ -355,6 +339,8 @@ static void HandleEnemyZoneIntrusion(
         "\"defender_level\":" +
             std::to_string(defLevel) +
         "}";
+    // The defender's own group facts and guard (issue #94).
+    AppendCandidateGroups(extraData, {defender});
 
     extraData = EscapeString(extraData);
 
@@ -468,9 +454,15 @@ static void HandleBotEntersEnemyTerritory(
         CommitIntrusionState(guid, newZone, now);
     }
 
+    bool isCapital =
+        (area->flags & AREA_FLAG_CAPITAL) != 0;
+
     std::string zoneName = GetZoneName(newZone);
     if (zoneName.empty())
         zoneName = "Unknown";
+    uint32 areaId = player->GetAreaId();
+    std::string subzoneName = areaId != newZone
+        ? GetAreaNameForLocale(areaId) : "";
 
     uint8 intruderClass = player->getClass();
     uint8 intruderRace = player->getRace();
@@ -481,7 +473,7 @@ static void HandleBotEntersEnemyTerritory(
 
     std::string extraData = "{"
         "\"intruder_name\":\"" +
-            JsonEscape(player->GetName()) + "\","
+            ChatterJsonEscape(player->GetName()) + "\","
         "\"intruder_class\":" +
             std::to_string(intruderClass) + ","
         "\"intruder_race\":" +
@@ -489,13 +481,19 @@ static void HandleBotEntersEnemyTerritory(
         "\"intruder_level\":" +
             std::to_string(intruderLevel) + ","
         "\"intruder_is_bot\":true,"
-        "\"is_capital\":true,"
+        "\"is_capital\":" +
+            std::string(
+                isCapital ? "true" : "false") + ","
         "\"zone_name\":\"" +
-            JsonEscape(zoneName) + "\","
+            ChatterJsonEscape(zoneName) + "\","
+        "\"area_id\":" +
+            std::to_string(areaId) + ","
+        "\"subzone_name\":\"" +
+            ChatterJsonEscape(subzoneName) + "\","
         "\"defender_guid\":" +
             std::to_string(defGuid) + ","
         "\"defender_name\":\"" +
-            JsonEscape(defender->GetName()) + "\","
+            ChatterJsonEscape(defender->GetName()) + "\","
         "\"defender_class\":" +
             std::to_string(
                 defender->getClass()) + ","
@@ -506,6 +504,8 @@ static void HandleBotEntersEnemyTerritory(
             std::to_string(
                 defender->GetLevel()) +
         "}";
+    // The defender's own group facts and guard (issue #94).
+    AppendCandidateGroups(extraData, {defender});
 
     extraData = EscapeString(extraData);
 
@@ -538,6 +538,74 @@ static void HandleBotEntersEnemyTerritory(
 
 std::mutex _rejoinMutex;
 std::vector<PendingRejoin> _pendingRejoins;
+
+// Every bot that could answer a General message in this zone, with no
+// cap: the capped reply sample plus the recent General speakers the
+// bridge may add (chatter_general._add_recent_general_speakers). Each
+// gets a group snapshot and a membership guard (issue #94), so no
+// General speaker escapes either. Selection itself is unchanged.
+static std::vector<Player*> CollectGeneralGuardBots(
+    uint32 zoneId, TeamId teamId)
+{
+    std::vector<Player*> bots;
+    std::set<ObjectGuid> seen;
+    auto consider = [&](Player* bot)
+    {
+        if (!bot || !bot->IsInWorld() || !IsPlayerBot(bot)
+            || bot->GetZoneId() != zoneId
+            || bot->GetTeamId() != teamId
+            || !seen.insert(bot->GetGUID()).second
+            || !CanSpeakInGeneralChannel(bot))
+            return;
+        bots.push_back(bot);
+    };
+
+    for (auto const& pair : sWorldSessionMgr->GetAllSessions())
+        if (pair.second)
+            consider(pair.second->GetPlayer());
+    for (Player* bot : GetChatterBots())
+        consider(bot);
+    return bots;
+}
+
+// A bot that logs in after its real player's rejoin window (120s) closed
+// would otherwise never get traits: OnAddMember does not fire for a saved
+// group. Queue a rejoin for that player; bots already registered in this
+// session are skipped when it is processed.
+static void QueueLateBotRejoin(Player* bot)
+{
+    if (!sLLMChatterConfig->_useGroupChatter)
+        return;
+    Group* group = bot->GetGroup();
+    if (!group)
+        return;
+
+    Player* realPlayer = nullptr;
+    for (GroupReference* itr = group->GetFirstMember();
+         itr != nullptr; itr = itr->next())
+    {
+        Player* member = itr->GetSource();
+        if (member && member != bot && !IsPlayerBot(member))
+        {
+            realPlayer = member;
+            break;
+        }
+    }
+    if (!realPlayer)
+        return;
+
+    uint32 groupId = group->GetGUID().GetCounter();
+    std::lock_guard<std::mutex> guard(_rejoinMutex);
+    for (auto const& pending : _pendingRejoins)
+    {
+        if (pending.groupId == groupId)
+            return;
+    }
+    _pendingRejoins.push_back(
+        {groupId,
+         realPlayer->GetGUID().GetCounter(),
+         time(nullptr)});
+}
 
 void ProcessPendingRejoins()
 {
@@ -622,6 +690,14 @@ void ProcessPendingRejoins()
 
         // All members loaded — collect bot data.
         uint32 groupId = entry.groupId;
+        std::vector<uint32> alreadyGreeted;
+        {
+            std::lock_guard<std::mutex> guard(
+                _groupJoinBatchMutex);
+            auto git = _groupGreetedBots.find(groupId);
+            if (git != _groupGreetedBots.end())
+                alreadyGreeted = git->second;
+        }
         uint32 pZone = player->GetZoneId();
         uint32 pArea = player->GetAreaId();
         uint32 pMap  = player->GetMapId();
@@ -642,6 +718,10 @@ void ProcessPendingRejoins()
 
             uint32 bguid =
                 member->GetGUID().GetCounter();
+            if (std::find(alreadyGreeted.begin(),
+                    alreadyGreeted.end(), bguid)
+                != alreadyGreeted.end())
+                continue;
             botGuids.push_back(bguid);
             if (first)
                 firstBotName = member->GetName();
@@ -669,7 +749,7 @@ void ProcessPendingRejoins()
                 "\"bot_guid\":" +
                     std::to_string(bguid) + ","
                 "\"bot_name\":\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         member->GetName()) +
                     "\","
                 "\"bot_class\":" +
@@ -705,7 +785,7 @@ void ProcessPendingRejoins()
             "\"group_id\":" +
                 std::to_string(groupId) + ","
             "\"player_name\":\"" +
-                JsonEscape(player->GetName()) +
+                ChatterJsonEscape(player->GetName()) +
                 "\","
             "\"player_guid\":" +
                 std::to_string(
@@ -779,8 +859,13 @@ public:
             || !sLLMChatterConfig->IsEnabled())
             return;
 
-        if (!player || IsPlayerBot(player))
+        if (!player)
             return;
+        if (IsPlayerBot(player))
+        {
+            QueueLateBotRejoin(player);
+            return;
+        }
 
         // Defensive crash-recovery cleanup: if the
         // server crashed, CleanupGroupSession never
@@ -954,8 +1039,14 @@ public:
         // (e.g. \xFF\xFF...) down to empty — drop it.
         if (safeMsg.empty())
             return true;
+        if (sLLMChatterConfig
+                ->IsPlayerChatPrefixIgnored(safeMsg))
+            return true;
 
         uint32 zoneId = player->GetZoneId();
+        uint64 generalContextKey =
+            (static_cast<uint64>(zoneId) << 1)
+            | (player->GetTeamId() == TEAM_HORDE ? 1u : 0u);
         std::string playerName = player->GetName();
 
         CharacterDatabase.Execute(
@@ -984,7 +1075,8 @@ public:
             std::lock_guard<std::mutex> guard(
                 _generalChatCooldownsMutex);
             auto it =
-                _generalChatCooldowns.find(zoneId);
+                _generalChatCooldowns.find(
+                    generalContextKey);
             if (it != _generalChatCooldowns.end()
                 && (now - it->second)
                    < (time_t)sLLMChatterConfig
@@ -1007,77 +1099,48 @@ public:
             std::lock_guard<std::mutex> guard(
                 _generalChatCooldownsMutex);
             auto it =
-                _generalChatCooldowns.find(zoneId);
+                _generalChatCooldowns.find(
+                    generalContextKey);
             if (it != _generalChatCooldowns.end()
                 && (now - it->second)
                    < (time_t)sLLMChatterConfig
                        ->_generalChatCooldown)
                 return true;
-            _generalChatCooldowns[zoneId] = now;
+            _generalChatCooldowns[generalContextKey] = now;
         }
 
         std::string zoneName = GetZoneName(zoneId);
         if (zoneName.empty())
             zoneName = "Unknown";
 
+        // Collect every bot of the zone and faction first, then take a
+        // uniform sample of _maxBotsPerZone, so neither registry order
+        // nor GUID order decides who can answer (issue #98).
         std::vector<Player*> zoneBots;
-        zoneBots.reserve(8);
-
+        std::set<ObjectGuid> seenBots;
+        auto considerBot = [&](Player* bot)
         {
-            WorldSessionMgr::SessionMap const& sessions =
-                sWorldSessionMgr->GetAllSessions();
-            for (auto const& pair : sessions)
-            {
-                WorldSession* session = pair.second;
-                if (!session)
-                    continue;
-                Player* p = session->GetPlayer();
-                if (!p || !p->IsInWorld())
-                    continue;
-                if (!IsPlayerBot(p))
-                    continue;
-                if (p->GetZoneId() != zoneId)
-                    continue;
-                zoneBots.push_back(p);
-                if (zoneBots.size()
-                    >= sLLMChatterConfig
-                        ->_maxBotsPerZone)
-                    break;
-            }
-        }
+            if (!bot || !bot->IsInWorld()
+                || bot->GetZoneId() != zoneId
+                || bot->GetTeamId() != player->GetTeamId())
+                return;
+            LLMChatterBotSource::AppendUniqueBot(
+                zoneBots, seenBots, bot->GetGUID(), bot);
+        };
 
-        if (zoneBots.size()
-            < sLLMChatterConfig->_maxBotsPerZone)
+        for (auto const& pair : sWorldSessionMgr->GetAllSessions())
         {
-            auto allBots =
-                sRandomPlayerbotMgr.GetAllBots();
-            for (auto& pair : allBots)
-            {
-                Player* bot = pair.second;
-                if (!bot || !bot->IsInWorld())
-                    continue;
-                if (bot->GetZoneId() != zoneId)
-                    continue;
-
-                bool found = false;
-                for (Player* b : zoneBots)
-                {
-                    if (b->GetGUID() == bot->GetGUID())
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    zoneBots.push_back(bot);
-                    if (zoneBots.size()
-                        >= sLLMChatterConfig
-                            ->_maxBotsPerZone)
-                        break;
-                }
-            }
+            Player* p = pair.second
+                ? pair.second->GetPlayer() : nullptr;
+            if (p && IsPlayerBot(p))
+                considerBot(p);
         }
+        for (Player* bot : GetChatterBots())
+            considerBot(bot);
+
+        std::mt19937 sampleRng{std::random_device{}()};
+        LLMChatterBotSource::SampleBots(
+            zoneBots, sLLMChatterConfig->_maxBotsPerZone, sampleRng);
 
         zoneBots.erase(
             std::remove_if(
@@ -1108,25 +1171,30 @@ public:
             botGuids += std::to_string(
                 bot->GetGUID().GetCounter());
             botNames += "\"" +
-                JsonEscape(bot->GetName()) + "\"";
+                ChatterJsonEscape(bot->GetName()) + "\"";
         }
         botGuids += "]";
         botNames += "]";
 
         std::string extraData = "{"
             "\"player_name\":\"" +
-                JsonEscape(playerName) + "\","
+                ChatterJsonEscape(playerName) + "\","
             "\"player_gender\":" +
                 std::to_string(player->getGender()) + ","
             "\"player_message\":\"" +
-                JsonEscape(safeMsg) + "\","
+                ChatterJsonEscape(safeMsg) + "\","
             "\"zone_id\":" +
                 std::to_string(zoneId) + ","
             "\"zone_name\":\"" +
-                JsonEscape(zoneName) + "\","
+                ChatterJsonEscape(zoneName) + "\","
             "\"bot_guids\":" + botGuids + ","
             "\"bot_names\":" + botNames +
             "}";
+        // Group facts and membership guards (issue #94) for every bot
+        // that may answer: the sample above and any recent General
+        // speaker the bridge adds. Selection above is unchanged.
+        AppendCandidateGroups(extraData,
+            CollectGeneralGuardBots(zoneId, player->GetTeamId()));
 
         extraData = EscapeString(extraData);
 
@@ -1138,7 +1206,10 @@ public:
             GetChatterEventPriority(
                 "player_general_msg"),
             "general_chat:" +
-                std::to_string(zoneId),
+                std::to_string(zoneId) + ":" +
+                std::to_string(
+                    player->GetTeamId()
+                        == TEAM_HORDE ? 1 : 0),
             player->GetGUID().GetCounter(),
             playerName,
             0,
@@ -1168,13 +1239,17 @@ public:
         Player* killer, Player* killed) override
     {
         if (!sLLMChatterConfig
-            || !sLLMChatterConfig->IsEnabled()
-            || !sLLMChatterConfig->_bgChatterEnable)
+            || !sLLMChatterConfig->IsEnabled())
             return;
         if (!killer || !killed)
             return;
 
         if (!killer->InBattleground())
+        {
+            HandleOpenWorldPvpKill(killer, killed);
+            return;
+        }
+        if (!sLLMChatterConfig->_bgChatterEnable)
             return;
         Battleground* bg = killer->GetBattleground();
         if (!bg || !bg->isBattleground())
@@ -1186,13 +1261,31 @@ public:
 
         std::string extraBase = "{"
             "\"victim_name\":\"" +
-                JsonEscape(killed->GetName()) +
+                ChatterJsonEscape(killed->GetName()) +
                 "\","
             "\"victim_class\":" +
                 std::to_string(
                     killed->getClass()) +
+            ",\"victim_race\":\"" +
+                GetRaceName(killed->getRace()) +
+                "\",\"victim_gender\":\"" +
+                std::string(
+                    killed->getGender() == GENDER_FEMALE
+                    ? "female" : "male") +
+                "\",\"victim_level\":" +
+                std::to_string(killed->GetLevel()) +
             ",\"killer_name\":\"" +
-                JsonEscape(killer->GetName()) +
+                ChatterJsonEscape(killer->GetName()) +
+                "\","
+            "\"killer_team\":\"" +
+                std::string(
+                    killer->GetBgTeamId() == TEAM_ALLIANCE
+                    ? "Alliance" : "Horde") +
+                "\","
+            "\"victim_team\":\"" +
+                std::string(
+                    killed->GetBgTeamId() == TEAM_ALLIANCE
+                    ? "Alliance" : "Horde") +
                 "\","
             "\"killer_is_real_player\":"
                 + std::string(
@@ -1295,7 +1388,7 @@ public:
         if (areaEntry)
         {
             uint8 loc =
-                sWorld->GetDefaultDbcLocale();
+                sLLMChatterConfig->GetModuleLocale();
             char const* n =
                 areaEntry->area_name[loc];
             areaName = n ? n : "";
@@ -1333,7 +1426,7 @@ public:
         if (zoneEntry)
         {
             uint8 loc =
-                sWorld->GetDefaultDbcLocale();
+                sLLMChatterConfig->GetModuleLocale();
             char const* n =
                 zoneEntry->area_name[loc];
             zoneName = n ? n : "";
@@ -1352,7 +1445,7 @@ public:
             "\"bot_guid\":" +
                 std::to_string(botGuid) + ","
             "\"bot_name\":\"" +
-                JsonEscape(bot->GetName()) + "\","
+                ChatterJsonEscape(bot->GetName()) + "\","
             "\"bot_class\":" +
                 std::to_string(
                     bot->getClass()) + ","
@@ -1366,16 +1459,17 @@ public:
                 std::to_string(
                     bot->GetLevel()) + ","
             + BuildBotStateJson(bot) + ","
+            + BuildGroupDeathJson(player) + ","
             "\"group_id\":" +
                 std::to_string(gId) + ","
             "\"zone_id\":" +
                 std::to_string(curZone) + ","
             "\"zone_name\":\"" +
-                JsonEscape(zoneName) + "\","
+                ChatterJsonEscape(zoneName) + "\","
             "\"area_id\":" +
                 std::to_string(newArea) + ","
             "\"area_name\":\"" +
-                JsonEscape(areaName) + "\""
+                ChatterJsonEscape(areaName) + "\""
             "}";
 
         extraData = EscapeString(extraData);
@@ -1419,9 +1513,6 @@ public:
 
         if (!player)
             return;
-
-        HandleAmbientPlayerUpdateZone(
-            player, newZone);
 
         // Eviction sweep + cleanup under mutex
         {

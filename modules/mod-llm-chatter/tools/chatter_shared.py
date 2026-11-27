@@ -7,6 +7,7 @@ No circular dependencies.
 """
 
 import json
+import locale
 import logging
 import os
 import random
@@ -16,17 +17,23 @@ import threading
 import time
 from typing import Optional, Dict, List, Tuple, Any
 
+from locales import dataset as locale_dataset
+from chatter_lore_data import RACE_CLASS_NOTES
 from chatter_constants import (
     ZONE_LEVELS, ZONE_NAMES,
-    CLASS_NAMES, RACE_NAMES,
-    RACE_SPEECH_PROFILES, CLASS_SPEECH_MODIFIERS,
+    CLASS_NAMES,
+    ALLIANCE_RACE_IDS, HORDE_RACE_IDS,
+    RACE_SPEECH_PROFILES,
+    CLASS_SPEECH_MODIFIERS,
     CLASS_ROLE_MAP, ROLE_COMBAT_PERSPECTIVES,
-    ZONE_FLAVOR, DUNGEON_FLAVOR,
+    ZONE_FLAVOR,
+    DUNGEON_FLAVOR, OPEN_AIR_INSTANCES,
+    BG_LORE,
     ITEM_QUALITY_COLORS, ITEM_QUALITY_NAMES,
     ITEM_CLASS_NAMES, WEAPON_SUBCLASS_NAMES,
     ARMOR_SUBCLASS_NAMES, CLASS_BITMASK,
-    MSG_TYPE_PLAIN, MSG_TYPE_QUEST, MSG_TYPE_LOOT,
-    MSG_TYPE_QUEST_REWARD, MSG_TYPE_TRADE,
+    ARMOR_KIND_SUBCLASS_NAMES, ARMOR_PIECE_NAMES,
+    ITEM_SUBCLASS_NAMES, WEAPON_HAND_NAMES,
     EMOTE_KEYWORDS,
     EMOTE_LIST_STR,
 )
@@ -35,6 +42,9 @@ from chatter_text import (
     parse_single_response,
     _sanitize_action,
     cleanup_message,
+    split_action_prefix,
+    shorten_chat_message,
+    shorten_chat_question,
     extract_conversation_msg_count,
     repair_json_string,
     _extract_ngrams,
@@ -47,13 +57,11 @@ from chatter_llm import (
     quick_llm_analyze,
 )
 from chatter_db import (
-    zone_cache,
     get_db_connection,
     wait_for_database,
     validate_emote,
     insert_chat_message,
     query_zone_quests,
-    query_zone_loot,
     query_zone_mobs,
     query_bot_spells,
     query_item_details,
@@ -63,8 +71,14 @@ from chatter_db import (
     get_character_info_by_name,
     get_character_talents,
     get_creature_entry_column,
+    get_race_name,
 )
 from talent_catalog import TALENT_CATALOG
+from chatter_structured import (
+    ResponseContract,
+    conversation_contract, render_structured_format, statement_contract,
+    structured_output_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,27 +93,47 @@ class PromptParts(str):
     messages.
     """
     def __new__(
-        cls, user_prompt: str, system_block: str
+        cls, user_prompt: str, system_block: str, *,
+        response_contract=None, structured_system_prompt=None,
+        contract_conflict=False,
     ):
         instance = super().__new__(
             cls, user_prompt + system_block
         )
         instance.user_prompt = user_prompt
         instance.system_prompt = system_block
+        instance.response_contract = response_contract
+        instance.structured_system_prompt = structured_system_prompt
+        instance.contract_conflict = contract_conflict
         return instance
+
+    def _metadata(self):
+        return dict(response_contract=self.response_contract,
+                    structured_system_prompt=self.structured_system_prompt,
+                    contract_conflict=self.contract_conflict)
 
     def __add__(self, other):
         if isinstance(other, PromptParts):
+            selected = self if self.system_prompt else other
+            metadata = selected._metadata()
+            metadata['contract_conflict'] = (
+                self.contract_conflict or other.contract_conflict
+                or any(part.response_contract is not None
+                       and part.response_contract != selected.response_contract
+                       for part in (self, other))
+            )
             return PromptParts(
                 self.user_prompt
                 + other.user_prompt,
                 self.system_prompt
-                or other.system_prompt
+                or other.system_prompt,
+                **metadata,
             )
         if isinstance(other, str):
             return PromptParts(
                 self.user_prompt + other,
-                self.system_prompt
+                self.system_prompt,
+                **self._metadata(),
             )
         return NotImplemented
 
@@ -107,12 +141,39 @@ class PromptParts(str):
         if isinstance(other, str):
             return PromptParts(
                 other + self.user_prompt,
-                self.system_prompt
+                self.system_prompt,
+                **self._metadata(),
             )
         return NotImplemented
 
     def __iadd__(self, other):
         return self.__add__(other)
+
+
+def _annotated_prompt(prompt, block, factory, semantic_rules, **options):
+    """Invalid metadata must not break legacy prompt construction.
+
+    Enabled dispatch rejects the explicit marker before sending a request.
+    """
+    try:
+        contract = factory(**options)
+        structured = render_structured_format(contract, semantic_rules)
+    except (ValueError, TypeError):
+        return PromptParts(prompt, block, contract_conflict=True)
+    return PromptParts(prompt, block, response_contract=contract,
+                       structured_system_prompt=structured)
+
+
+def annotate_conversation_prompt(prompt, block, semantic_rules, **options):
+    """Attach a conversation contract to a caller-built JSON block.
+
+    For builders whose legacy JSON block differs from
+    append_conversation_json_instruction(); options go to
+    conversation_contract().
+    """
+    return _annotated_prompt(
+        prompt, block, conversation_contract, semantic_rules, **options
+    )
 
 
 # N12 decomposition scaffold note:
@@ -146,7 +207,7 @@ def _evict_zone_delivery_cache() -> None:
 
     Entries older than 1 hour are irrelevant — no
     meaningful gap enforcement needed after that long.
-    Called probabilistically from _zone_delivery_delay
+    Called probabilistically from the zone reservation
     (~1% of calls) to bound memory growth.
     """
     cutoff = time.monotonic() - 3600
@@ -158,35 +219,52 @@ def _evict_zone_delivery_cache() -> None:
         del _zone_last_delivery[k]
 
 
-def _zone_delivery_delay(zone_id, config) -> float:
-    """Return extra delay (seconds) to enforce a
-    minimum gap between General messages in a zone.
+def _reserve_zone_delivery_window(
+    zone_id, config, duration_seconds=0.0,
+) -> float:
+    """Atomically reserve a General delivery window.
 
-    Returns 0 if enough time has passed since the
-    last delivery in this zone.
-
-    Shared between ambient and player-reaction paths
-    so both contribute to and respect the same gap.
-    Thread-safe: read-compute-write is under lock.
+    Returns the delay before the window may begin. The
+    reservation remains occupied through
+    ``duration_seconds``, so another automated sequence
+    cannot schedule follow-up lines over this one.
     """
     # Probabilistic eviction (~1% chance per call)
-    if random.random() < 0.01:
-        _evict_zone_delivery_cache()
-
-    gap = float(config.get(
+    gap = max(0.0, float(config.get(
         'LLMChatter.GeneralChat.MinZoneGap',
         _ZONE_GAP_DEFAULT
-    ))
+    )))
+    duration = max(0.0, float(duration_seconds))
     with _zone_gap_lock:
+        if random.random() < 0.01:
+            _evict_zone_delivery_cache()
+
         now = time.monotonic()
         last = _zone_last_delivery.get(zone_id, 0)
-        elapsed = now - last
-        if elapsed >= gap:
-            _zone_last_delivery[zone_id] = now
-            return 0
-        extra = gap - elapsed
-        _zone_last_delivery[zone_id] = now + extra
-        return extra
+        start = max(now, last + gap)
+        _zone_last_delivery[zone_id] = start + duration
+        return start - now
+
+
+def _extend_zone_delivery_window(
+    zone_id, delay_seconds,
+) -> None:
+    """Extend, but never shorten, a zone reservation."""
+    projected = time.monotonic() + max(
+        0.0, float(delay_seconds)
+    )
+    with _zone_gap_lock:
+        _zone_last_delivery[zone_id] = max(
+            projected,
+            _zone_last_delivery.get(zone_id, 0),
+        )
+
+
+def _zone_delivery_delay(zone_id, config) -> float:
+    """Reserve one General message and return its delay."""
+    return _reserve_zone_delivery_window(
+        zone_id, config, duration_seconds=0.0,
+    )
 
 
 # =============================================================================
@@ -277,12 +355,108 @@ def pick_random_max_tokens(config: dict) -> int:
 
 
 # =============================================================================
+# Maps a WoW client locale code (see _LANGUAGE_LOCALE_CODES
+# above) to the corresponding locale-specific zone-name
+# dict. Add further locales here (mirroring
+# _LANGUAGE_LOCALE_CODES) as more locale-specific zone-name
+# data becomes available.
+#
+# Provenance differs by locale, and that difference matters:
+#   - ruRU (ZONE_NAMES_RU): extracted directly from
+#     Blizzard's own ruRU AreaTable.dbc client data --
+#     100% authoritative.
+#   - frFR / deDE (ZONE_NAMES_FR / ZONE_NAMES_DE): sourced
+#     from warcraft.wiki.gg's community-maintained
+#     "LocalizedMapZones" addon-localization table, NOT from
+#     an official Blizzard client data extraction. Names are
+#     likely accurate (real translated zone names, not
+#     guesses) but have not been independently verified
+#     against official client data, and coverage is known to
+#     be incomplete -- French in particular is missing most/
+#     all of Northrend and a handful of other zones. Missing
+#     entries simply fall back to English below rather than
+#     being guessed at.
+#   - esES (ZONE_NAMES_ES): mixed provenance -- most entries
+#     sourced from an old (2007) Spanish WoW fan blog
+#     (worldofwarcraftesp.blogspot.com), community-sourced
+#     and unverified like frFR/deDE above, but nine entries
+#     (Borean Tundra, Howling Fjord, Hellfire Peninsula,
+#     Dragonblight, Grizzly Hills, Zul'Drak, Sholazar Basin,
+#     The Storm Peaks, Icecrown) come from an official
+#     Blizzard press source instead (news.blizzard.com/es-es)
+#     and are genuinely higher-confidence -- see the inline
+#     comments on those nine entries in ZONE_NAMES_ES above
+#     for details.
+#   - frFR (ZONE_NAMES_FR) also has 8 Northrend entries
+#     (Borean Tundra, Howling Fjord, Dragonblight, Grizzly
+#     Hills, Zul'Drak, Sholazar Basin, The Storm Peaks,
+#     Icecrown) sourced the same official way
+#     (news.blizzard.com/fr-fr), layered on top of the rest
+#     of the wiki-sourced frFR data described above.
+#   - koKR (ZONE_NAMES_KO): a brand-new locale, covering only
+#     8 Northrend zones (the same set as the frFR/esES
+#     official-source additions above), sourced entirely from
+#     official Blizzard ko-kr press articles
+#     (news.blizzard.com/ko-kr). koKR creature/item/quest
+#     names above were already live (sourced from
+#     acore_world.*_locale, which does carry that locale);
+#     this is the first koKR zone-name data. Every zone
+#     outside those 8 falls back to English via
+#     get_zone_name(), same as the other locales.
+_ZONE_NAME_LOCALE_MAPS: Dict[str, Dict[int, str]] = locale_dataset("ZONE_NAMES")
+
+
+def _load_subzone_names_ru() -> Dict[int, str]:
+    """Load ruRU subzone names from subzone_names_ru.json.
+
+    Maps area_id -> Russian subzone name, extracted directly
+    from Blizzard's ruRU AreaTable.dbc (100% authoritative,
+    same provenance as ZONE_NAMES_RU). Returns {} when the
+    file is absent so the English subzone_lore.json fallback
+    still applies.
+    """
+    try:
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "subzone_names_ru.json",
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            int(key): value
+            for key, value in data.get("subzones", {}).items()
+        }
+    except Exception:
+        return {}
+
+
+_SUBZONE_NAME_LOCALE_MAPS: Dict[str, Dict[int, str]] = {
+    "ruRU": _load_subzone_names_ru(),
+}
+
+
 def get_zone_name(zone_id: int) -> Optional[str]:
     """Get human-readable zone name from zone ID.
+
+    Prefers the localized name for the configured
+    LLMChatter.Language (via _ZONE_NAME_LOCALE_MAPS) when
+    available, falling back to the static English ZONE_NAMES
+    entry, mirroring the same fallback-safe pattern used for
+    creature/item/quest name localization. See the
+    _ZONE_NAME_LOCALE_MAPS comment above for the differing
+    provenance/confidence of each locale's data (ruRU is
+    DBC-extracted and authoritative; frFR/deDE are
+    community-wiki-sourced and unverified against official
+    client data).
 
     Returns None when the zone ID is unknown to avoid
     injecting 'zone 123' placeholder text into prompts.
     """
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _ZONE_NAME_LOCALE_MAPS.get(locale)
+        if localized_map and zone_id in localized_map:
+            return localized_map[zone_id]
     if zone_id in ZONE_NAMES:
         return ZONE_NAMES[zone_id]
     return None
@@ -349,9 +523,35 @@ def get_class_name(class_id: int) -> str:
     return CLASS_NAMES.get(class_id, "Adventurer")
 
 
-def get_race_name(race_id: int) -> str:
-    """Get human-readable race name from race ID."""
-    return RACE_NAMES.get(race_id, "Unknown")
+def get_race_faction(race_id) -> str:
+    """Return the playable faction for a WotLK race ID."""
+    try:
+        race_id = int(race_id)
+    except (TypeError, ValueError):
+        return ""
+    if race_id in ALLIANCE_RACE_IDS:
+        return "Alliance"
+    if race_id in HORDE_RACE_IDS:
+        return "Horde"
+    return ""
+
+
+def faction_war_line(
+    own_subject: str, own_team: str,
+    enemy_name: str, enemy_team: str,
+    own_verb: str = "fights",
+) -> str:
+    """PvP framing: who fights for which faction, and that the Horde and
+    the Alliance are hostile. Empty when a faction is unknown or equal."""
+    own_team = str(own_team or '').strip()
+    enemy_team = str(enemy_team or '').strip()
+    if not own_team or not enemy_team or own_team == enemy_team:
+        return ""
+    return (
+        f"{own_subject} {own_verb} for the {own_team}; {enemy_name} "
+        f"fights for the {enemy_team}. The Horde and the Alliance are "
+        "hostile factions, locked in a long, bitter war for survival."
+    )
 
 
 def get_gender_label(gender_id: int) -> str:
@@ -364,6 +564,9 @@ def build_bot_identity(
     bot_race: str,
     bot_class: str,
     gender: str = '',
+    suffix: str = '.',
+    gear: str = '',
+    guild_name: str = '',
 ) -> str:
     """Return an identity prefix for bot prompts.
 
@@ -372,11 +575,24 @@ def build_bot_identity(
     """
     if bot_race and bot_class:
         gender_prefix = f"{gender} " if gender else ""
-        return (
+        identity = (
             f"You are {bot_name}, "
-            f"a {gender_prefix}{bot_race} {bot_class}."
+            f"a {gender_prefix}{bot_race} "
+            f"{bot_class}{suffix}"
         )
-    return f"You are {bot_name}."
+    else:
+        identity = f"You are {bot_name}{suffix}"
+    identity += _guild_membership_sentence(guild_name)
+
+    gear = (gear or '').strip()
+    return f"{identity} {gear}" if gear else identity
+
+
+def _guild_membership_sentence(guild_name: str) -> str:
+    guild_name = (guild_name or '').strip()
+    if not guild_name:
+        return ''
+    return f" You are a member of the guild \"{guild_name}\"."
 
 
 def build_bot_identity_with_level(
@@ -386,6 +602,7 @@ def build_bot_identity_with_level(
     bot_level,
     gender: str = '',
     suffix: str = ' in World of Warcraft.',
+    guild_name: str = '',
 ) -> str:
     """Return a leveled identity prefix for bot prompts."""
     gender_prefix = f"{gender} " if gender else ""
@@ -393,6 +610,7 @@ def build_bot_identity_with_level(
         f"You are {bot_name}, a level "
         f"{bot_level} {gender_prefix}{bot_race} "
         f"{bot_class}{suffix}"
+        + _guild_membership_sentence(guild_name)
     )
 
 
@@ -403,6 +621,7 @@ def build_bot_identity_from_dict(
 ) -> str:
     """Build a standard identity line from a bot dict."""
     gender = bot.get('gender', '')
+    guild_name = bot.get('guild_name', '')
     if include_level:
         return build_bot_identity_with_level(
             bot['name'],
@@ -411,12 +630,14 @@ def build_bot_identity_from_dict(
             bot['level'],
             gender=gender,
             suffix=suffix,
+            guild_name=guild_name,
         )
     return build_bot_identity(
         bot['name'],
         bot['race'],
         bot['class'],
         gender=gender,
+        guild_name=guild_name,
     )
 
 
@@ -451,6 +672,8 @@ _race_lore_chance = 0.15
 # Module-level race vocabulary chance (set from config)
 _race_vocab_chance = 0.15
 
+_race_class_notes_enabled = True
+
 
 def set_race_lore_chance(chance_pct: int):
     """Set from config: LLMChatter.RaceLoreChance (0-100)."""
@@ -464,13 +687,40 @@ def set_race_vocab_chance(chance_pct: int):
     _race_vocab_chance = chance_pct / 100.0
 
 
+def set_race_class_notes_enabled(enabled: bool):
+    """Set from config: LLMChatter.RaceClassNotes.Enable."""
+    global _race_class_notes_enabled
+    _race_class_notes_enabled = bool(enabled)
+
+
+def race_class_note(
+    race: str, class_name: str,
+    class_style: str = None, actual_role: str = None,
+    subject: str = "Your",
+) -> str:
+    """Lore note for this race+class; priests split into Light/Shadow."""
+    if not _race_class_notes_enabled:
+        return ""
+    style = class_style or class_name
+    if style == 'Priest':
+        style = (
+            'Shadow Priest'
+            if actual_role and actual_role.endswith('dps')
+            else 'Light Priest'
+        )
+    note = RACE_CLASS_NOTES.get((race, style))
+    if not note:
+        return ""
+    return f"{subject} people and calling ({race} {style}): {note}"
+
+
 def build_race_class_context(
     race: str, class_name: str,
     actual_role: str = None
 ) -> str:
     """Build an RP personality fragment for prompts."""
     parts = []
-    profile = RACE_SPEECH_PROFILES.get(race)
+    profile = get_race_speech_profile(race)
     if profile:
         traits = profile['traits']
         if isinstance(traits, list):
@@ -543,7 +793,7 @@ def build_race_class_context_parts(
     shared_race_parts = []
     shared_class_parts = []
 
-    profile = RACE_SPEECH_PROFILES.get(race)
+    profile = get_race_speech_profile(race)
     if profile:
         # Per-bot: traits (random choice) + vocab phrase
         traits = profile['traits']
@@ -614,15 +864,170 @@ def build_race_class_context_parts(
     )
 
 
-def build_bot_state_context(extra_data):
-    """Build natural-language state description
-    from C++ bot_state data in extra_data."""
-    if not extra_data:
-        return ""
-    state = extra_data.get('bot_state')
-    if not state or not isinstance(state, dict):
+def _payload_bool(value):
+    """C++ payloads send JSON booleans, but tolerate
+    ints and strings ("true", "1")."""
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true')
+    return bool(value)
+
+
+def is_pvp_enemy(extra_data):
+    """True when the event's enemy is an
+    opposing-faction player (real player or bot)."""
+    return bool(extra_data) and (
+        extra_data.get('enemy_kind') == 'player'
+    )
+
+
+def is_pvp_identity_known(extra_data):
+    """True when the reactor could perceive the
+    PvP enemy, so its identity may be used."""
+    return is_pvp_enemy(extra_data) and _payload_bool(
+        extra_data.get('enemy_identity_known')
+    )
+
+
+def _pvp_level_gap_line(extra_data):
+    """Describe the level gap between the enemy and
+    the group member involved."""
+    if _payload_bool(extra_data.get('is_gray_kill')):
+        return (
+            "They are far lower level than your "
+            "side, a lopsided fight that earns no "
+            "honour."
+        )
+    try:
+        gap = int(extra_data.get('level_gap', 0))
+    except (TypeError, ValueError):
+        gap = 0
+    if gap >= 10:
+        return (
+            "They are far higher level than your "
+            "side and very dangerous."
+        )
+    if gap >= 4:
+        return "They are higher level than your side."
+    if gap <= -4:
+        return "They are lower level than your side."
+    return "They are roughly an even match."
+
+
+def build_pvp_enemy_context(extra_data, mode='roleplay'):
+    """Describe an opposing-faction enemy for combat
+    prompts. Returns "" for creature enemies.
+
+    Identity (name, race, class, level) is used only
+    when C++ marked it perceivable. An enemy is
+    never described as a bot, NPC, or monster.
+    """
+    if not is_pvp_enemy(extra_data):
         return ""
 
+    from chatter_mode import is_roleplay
+    roleplay = is_roleplay(mode)
+    lines = []
+
+    via_pet = _payload_bool(extra_data.get('via_pet'))
+    pet_name = str(
+        extra_data.get('enemy_pet_name') or ''
+    ).strip()
+
+    if is_pvp_identity_known(extra_data):
+        name = str(
+            extra_data.get('enemy_name') or ''
+        ).strip() or 'an enemy'
+        try:
+            race = get_race_name(
+                int(extra_data.get('enemy_race', 0)))
+            cls = get_class_name(
+                int(extra_data.get('enemy_class', 0)))
+            level = int(extra_data.get('enemy_level', 0))
+        except (TypeError, ValueError):
+            race, cls, level = '', '', 0
+        faction = str(
+            extra_data.get('enemy_faction') or ''
+        ).strip() or 'opposing faction'
+        # Local import: chatter_member_gender imports chatter_shared.
+        from chatter_member_gender import gender_from_id
+        gender = gender_from_id(extra_data.get('enemy_gender'))
+        desc = ' '.join(
+            p for p in (
+                f"level {level}" if level else '',
+                gender, race, cls,
+            ) if p
+        )
+        who = f"{name}, a {desc}" if desc else name
+        lines.append(
+            f"This fight is against another "
+            f"adventurer: {who} of the {faction}."
+        )
+        if via_pet and pet_name:
+            lines.append(
+                f"Their pet {pet_name} is part of it."
+            )
+        lines.append(_pvp_level_gap_line(extra_data))
+    elif via_pet and pet_name:
+        lines.append(
+            f"An enemy adventurer's pet, {pet_name}, is "
+            f"involved, but its master stayed out of "
+            f"sight. Do not name or describe the master."
+        )
+    else:
+        lines.append(
+            "An unseen adventurer of the opposing "
+            "faction is involved. Nobody saw who it "
+            "was, so do not name or describe them."
+        )
+
+    initiator = extra_data.get('initiator')
+    if initiator == 'enemy':
+        lines.append("They attacked your group first.")
+    elif initiator == 'group':
+        lines.append("Your group started this fight.")
+
+    lines.append(
+        "Treat them as a living character of the "
+        "opposing faction. Never call them a bot, "
+        "NPC, mob, or monster."
+    )
+    lines.append(
+        "Let your class, race, and personality shape "
+        "how you feel about this fight; an "
+        "honour-bound character may dislike beating a "
+        "much weaker foe, a ruthless one may not care."
+    )
+    if roleplay:
+        lines.append(
+            "Rivalry and taunts are fine, but no slurs, "
+            "abuse, or hateful language."
+        )
+    else:
+        lines.append(
+            "Use natural WoW PvP language. Playful "
+            "trash talk is fine, but no slurs, abuse, "
+            "or hateful language."
+        )
+    return ' '.join(lines)
+
+
+def build_bot_state_context(extra_data, mode='roleplay'):
+    """Build natural-language state description
+    from C++ bot_state data in extra_data.
+
+    Opposing-faction PvP enemy context, when present,
+    is appended so every combat prompt that already
+    includes bot state picks it up.
+    """
+    if not extra_data:
+        return ""
+    extra_context = build_pvp_enemy_context(extra_data, mode)
+    state = extra_data.get('bot_state')
+    if not state or not isinstance(state, dict):
+        return extra_context
+
+    from chatter_mode import is_roleplay
+    roleplay = is_roleplay(mode)
     parts = []
 
     # Real role (replaces CLASS_ROLE_MAP guessing)
@@ -645,15 +1050,21 @@ def build_bot_state_context(extra_data):
     if hp is not None:
         hp = int(hp)
         if hp <= 20:
-            parts.append(
-                f"You are critically wounded "
-                f"({hp}% health)."
-            )
+            if roleplay:
+                parts.append(
+                    f"You are critically wounded ({hp}% health)."
+                )
+            else:
+                parts.append(
+                    f"Your character is critically low on health ({hp}%)."
+                )
         elif hp <= 50:
-            parts.append(
-                f"You are injured "
-                f"({hp}% health)."
-            )
+            if roleplay:
+                parts.append(f"You are injured ({hp}% health).")
+            else:
+                parts.append(
+                    f"Your character is low on health ({hp}%)."
+                )
 
     # Mana (skip for non-mana classes: -1 sentinel)
     mp = state.get('mana_pct')
@@ -671,19 +1082,26 @@ def build_bot_state_context(extra_data):
                     f"({mp}%)."
                 )
 
-    # Current target
+    # Current target. C++ (BuildBotStateJson) only fills it
+    # when the bot can perceive its own victim.
     target = state.get('target', '')
     if target:
-        parts.append(
-            f"You are currently fighting "
-            f"{target}."
-        )
+        subject = "You are" if roleplay else "Your character is"
+        parts.append(f"{subject} currently fighting {target}.")
 
     travel_ctx = format_travel_context(
         state.get('travel_state')
     )
     if travel_ctx:
-        parts.append(travel_ctx)
+        if roleplay:
+            parts.append(travel_ctx)
+        else:
+            parts.append(
+                f"Character gameplay travel state: {travel_ctx}"
+            )
+
+    if extra_context:
+        parts.append(extra_context)
 
     return ' '.join(parts)
 
@@ -853,21 +1271,134 @@ def build_group_travel_metadata(bots):
 # =============================================================================
 # CONFIG & DATABASE
 # =============================================================================
+def _read_config_text(config_path: str) -> str:
+    """Read and decode the config file, exiting on a read failure."""
+    # Read raw bytes so we can decode explicitly. A genuine file-access
+    # error (missing/unreadable) is fatal and logged; encoding is handled
+    # separately below so a decodable-but-non-UTF-8 file is never treated
+    # as a read failure.
+    try:
+        with open(config_path, 'rb') as f:
+            raw = f.read()
+    except Exception as e:
+        logger.error(
+            "FATAL: could not read config file %s: %s: %s",
+            config_path,
+            type(e).__name__,
+            e,
+        )
+        sys.exit(1)
+
+    # Decode preference:
+    #   1. utf-8-sig - handles UTF-8 with or without a BOM, and pure ASCII.
+    #      Without an explicit encoding, open() used the OS locale (cp1252
+    #      on Windows), which cannot decode common UTF-8 bytes and killed
+    #      the bridge silently.
+    #   2. On UnicodeDecodeError, fall back to the OS locale encoding so
+    #      pre-existing Windows ANSI/cp1252 configs (e.g. a raw 0xE9 'e')
+    #      keep parsing the way plain open() used to read them. Use
+    #      errors='replace' so this fallback can never itself raise.
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode(
+            locale.getpreferredencoding(False), errors='replace'
+        )
+
+
 def parse_config(config_path: str) -> dict:
     """Parse the WoW-style config file."""
     config = {}
-    try:
-        with open(config_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    config[key.strip()] = value.strip()
-    except Exception as e:
-        sys.exit(1)
+    for line in _read_config_text(config_path).splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            key, value = line.split('=', 1)
+            config[key.strip()] = value.strip()
     return config
+
+
+# A section banner is a full '#' rule followed by '# TITLE [TAG]'.
+_SECTION_RULE_RE = re.compile(r'^#{20,}\s*$')
+_SECTION_TAG_RE = re.compile(r'\s*[\[(].*$')
+
+
+def parse_config_sections(config_path: str) -> dict:
+    """Map each config key to the title of the file section holding it.
+
+    Titles come from the file's own '#####' banners, with the
+    [BOTH]/[BRIDGE]/[SERVER] tags and '(only needed if ...)' notes
+    dropped. Keys above the first banner are left out.
+    """
+    sections = {}
+    current = ''
+    after_rule = False
+    for line in _read_config_text(config_path).splitlines():
+        stripped = line.strip()
+        if _SECTION_RULE_RE.match(stripped):
+            after_rule = True
+            continue
+        is_title_line = after_rule and stripped.startswith('#')
+        after_rule = False
+        if is_title_line:
+            title = _SECTION_TAG_RE.sub('', stripped.lstrip('#')).strip()
+            if title:
+                current = title.upper()
+                continue
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0].strip()
+            if current:
+                sections[key] = current
+    return sections
+
+
+# Key-name suffixes whose values must never reach a log.
+_SECRET_KEY_SUFFIXES = ('apikey', 'password', 'secret')
+_CONFIG_KEY_PREFIX = 'LLMChatter.'
+_CONFIG_LOG_KEY_WIDTH = 48
+_CONFIG_LOG_RULE_WIDTH = 60
+
+
+def format_config_for_log(config: dict, sections: dict = None) -> list:
+    """Return the config as readable log lines, grouped by file section.
+
+    Each group gets a '-- TITLE (N) ---' header and a blank line before
+    it; keys keep their file order, drop the 'LLMChatter.' prefix and
+    have their values aligned. Keys with no known section go under
+    OTHER. Secrets (API keys, passwords) are shown only as set or
+    empty, so the startup log can be shared when asking for help.
+    Internal keys the bridge adds at runtime (``__name__``) are skipped.
+    """
+    sections = sections or {}
+    groups = {}
+    for key, value in config.items():
+        if key.startswith('__'):
+            continue
+        if key.lower().endswith(_SECRET_KEY_SUFFIXES):
+            value = '<set, hidden>' if str(value).strip() else '<empty>'
+        elif not str(value).strip():
+            value = '<empty>'
+        groups.setdefault(sections.get(key, 'OTHER'), []).append(
+            (key, value)
+        )
+
+    lines = []
+    for title, items in groups.items():
+        header = f"-- {title} ({len(items)}) "
+        lines.append('')
+        lines.append(header.ljust(_CONFIG_LOG_RULE_WIDTH, '-'))
+        names = [
+            k[len(_CONFIG_KEY_PREFIX):]
+            if k.startswith(_CONFIG_KEY_PREFIX) else k
+            for k, _ in items
+        ]
+        width = min(
+            max(len(n) for n in names), _CONFIG_LOG_KEY_WIDTH
+        )
+        for name, (_, value) in zip(names, items):
+            lines.append(f"  {name.ljust(width)}  {value}")
+    return lines
 
 
 # =============================================================================
@@ -882,14 +1413,117 @@ def get_zone_level_range(
     return (max(1, bot_level - 5), bot_level + 5)
 
 
+# Locale-keyed zone flavor text maps, mirroring
+# _ZONE_NAME_LOCALE_MAPS above. ruRU, frFR, deDE and esES carry
+# translated ZONE_FLAVOR tables; any other locale (or zone_id
+# missing from the localized map) falls back to the English
+# ZONE_FLAVOR via get_zone_flavor() below.
+_ZONE_FLAVOR_LOCALE_MAPS: Dict[str, Dict[int, str]] = locale_dataset("ZONE_FLAVOR")
+
+
+# Locale-keyed race speech profile maps, mirroring
+# _ZONE_FLAVOR_LOCALE_MAPS above. Only ruRU has a translated
+# RACE_SPEECH_PROFILES_RU dict so far; any other locale (or
+# race missing from the localized map) falls back to the
+# static English RACE_SPEECH_PROFILES via
+# get_race_speech_profile() below.
+_RACE_SPEECH_LOCALE_MAPS: Dict[str, Dict[str, Dict]] = locale_dataset("RACE_SPEECH_PROFILES")
+
+
+def get_race_speech_profile(race: str) -> Optional[Dict]:
+    """Get race speech profile for prompt context.
+
+    Prefers the localized profile for the configured
+    LLMChatter.Language (via _RACE_SPEECH_LOCALE_MAPS) when
+    available, falling back to the static English
+    RACE_SPEECH_PROFILES entry, mirroring get_zone_flavor()'s
+    locale-fallback pattern.
+    """
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _RACE_SPEECH_LOCALE_MAPS.get(locale)
+        if localized_map and race in localized_map:
+            return localized_map[race]
+    return RACE_SPEECH_PROFILES.get(race)
+
+
 def get_zone_flavor(zone_id: int) -> Optional[str]:
-    """Get rich zone flavor text for immersive context."""
+    """Get rich zone flavor text for immersive context.
+
+    Prefers the localized flavor text for the configured
+    LLMChatter.Language (via _ZONE_FLAVOR_LOCALE_MAPS) when
+    available, falling back to the static English ZONE_FLAVOR
+    entry, mirroring get_zone_name()'s locale-fallback pattern.
+
+    Returns None when the zone ID has no flavor text at all
+    (unreachable and developer zones).
+    """
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _ZONE_FLAVOR_LOCALE_MAPS.get(locale)
+        if localized_map and zone_id in localized_map:
+            return localized_map[zone_id]
     return ZONE_FLAVOR.get(zone_id)
 
 
+# Locale-keyed dungeon/raid flavor text maps, mirroring
+# _ZONE_FLAVOR_LOCALE_MAPS above. ruRU, frFR, deDE and esES carry
+# translated DUNGEON_FLAVOR tables; any other locale (or map_id
+# missing from the localized map) falls back to the static
+# English DUNGEON_FLAVOR via get_dungeon_flavor() below.
+_DUNGEON_FLAVOR_LOCALE_MAPS: Dict[str, Dict[int, str]] = locale_dataset("DUNGEON_FLAVOR")
+
+
 def get_dungeon_flavor(map_id: int) -> Optional[str]:
-    """Get dungeon/raid flavor text by map ID."""
+    """Get dungeon/raid flavor text by map ID.
+
+    Prefers the localized flavor text for the configured
+    LLMChatter.Language (via _DUNGEON_FLAVOR_LOCALE_MAPS) when
+    available, falling back to the static English
+    DUNGEON_FLAVOR entry, mirroring get_zone_flavor()'s
+    locale-fallback pattern.
+    """
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _DUNGEON_FLAVOR_LOCALE_MAPS.get(locale)
+        if localized_map and map_id in localized_map:
+            return localized_map[map_id]
     return DUNGEON_FLAVOR.get(map_id)
+
+
+# Locale-keyed battleground lore maps, mirroring
+# _DUNGEON_FLAVOR_LOCALE_MAPS above. ruRU, frFR, deDE and esES
+# carry translated BG_LORE tables; any other locale (or bg_type_id
+# missing from the localized map) falls back to the static English
+# BG_LORE entry via get_bg_lore() below.
+_BG_LORE_LOCALE_MAPS: Dict[str, Dict[int, Dict]] = locale_dataset("BG_LORE")
+
+
+def get_bg_lore(bg_type_id: int) -> Dict:
+    """Get battleground lore dict by bg_type_id.
+
+    Prefers the localized lore dict for the configured
+    LLMChatter.Language (via _BG_LORE_LOCALE_MAPS) when
+    available, falling back to the static English BG_LORE
+    entry, mirroring get_zone_flavor()'s locale-fallback
+    pattern. Returns {} (not None) when bg_type_id has no
+    lore at all, matching BG_LORE.get(bg_type_id, {})
+    semantics.
+    """
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _BG_LORE_LOCALE_MAPS.get(locale)
+        if localized_map and bg_type_id in localized_map:
+            return localized_map[bg_type_id]
+    return BG_LORE.get(bg_type_id, {})
+
+def instance_has_sky(map_id: int = 0, map_name: str = '') -> bool:
+    """True when an instance is fought under the open sky, so time
+    of day, season and weather belong in its prompts. Raid events
+    only carry a map name, so either key is accepted."""
+    if map_id and map_id in OPEN_AIR_INSTANCES:
+        return True
+    return bool(map_name) and map_name in OPEN_AIR_INSTANCES.values()
 
 
 def get_group_area(db, group_id: int) -> int:
@@ -973,15 +1607,60 @@ def get_subzone_lore(
     return None
 
 
+def get_zone_lore(zone_id: int) -> Optional[str]:
+    """Get the full zone description from subzone_lore.json.
+
+    Much longer than ZONE_FLAVOR, so it is only for prompts whose
+    subject is the zone itself; everything else uses
+    get_zone_flavor(). The text is English only, so it returns
+    None when LLMChatter.Language has a translated ZONE_FLAVOR
+    for the zone (callers then fall back to get_zone_flavor()),
+    and when the zone has no description.
+    """
+    if not zone_id:
+        return None
+    locale = get_language_locale_code()
+    if locale and zone_id in _ZONE_FLAVOR_LOCALE_MAPS.get(locale, {}):
+        return None
+    zdata = _load_subzone_lore().get("zones", {}).get(
+        str(zone_id), {}
+    )
+    return zdata.get("description") or None
+
+
+def location_lore_lines(
+    zone_id: int, area_id: int, include_zone: bool = True,
+) -> List[str]:
+    """Open-world lore lines for a prompt: the zone flavor
+    (unless include_zone is False) and the subzone lore,
+    each only when it exists."""
+    lines = []
+    if include_zone:
+        zone_flavor = get_zone_flavor(zone_id) if zone_id else None
+        if zone_flavor:
+            lines.append(f"Zone context: {zone_flavor}")
+    subzone_lore = get_subzone_lore(zone_id, area_id)
+    if subzone_lore:
+        lines.append(f"Current subzone: {subzone_lore}")
+    return lines
+
+
 def get_subzone_name(
     zone_id: int, area_id: int
 ) -> Optional[str]:
-    """Get subzone name from subzone_lore.json.
+    """Get subzone name, localized when available.
 
-    Returns None if area equals zone or no entry.
+    Prefers the ruRU DBC-extracted name for the configured
+    locale, falling back to the English subzone_lore.json
+    entry. Returns None if area equals zone or no entry.
     """
     if not area_id or area_id == zone_id:
         return None
+    locale = get_language_locale_code()
+    if locale:
+        localized_map = _SUBZONE_NAME_LOCALE_MAPS.get(locale)
+        if localized_map and area_id in localized_map:
+            return localized_map[area_id]
     lore = _load_subzone_lore()
     zones = lore.get("zones", {})
     zdata = zones.get(str(zone_id), {})
@@ -990,6 +1669,31 @@ def get_subzone_name(
     if entry:
         return entry.get("name")
     return None
+
+
+def find_subzone_id(zone_id: int, subzone_name: str) -> int:
+    """Area ID of a named subzone of zone_id, or 0.
+
+    For payloads that carry the subzone name but no area_id (an older
+    worldserver). Names are matched case-insensitively against the
+    English entries and every localized subzone-name table, within
+    this zone only, since subzone names repeat across zones.
+    """
+    wanted = str(subzone_name or '').strip().casefold()
+    if not zone_id or not wanted:
+        return 0
+    subzones = _load_subzone_lore().get("zones", {}).get(
+        str(zone_id), {}
+    ).get("subzones", {})
+    for area_id, entry in subzones.items():
+        if str(entry.get("name") or '').casefold() == wanted:
+            return int(area_id)
+    for localized_map in _SUBZONE_NAME_LOCALE_MAPS.values():
+        for area_id, name in localized_map.items():
+            if (str(area_id) in subzones
+                    and str(name or '').casefold() == wanted):
+                return int(area_id)
+    return 0
 
 
 def build_zone_metadata(
@@ -1046,10 +1750,11 @@ def get_dungeon_bosses(
 ) -> list:
     """Get boss names for a dungeon/raid map.
 
-    Queries creature + creature_template from
-    acore_world. Detects bosses via:
+    Uses registered creature encounters first, then the established
+    metadata fallback for unregistered special bosses:
+    - instance_encounters creature credits
     - rank=3 (raid bosses)
-    - CreatureImmunitiesId > 0 AND single spawn
+    - positive CreatureImmunitiesId AND single spawn
       (named dungeon bosses — immune mobs that
       spawn only once per map are reliably bosses;
       multi-spawn immune mobs like Molten Elementals
@@ -1062,7 +1767,18 @@ def get_dungeon_bosses(
         cursor = db.cursor(dictionary=True)
         entry_col = get_creature_entry_column(db)
         cursor.execute(f"""
-            SELECT ct.name
+            SELECT ct.name AS name
+            FROM acore_world.creature_template ct
+            JOIN acore_world.creature c
+                ON c.{entry_col} = ct.entry
+            WHERE c.map = %s
+                AND ct.entry IN (
+                    SELECT ie.creditEntry
+                    FROM acore_world.instance_encounters ie
+                    WHERE ie.creditType = 0
+                )
+            UNION
+            SELECT ct.name AS name
             FROM acore_world.creature_template ct
             JOIN acore_world.creature c
                 ON c.{entry_col} = ct.entry
@@ -1071,8 +1787,8 @@ def get_dungeon_bosses(
                      OR ct.CreatureImmunitiesId > 0)
             GROUP BY ct.entry, ct.name, ct.`rank`
             HAVING ct.`rank` = 3 OR COUNT(*) = 1
-            ORDER BY ct.name
-        """, (map_id,))
+            ORDER BY name
+        """, (map_id, map_id))
         bosses = [
             row['name']
             for row in cursor.fetchall()
@@ -1120,6 +1836,121 @@ def format_price(copper: int) -> str:
     return " ".join(parts) if parts else ""
 
 
+_ONES = (
+    "zero one two three four five six seven eight nine ten eleven "
+    "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+    "nineteen"
+).split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+def number_to_words(n: int) -> str:
+    """Spell out a non-negative integer (up to 999,999) in English."""
+    n = int(n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _TENS[tens] + (f"-{_ONES[ones]}" if ones else "")
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        head = f"{_ONES[hundreds]} hundred"
+        return head + (f" and {number_to_words(rest)}" if rest else "")
+    if n < 1_000_000:
+        thousands, rest = divmod(n, 1000)
+        head = f"{number_to_words(thousands)} thousand"
+        if not rest:
+            return head
+        return head + (" and " if rest < 100 else " ") + number_to_words(rest)
+    return str(n)
+
+
+def _coins_in_words(gold: int, silver: int, copper: int) -> str:
+    parts = [f"{number_to_words(amount)} {metal}"
+             for amount, metal in ((gold, "gold"), (silver, "silver"),
+                                   (copper, "copper")) if amount]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def format_price_words(copper: int) -> str:
+    """Copper amount as spoken coins, e.g. 'one gold and twenty silver coins'."""
+    if not copper or copper <= 0:
+        return ""
+    words = _coins_in_words(
+        copper // 10000, (copper % 10000) // 100, copper % 100)
+    return f"{words} coins"
+
+
+_WOW_LINK_RE = re.compile(r'\|c[0-9A-Fa-f]{8}\|H[^|]*\|h\[[^\]]*\]\|h\|r')
+_COIN_RE = re.compile(
+    r'(?<![\w.])(?<!\d,)(\d+)\s?(g|gold|s|silver|c|copper)(?![A-Za-z])'
+    r'(?:\s*(\d+)\s?(s|silver|c|copper)(?![A-Za-z]))?'
+    r'(?:\s*(\d+)\s?(c|copper)(?![A-Za-z]))?',
+    re.IGNORECASE,
+)
+# Digits joined by a comma ("12,5", "1,500.50") are left as written.
+_DIGITS_RE = re.compile(r'(?<![\w.])(?<!\d,)\d{1,6}(?![\w.]|,\d)')
+# "1,500" must reach _COIN_RE and _DIGITS_RE as one number, or each
+# would rewrite its digit groups separately ("one,five hundred"). It may
+# be followed by a coin suffix ("1,500g20s") but not by more digits or a
+# decimal part.
+_GROUPED_RE = re.compile(
+    r'(?<![\w.,])\d{1,3}(?:,\d{3})+(?![\d,.]?\d)'
+    r'(?=(?:g|gold|s|silver|c|copper)(?![A-Za-z])|\W|$)',
+    re.IGNORECASE,
+)
+
+
+def _coin_match_words(match) -> str:
+    amounts = {'g': 0, 's': 0, 'c': 0}
+    for amount, unit in ((match.group(1), match.group(2)),
+                         (match.group(3), match.group(4)),
+                         (match.group(5), match.group(6))):
+        if amount and unit:
+            amounts[unit[0].lower()] = int(amount)
+    return _coins_in_words(amounts['g'], amounts['s'], amounts['c'])
+
+
+def spell_out_numbers(text: str) -> str:
+    """Write prices ('1g20s', '50 silver') and other numbers in words,
+    leaving WoW link markup untouched."""
+    if not text:
+        return text
+    pieces = []
+    last = 0
+    for link in _WOW_LINK_RE.finditer(text):
+        pieces.append(_spell_plain(text[last:link.start()]))
+        pieces.append(link.group(0))
+        last = link.end()
+    pieces.append(_spell_plain(text[last:]))
+    return "".join(pieces)
+
+
+def spell_out_trade_numbers(text: str) -> str:
+    """spell_out_numbers() for English chat only. It writes English
+    words, so other languages keep the model's own wording (the trade
+    prompt already asks for numbers in words)."""
+    if _language:
+        return text
+    return spell_out_numbers(text)
+
+
+def _ungroup(match) -> str:
+    # number_to_words() stops at 999,999; larger amounts keep their commas.
+    plain = match.group(0).replace(',', '')
+    return plain if int(plain) < 1_000_000 else match.group(0)
+
+
+def _spell_plain(text: str) -> str:
+    text = _GROUPED_RE.sub(_ungroup, text)
+    text = _COIN_RE.sub(_coin_match_words, text)
+    return _DIGITS_RE.sub(lambda m: number_to_words(int(m.group(0))), text)
+
+
 def format_quest_link(
     quest_id: int, quest_level: int, quest_name: str
 ) -> str:
@@ -1162,7 +1993,7 @@ def replace_placeholders(
     result = message
 
     if quest_data:
-        quest_pattern = r'\{quest:[^}]+\}'
+        quest_pattern = r'\{?\{quest:[^}]+\}\}?'
         if re.search(quest_pattern, result):
             link = format_quest_link(
                 quest_data['quest_id'],
@@ -1172,7 +2003,7 @@ def replace_placeholders(
             result = re.sub(quest_pattern, link, result)
 
     if item_data:
-        item_pattern = r'\{item:[^}]+\}'
+        item_pattern = r'\{?\{item:[^}]+\}\}?'
         link = format_item_link(
             item_data['item_id'],
             item_data.get('item_quality', 2),
@@ -1188,7 +2019,7 @@ def replace_placeholders(
                 )
 
     if spell_data:
-        spell_pattern = r'\{spell:[^}]+\}'
+        spell_pattern = r'\{?\{spell:[^}]+\}\}?'
         if re.search(spell_pattern, result):
             link = format_spell_link(
                 spell_data['spell_id'],
@@ -1204,7 +2035,7 @@ _action_chance = 0.10
 _action_disabled = True
 
 # Module-level emote chance (set from config at startup)
-_emote_chance = 0.50
+_emote_chance = 0.20
 
 # Module-level response language (set from config at startup).
 # Empty string = English default (no extra instruction emitted).
@@ -1216,6 +2047,7 @@ _LANGUAGE_LABELS = {
     "ES": "Spanish",
     "FR": "French",
     "GB": "English",
+    "KO": "Korean",
     "PT": "Portuguese",
     "RU": "Russian",
     "US": "English",
@@ -1295,21 +2127,592 @@ def get_language_rule() -> str:
     if not _language:
         return ""
     return (
-        f"\nLanguage: Write EVERY field in {_language} — "
-        "the \"message\" field AND the \"action\" "
-        "narrator field must both be fully in "
-        f"{_language}. Do not mix languages. "
-        "Exception: keep WoW proper nouns (zone, "
-        "subzone, creature, NPC, item, spell, quest, "
-        "and character names) in English exactly as "
-        "written — never translate them. Any prior "
-        "chat, memories, quoted lines, or examples in "
-        "this prompt may be in English or another "
-        "language — treat them only as content to react "
-        "to, never as a guide for which language to "
-        f"use. Your entire output must be in {_language} "
-        "no matter what language that context is in."
+        f"\nLanguage: Write EVERY text field of your "
+        f"JSON response fully in {_language} — this "
+        "includes every prose field the schema below "
+        "asks for, whatever it is named (for example "
+        "\"message\", the \"action\" narrator field, "
+        "or a \"memory\" journal entry). No prose "
+        "field may be left in another language. "
+        "Do not mix languages. "
+        "Exception — proper nouns: names of zones, "
+        "subzones, creatures, NPCs, items, spells, "
+        "quests and characters are supplied to you "
+        "already in the form the game will use. "
+        f"Depending on what data exists, that form "
+        f"may be {_language} or it may be English; "
+        "both are correct. Use the form you were "
+        "given. Do not translate it, do not "
+        "transliterate it, and never invent a "
+        "spelling of your own — if a name was given "
+        "to you in English, it stays English rather "
+        "than being guessed at. Class and "
+        "race names (Warrior, Priest, Mage, Blood Elf, "
+        "Night Elf, etc.) are NOT exceptions — always "
+        "translate them into their standard WoW "
+        f"localization terms for {_language}. Never "
+        "glue an English word to a "
+        f"{_language} grammatical ending (e.g. never "
+        "write \"priesta\" — write the real translated "
+        "word, fully inflected in that language). Any "
+        "prior chat, memories, quoted lines, or "
+        "examples in this prompt may be in English or "
+        "another language — treat them only as content "
+        "to react to, never as a guide for which "
+        "language to use. Your entire output must be "
+        f"in {_language} no matter what language that "
+        "context is in. "
+        "Grammatical gender: where "
+        f"{_language} inflects verbs, adjectives, "
+        "participles or pronouns for gender, every "
+        "such form referring to yourself must match "
+        "your own gender exactly as stated in your "
+        "identity line above, and every form "
+        "referring to another character must match "
+        "that character's stated gender. Past-tense "
+        "verbs about yourself are the most common "
+        "mistake — check each one. Never fall back "
+        "to masculine forms as a default. "
+        "Declension: when a proper noun appears as "
+        "plain text in your sentence, inflect it to "
+        "the grammatical case the sentence requires "
+        "(genitive, accusative, dative, etc.) rather "
+        "than leaving it in the nominative — keep the "
+        "spelling you were given for the stem. The one "
+        "thing you must never inflect is a token in "
+        "curly braces such as {item}: those are "
+        "replaced with clickable game links after you "
+        "write, so they have to survive exactly as "
+        "written. Word the sentence so the token reads "
+        "naturally without being changed. "
+        "Naturalness: write natural, idiomatic "
+        f"{_language} — avoid word-for-word metaphors "
+        "and stilted constructions no native speaker "
+        "would actually say; if a phrase sounds odd "
+        "when read back, rephrase it plainly. Prefer "
+        "direct, concrete speech over abstract or "
+        "poetic imagery unless it genuinely fits the "
+        "moment."
     )
+
+
+# Maps the resolved language label (see _LANGUAGE_LABELS)
+# to the WoW client locale code used by Blizzard's own
+# localized data in acore_world.*_locale tables (e.g.
+# creature_template_locale). Only languages we actually
+# have locale data for are listed here; any language
+# label not present (including "" / English) simply has
+# no lookup performed and callers fall back to the
+# English name they already have in hand.
+_LANGUAGE_LOCALE_CODES = {
+    "Russian": "ruRU",
+    "French": "frFR",
+    "German": "deDE",
+    "Spanish": "esES",
+    "Korean": "koKR",
+}
+
+
+def get_language_locale_code() -> Optional[str]:
+    """Return the WoW client locale code (e.g. 'ruRU')
+    for the currently configured LLMChatter.Language, or
+    None if there's no locale data mapped for it (English
+    default, or a language we haven't added data for yet).
+    """
+    return _LANGUAGE_LOCALE_CODES.get(_language)
+
+
+# Cache for Blizzard-localized creature/NPC names, keyed
+# by (entry, locale). A given entry+locale pair's name
+# never changes at runtime, so cache indefinitely — mirrors
+# the _dungeon_boss_cache pattern above.
+_creature_name_locale_cache: Dict[
+    Tuple[int, str], Optional[str]
+] = {}
+
+
+def get_localized_creature_name(
+    db, entry: Optional[int], locale: Optional[str]
+) -> Optional[str]:
+    """Look up the Blizzard-localized creature name from
+    acore_world.creature_template_locale.
+
+    Returns None (caller should fall back to the English
+    name already in hand) when entry/locale is missing,
+    the entry has no localization row for that locale
+    (~16% of creature_template lacks ruRU coverage), or
+    the query fails for any reason.
+    """
+    if not entry or not locale:
+        return None
+    try:
+        entry = int(entry)
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (entry, locale)
+    if cache_key in _creature_name_locale_cache:
+        return _creature_name_locale_cache[cache_key]
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT Name FROM "
+            "acore_world.creature_template_locale "
+            "WHERE entry = %s AND locale = %s",
+            (entry, locale),
+        )
+        row = cursor.fetchone()
+        name = (
+            row['Name']
+            if row and row.get('Name') else None
+        )
+        _creature_name_locale_cache[cache_key] = name
+        return name
+    except Exception:
+        logger.error(
+            "get_localized_creature_name failed for "
+            "entry %s locale %s",
+            entry, locale, exc_info=True,
+        )
+        # Don't cache exceptions -- a transient DB
+        # hiccup shouldn't permanently poison the
+        # cache the way a genuine "not found" should.
+        return None
+
+
+def get_english_creature_name(
+    db, entry: Optional[int]
+) -> Optional[str]:
+    """Look up the English creature name from
+    acore_world.creature_template.
+
+    creature_template_locale holds only translations, so an
+    English-configured bridge cannot reach English text
+    through it -- the base table is the English row.
+    Returns None when the entry is missing or the query
+    fails, leaving the caller with the name it already has.
+    """
+    if not entry:
+        return None
+    try:
+        entry = int(entry)
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (entry, 'enUS')
+    if cache_key in _creature_name_locale_cache:
+        return _creature_name_locale_cache[cache_key]
+
+    name = None
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT name FROM "
+            "acore_world.creature_template "
+            "WHERE entry = %s",
+            (entry,),
+        )
+        row = cursor.fetchone()
+        name = (
+            row['name']
+            if row and row.get('name') else None
+        )
+        cursor.close()
+    except Exception as exc:
+        logger.debug(
+            "English creature name lookup failed for "
+            "entry %s: %s", entry, exc,
+        )
+        return None
+
+    _creature_name_locale_cache[cache_key] = name
+    return name
+
+
+def localize_creature_name(
+    db, name: str, entry: Optional[int] = None
+) -> str:
+    """Return the creature/NPC name in the language named
+    by LLMChatter.Language.
+
+    That setting decides in both directions. For a mapped
+    non-English language the name comes from
+    creature_template_locale. For English it comes from
+    creature_template, because the caller's `name` was
+    resolved by C++ against sWorld->GetDefaultDbcLocale()
+    and may already be in some other language on a server
+    whose client locale is not English.
+
+    Falls back to `name` unchanged when no entry id was
+    supplied or the lookup finds nothing.
+    """
+    if not entry:
+        return name
+    locale = get_language_locale_code()
+    if not locale:
+        return get_english_creature_name(db, entry) or name
+    localized = get_localized_creature_name(
+        db, entry, locale
+    )
+    return localized or name
+
+
+# Cache for Blizzard-localized item names, keyed by
+# (entry, locale). Mirrors _creature_name_locale_cache.
+_item_name_locale_cache: Dict[
+    Tuple[int, str], Optional[str]
+] = {}
+
+
+def get_localized_item_name(
+    db, entry: Optional[int], locale: Optional[str]
+) -> Optional[str]:
+    """Look up the Blizzard-localized item name from
+    acore_world.item_template_locale.
+
+    Returns None (caller should fall back to the English
+    name already in hand) when entry/locale is missing,
+    the entry has no localization row for that locale, or
+    the query fails for any reason.
+
+    Note: item_template_locale's PK column is named `ID`
+    (not `entry` like creature_template_locale).
+    """
+    if not entry or not locale:
+        return None
+    try:
+        entry = int(entry)
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (entry, locale)
+    if cache_key in _item_name_locale_cache:
+        return _item_name_locale_cache[cache_key]
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT Name FROM "
+            "acore_world.item_template_locale "
+            "WHERE ID = %s AND locale = %s",
+            (entry, locale),
+        )
+        row = cursor.fetchone()
+        name = (
+            row['Name']
+            if row and row.get('Name') else None
+        )
+        _item_name_locale_cache[cache_key] = name
+        return name
+    except Exception:
+        logger.error(
+            "get_localized_item_name failed for "
+            "entry %s locale %s",
+            entry, locale, exc_info=True,
+        )
+        # Don't cache exceptions -- a transient DB
+        # hiccup shouldn't permanently poison the
+        # cache the way a genuine "not found" should.
+        return None
+
+
+def localize_item_name(
+    db, name: str, entry: Optional[int] = None
+) -> str:
+    """Return the Blizzard-localized item name for the
+    configured LLMChatter.Language when available,
+    otherwise return `name` unchanged.
+
+    Safe no-op (returns `name` as-is) when: the configured
+    language has no locale mapping, no item entry ID was
+    supplied, or the entry has no matching row in
+    item_template_locale.
+    """
+    locale = get_language_locale_code()
+    if not locale or not entry:
+        return name
+    localized = get_localized_item_name(
+        db, entry, locale
+    )
+    return localized or name
+
+
+# Cache for Blizzard-localized quest titles, keyed by
+# (quest_id, locale). Mirrors _creature_name_locale_cache.
+_quest_name_locale_cache: Dict[
+    Tuple[int, str], Optional[str]
+] = {}
+
+
+def get_localized_quest_name(
+    db, quest_id: Optional[int], locale: Optional[str]
+) -> Optional[str]:
+    """Look up the Blizzard-localized quest title from
+    acore_world.quest_template_locale.
+
+    Returns None (caller should fall back to the English
+    name already in hand) when quest_id/locale is missing,
+    the quest has no localization row for that locale, or
+    the query fails for any reason.
+
+    Note: quest_template_locale's PK column is named `ID`
+    (not `entry`/`quest_id`).
+    """
+    if not quest_id or not locale:
+        return None
+    try:
+        quest_id = int(quest_id)
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (quest_id, locale)
+    if cache_key in _quest_name_locale_cache:
+        return _quest_name_locale_cache[cache_key]
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT Title FROM "
+            "acore_world.quest_template_locale "
+            "WHERE ID = %s AND locale = %s",
+            (quest_id, locale),
+        )
+        row = cursor.fetchone()
+        title = (
+            row['Title']
+            if row and row.get('Title') else None
+        )
+        _quest_name_locale_cache[cache_key] = title
+        return title
+    except Exception:
+        logger.error(
+            "get_localized_quest_name failed for "
+            "quest_id %s locale %s",
+            quest_id, locale, exc_info=True,
+        )
+        # Don't cache exceptions -- a transient DB
+        # hiccup shouldn't permanently poison the
+        # cache the way a genuine "not found" should.
+        return None
+
+
+def localize_quest_name(
+    db, name: str, quest_id: Optional[int] = None
+) -> str:
+    """Return the Blizzard-localized quest title for the
+    configured LLMChatter.Language when available,
+    otherwise return `name` unchanged.
+
+    Safe no-op (returns `name` as-is) when: the configured
+    language has no locale mapping, no quest ID was
+    supplied, or the quest has no matching row in
+    quest_template_locale.
+    """
+    locale = get_language_locale_code()
+    if not locale or not quest_id:
+        return name
+    localized = get_localized_quest_name(
+        db, quest_id, locale
+    )
+    return localized or name
+
+
+# Quest texts carry client placeholders: $N name, $R race,
+# $C class, $B line break, $G male:female; gender forms.
+_QUEST_GENDER_TOKEN = re.compile(r'\$[Gg]\s*([^:;]*):([^;]*);')
+_QUEST_SIMPLE_TOKEN = re.compile(r'\$([NnRrCcBb])')
+
+
+def clean_quest_text(
+    text, player_name='', player_race='', player_class='',
+    player_gender='', limit=0,
+) -> str:
+    """Quest text with client placeholders filled in for the
+    player, whitespace collapsed, and cut to `limit`
+    characters at a sentence boundary (0 = no cut)."""
+    text = str(text or '')
+    if not text.strip():
+        return ''
+    female = str(player_gender or '').lower().startswith('f')
+    text = _QUEST_GENDER_TOKEN.sub(
+        lambda m: (m.group(2) if female else m.group(1)).strip(), text)
+    values = {
+        'n': player_name or 'friend',
+        'r': player_race or 'traveller',
+        'c': player_class or 'adventurer',
+        'b': ' ',
+    }
+    text = _QUEST_SIMPLE_TOKEN.sub(
+        lambda m: values[m.group(1).lower()], text)
+    text = ' '.join(text.split())
+    if limit and len(text) > limit:
+        head = text[:limit]
+        cut = max(head.rfind('. '), head.rfind('! '), head.rfind('? '))
+        text = head[:cut + 1] if cut > limit // 3 else (
+            head.rsplit(' ', 1)[0] + '...')
+    return text
+
+
+def get_quest_memory_texts(
+    db, quest_id, player_name='', player_race='',
+    player_class='', player_gender='',
+) -> Dict[str, str]:
+    """The quest-giver's words for a quest, for memories:
+    'brief' (the quest-log summary, LogDescription), 'full'
+    (QuestDescription) and 'completion' (what the giver says
+    on turn-in, quest_offer_reward.RewardText). Uses the
+    module locale when the quest is localized; placeholders
+    are filled in. Missing texts are ''; never raises."""
+    texts = {'brief': '', 'full': '', 'completion': ''}
+    try:
+        quest_id = int(quest_id or 0)
+    except (TypeError, ValueError):
+        return texts
+    if not quest_id or db is None:
+        return texts
+    locale = get_language_locale_code()
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT t.LogDescription AS brief,"
+            " t.QuestDescription AS full,"
+            " r.RewardText AS completion"
+            " FROM acore_world.quest_template t"
+            " LEFT JOIN acore_world.quest_offer_reward r"
+            "   ON r.ID = t.ID"
+            " WHERE t.ID = %s",
+            (quest_id,),
+        )
+        row = cursor.fetchone() or {}
+        if locale:
+            cursor.execute(
+                "SELECT l.Objectives AS brief, l.Details AS full,"
+                " rl.RewardText AS completion"
+                " FROM acore_world.quest_template_locale l"
+                " LEFT JOIN acore_world.quest_offer_reward_locale rl"
+                "   ON rl.ID = l.ID AND rl.locale = l.locale"
+                " WHERE l.ID = %s AND l.locale = %s",
+                (quest_id, locale),
+            )
+            localized = cursor.fetchone() or {}
+            row = {k: localized.get(k) or row.get(k)
+                   for k in texts}
+        cursor.close()
+    except Exception:
+        logger.error(
+            "get_quest_memory_texts failed for quest %s",
+            quest_id, exc_info=True,
+        )
+        return texts
+    limits = {'brief': 300, 'full': 700, 'completion': 300}
+    for key in texts:
+        texts[key] = clean_quest_text(
+            row.get(key), player_name, player_race,
+            player_class, player_gender, limits[key],
+        )
+    return texts
+
+
+def quest_memory_background(texts) -> List[str]:
+    """Background lines for a quest memory, labelled as the
+    quest-giver's words. The full description is sent only
+    when there is no quest-log summary: they mostly say the
+    same thing, and a one- or two-sentence memory needs
+    little background."""
+    texts = dict(texts or {})
+    if texts.get('brief'):
+        texts.pop('full', None)
+    labels = (
+        ('brief', "How the quest-giver summed up the task"),
+        ('full', "How the quest-giver described the task"),
+        ('completion', "What the quest-giver said when it was done"),
+    )
+    return [
+        f"{label}: {texts[key]}"
+        for key, label in labels if texts.get(key)
+    ]
+
+
+# Cache for Blizzard-localized creature/NPC titles
+# (SubName), keyed by (entry, locale). Mirrors
+# _creature_name_locale_cache -- a parallel lookup since
+# creature_template_locale carries Name and Title as
+# separate columns.
+_creature_title_locale_cache: Dict[
+    Tuple[int, str], Optional[str]
+] = {}
+
+
+def get_localized_creature_title(
+    db, entry: Optional[int], locale: Optional[str]
+) -> Optional[str]:
+    """Look up the Blizzard-localized creature title
+    (SubName) from acore_world.creature_template_locale.
+
+    Returns None (caller should fall back to the English
+    title already in hand) when entry/locale is missing,
+    the entry has no localization row for that locale, the
+    row's Title is empty (many creatures have no SubName),
+    or the query fails for any reason.
+    """
+    if not entry or not locale:
+        return None
+    try:
+        entry = int(entry)
+    except (TypeError, ValueError):
+        return None
+
+    cache_key = (entry, locale)
+    if cache_key in _creature_title_locale_cache:
+        return _creature_title_locale_cache[cache_key]
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT Title FROM "
+            "acore_world.creature_template_locale "
+            "WHERE entry = %s AND locale = %s",
+            (entry, locale),
+        )
+        row = cursor.fetchone()
+        title = (
+            row['Title']
+            if row and row.get('Title') else None
+        )
+        _creature_title_locale_cache[cache_key] = title
+        return title
+    except Exception:
+        logger.error(
+            "get_localized_creature_title failed for "
+            "entry %s locale %s",
+            entry, locale, exc_info=True,
+        )
+        # Don't cache exceptions -- a transient DB
+        # hiccup shouldn't permanently poison the
+        # cache the way a genuine "not found" should.
+        return None
+
+
+def localize_creature_title(
+    db, title: str, entry: Optional[int] = None
+) -> str:
+    """Return the Blizzard-localized creature/NPC title
+    (SubName) for the configured LLMChatter.Language when
+    available, otherwise return `title` unchanged.
+
+    Safe no-op (returns `title` as-is) when: the configured
+    language has no locale mapping, no creature entry ID
+    was supplied, or the entry has no matching Title row in
+    creature_template_locale.
+    """
+    locale = get_language_locale_code()
+    if not locale or not entry:
+        return title
+    localized = get_localized_creature_title(
+        db, entry, locale
+    )
+    return localized or title
 
 
 def set_emote_chance(chance_pct: int):
@@ -1385,10 +2788,190 @@ def strip_conversation_actions(
             pass
 
 
+# Brief casual length tiers: name -> (min words, max words, max chars).
+# One fixed band made every brief reply land at the same size; picking
+# a tier per reply keeps brief turns brief while varying them the way
+# people do ("Evening!" vs. a short line vs. one relaxed sentence).
+BRIEF_CASUAL_TIERS: Dict[str, Tuple[int, int, int]] = {
+    'tiny': (1, 4, 30),
+    'short': (2, 8, 50),
+    'relaxed': (5, 14, 85),
+}
+DEFAULT_BRIEF_CASUAL_TIER = 'short'
+_BRIEF_CASUAL_TIER_ORDER = ('tiny', 'short', 'relaxed')
+
+
+_FIRST_SENTENCE = re.compile(r'^(.+?[.!?])(?=\s|$)', re.S)
+
+
+def _brief_casual_limits(
+    tier: Optional[str],
+) -> Tuple[int, int, int]:
+    return BRIEF_CASUAL_TIERS.get(
+        tier or DEFAULT_BRIEF_CASUAL_TIER,
+        BRIEF_CASUAL_TIERS[DEFAULT_BRIEF_CASUAL_TIER],
+    )
+
+
+def pick_brief_casual_tier(
+    config: Dict,
+    avoid: Optional[str] = None,
+) -> str:
+    """Pick a brief casual length tier from the configured weights.
+
+    avoid: tier used by the previous speaker in the same exchange;
+    it is skipped when another tier has weight, so two replies to
+    one player message do not come out the same size.
+    """
+    raw = str(config.get(
+        'LLMChatter.PlayerChat.BriefCasualLengthWeights',
+        '35,45,20',
+    ))
+    weights = []
+    for part in raw.split(','):
+        try:
+            weights.append(max(0, int(part.strip())))
+        except ValueError:
+            weights.append(0)
+    weights = (weights + [0, 0, 0])[:3]
+    pairs = [
+        (name, w)
+        for name, w in zip(_BRIEF_CASUAL_TIER_ORDER, weights)
+        if w > 0
+    ]
+    if avoid and any(name != avoid for name, _ in pairs):
+        pairs = [(name, w) for name, w in pairs if name != avoid]
+    if not pairs:
+        return DEFAULT_BRIEF_CASUAL_TIER
+    names, tier_weights = zip(*pairs)
+    return random.choices(names, weights=tier_weights, k=1)[0]
+
+
+def brief_casual_length_line(tier: Optional[str] = None) -> str:
+    """Length instruction for a brief casual reply."""
+    lo, hi, chars = _brief_casual_limits(tier)
+    return (
+        f"Length: {lo}-{hi} words, no more than {chars} characters."
+    )
+
+
+def build_conversational_scale_guidance(
+    subject: str = "message",
+    force_brief: bool = False,
+    brief_tier: Optional[str] = None,
+) -> str:
+    """Match response scope to conversational purpose, not input size."""
+    guidance = (
+        f"Judge what the player's {subject} invites in this conversation, "
+        "not how many words it contains. Within this channel's length "
+        "guidance and hard limits, a short open question may deserve a "
+        "concrete answer, useful detail, or explanation. Use recent context "
+        "to understand terse follow-ups. An acknowledgment, routine social "
+        "exchange, or closure usually needs only a few natural words; "
+        "do not turn it into a speech or introduce a new topic. When the "
+        "player invites information or discussion, contribute something "
+        "relevant rather than a stock dismissal. Use the supplied context; "
+        "do not invent factual updates to fill space. Never pad a reply."
+    )
+    if force_brief:
+        lo, hi, chars = _brief_casual_limits(brief_tier)
+        guidance += (
+            " This interaction has been classified as brief and casual. "
+            "This brief contract overrides generic mood, creativity, and "
+            "length suggestions. "
+            f"Use {lo}-{hi} words and no more than {chars} characters. "
+        )
+        if brief_tier == 'relaxed':
+            guidance += (
+                "Answer the way a person would in passing: plain words, "
+                "and if it feels natural, one small personal touch or a "
+                "light question back. No metaphor, blessing, proverb, "
+                "explanation, or ceremonial flourish."
+            )
+        else:
+            guidance += (
+                "Use plain conversational wording rather than a "
+                "metaphor, blessing, proverb, explanation, question, "
+                "or ceremonial flourish."
+            )
+        guidance += " Keep character voice through light word choice only."
+    return guidance
+
+
+def brief_casual_response_fits(
+    message: str,
+    emote: Optional[str] = None,
+    tier: Optional[str] = None,
+) -> bool:
+    """Validate the hard output contract for a brief casual turn.
+
+    Only the spoken words count. A leading *action* is delivered as
+    a separate text emote, so it never makes a short reply too long.
+    """
+    text, _ = split_action_prefix(str(message or '').strip())
+    text = (text or '').strip()
+    if not text:
+        return bool(emote)
+    _, hi, chars = _brief_casual_limits(tier)
+    return (
+        len(text) <= chars
+        and len(text.split()) <= hi
+    )
+
+
+def bound_brief_casual_response(
+    message: str,
+    emote: Optional[str] = None,
+    fallback_message: str = '',
+    fallback_emote: Optional[str] = None,
+    tier: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """Keep a usable brief response instead of discarding it.
+
+    A reply that runs over its length band is never cut mid-sentence:
+    its first complete sentence is kept when that fits the band,
+    otherwise the reply is delivered whole (only the chat limit applies).
+    """
+    if brief_casual_response_fits(message, emote, tier):
+        return message, emote
+    source = (
+        str(message or '').strip()
+        or str(fallback_message or '').strip()
+    )
+    emote = emote or fallback_emote
+    match = _FIRST_SENTENCE.match(source)
+    if match:
+        first = match.group(1).strip()
+        if brief_casual_response_fits(first, None, tier):
+            return first, emote
+    return shorten_chat_message(source), emote
+
+
+def build_brief_casual_repair_prompt(
+    prompt: PromptParts,
+    tier: Optional[str] = None,
+) -> PromptParts:
+    """Request one format-preserving rewrite of an oversized reply."""
+    lo, hi, chars = _brief_casual_limits(tier)
+    return prompt + (
+        "\n\nYour previous response violated the brief-casual hard "
+        f"limit. Rewrite it using {lo}-{hi} words and no more than "
+        f"{chars} characters. Keep it plain and conversational. Return "
+        "the same JSON shape requested above."
+    )
+
+
 def append_json_instruction(
     prompt: str, allow_action: bool = True,
     skip_emote: bool = False,
     skip_action_rng: bool = False,
+    message_only: bool = False,
+    allow_emote_only: bool = False,
+    allow_narrator_message: bool = False,
+    extra_field: str = '',
+    extra_rule: str = '',
+    include_thread: bool = False,
+    thread_speaker_names=(),
 ) -> str:
     """Append structured JSON response instruction
     to a prompt.
@@ -1401,7 +2984,55 @@ def append_json_instruction(
     skip_action_rng=True bypasses the pre-call RNG
     so the caller can apply post-parse stripping
     instead (used by General conversation paths).
+    message_only=True emits a strict {"message": "..."} schema with no
+    emote/action fields at all (e.g. guild chat, which is spoken text only).
+    extra_field / extra_rule add one optional trailing field to the
+    full schema (e.g. the party conversation-thread report).
     """
+    if message_only:
+        lang_rule = get_language_rule()
+        if lang_rule:
+            prompt = prompt + lang_rule
+        message_example = (
+            '  "message": "brief dialogue or narrator action"\n'
+            if allow_narrator_message
+            else '  "message": "your spoken words here"\n'
+        )
+        narrator_rule = (
+            " For this response, the message may instead be one short "
+            "third-person narrator action featuring the speaker."
+            if allow_narrator_message
+            else ""
+        )
+        if extra_field:
+            message_example = (
+                message_example.rstrip('\n') + ',\n'
+                + f'  {extra_field}\n'
+            )
+        block = (
+            "\n\nRESPONSE FORMAT: You MUST respond with "
+            "ONLY valid JSON. No other text.\n"
+            "{\n"
+            f"{message_example}"
+            "}\n"
+            f"{extra_rule + chr(10) if extra_rule else ''}"
+            "Rules: double quotes only, no trailing "
+            "commas, no code fences, no markdown.\n"
+            f"{narrator_rule}"
+            "CRITICAL: Follow the Length instruction "
+            "in the prompt exactly — never exceed the "
+            "stated character limit."
+            f"{lang_rule}"
+        )
+        # Thread callers currently use extra_rule only for legacy report format.
+        return _annotated_prompt(
+            prompt, block, statement_contract,
+            narrator_rule
+            + ' Follow the Length instruction and character limit exactly.'
+            + lang_rule + (extra_rule if not include_thread else ''),
+            message_only=True, thread=include_thread,
+            thread_speaker_names=thread_speaker_names,
+        )
     # Apply ActionChance RNG: allow_action=True means
     # "eligible for action" — the RNG decides.
     # allow_action=False means "never include action"
@@ -1431,7 +3062,11 @@ def append_json_instruction(
 
     # Skip emote list if explicitly requested OR
     # if EmoteChance RNG says no
-    if skip_emote or random.random() >= _emote_chance:
+    emote_available = (
+        not skip_emote
+        and random.random() < _emote_chance
+    )
+    if not emote_available:
         emote_line = '  "emote": null,\n'
     else:
         emote_line = (
@@ -1447,14 +3082,28 @@ def append_json_instruction(
     # content that sits inside the user prompt.
     if lang_rule:
         prompt = prompt + lang_rule
+    message_line = '  "message": "your spoken words here",\n'
+    emote_only_rule = ""
+    if allow_emote_only and emote_available:
+        message_line = (
+            '  "message": "spoken words, or empty only when emote is '
+            'non-null",\n'
+        )
+        emote_only_rule = (
+            "A brief local reaction may use an empty message with one "
+            "non-null emote. Never leave both message and emote empty.\n"
+        )
     block = (
         "\n\nRESPONSE FORMAT: You MUST respond with "
         "ONLY valid JSON. No other text.\n"
         "{\n"
-        '  "message": "your spoken words here",\n'
+        f"{message_line}"
         f"{emote_line}"
         f"  {action_desc}"
+        f"{f'  {extra_field}' + chr(10) if extra_field else ''}"
         "}\n"
+        f"{emote_only_rule}"
+        f"{extra_rule + chr(10) if extra_rule else ''}"
         "Rules: double quotes only, no trailing "
         "commas, no code fences, no markdown.\n"
         "CRITICAL: Follow the Length instruction "
@@ -1462,7 +3111,15 @@ def append_json_instruction(
         "stated character limit."
         f"{lang_rule}"
     )
-    return PromptParts(prompt, block)
+    return _annotated_prompt(
+        prompt, block, statement_contract,
+        action_desc + emote_only_rule
+        + 'Follow the Length instruction and character limit exactly.'
+        + lang_rule + (extra_rule if not include_thread else ''),
+        emote=emote_available, action=allow_action,
+        emote_only=allow_emote_only, thread=include_thread,
+        thread_speaker_names=thread_speaker_names,
+    )
 
 
 def append_conversation_json_instruction(
@@ -1470,12 +3127,83 @@ def append_conversation_json_instruction(
     bot_names: List[str],
     msg_count: int,
     allow_action: bool = True,
+    message_only: bool = False,
+    addressee_names: Optional[List[str]] = None,
+    allow_emote_only: bool = False,
+    allow_narrator_messages: bool = False,
+    trailing_object: str = '',
+    extra_rule: str = '',
+    include_thread: bool = False,
+    thread_speaker_names=(),
 ) -> str:
     """Append conversation JSON array instruction.
 
-    Conversation prompts return an array where each
-    item has speaker/message/emote/action fields.
+    By default each item has speaker/message/emote/action
+    fields. Guild chat uses message_only to request spoken
+    text without action or emote fields. trailing_object /
+    extra_rule add one optional non-message object as the last
+    array element (e.g. the party conversation-thread report);
+    parse_conversation_response() skips it because it has no
+    speaker.
     """
+    lang_rule = get_language_rule()
+    if lang_rule:
+        prompt = prompt + lang_rule
+
+    if message_only:
+        message_example = (
+            "brief dialogue or narrator action"
+            if allow_narrator_messages
+            else "..."
+        )
+        example_msgs = ',\n  '.join(
+            [
+                (
+                    f'{{"speaker": "{name}", '
+                    f'"message": "{message_example}"}}'
+                )
+                for name in bot_names
+            ]
+        )
+        narrator_rule = (
+            "Each message may instead be one short third-person "
+            "narrator action featuring its speaker.\n"
+            if allow_narrator_messages
+            else ""
+        )
+        block = (
+            "\n\nJSON rules: Use double quotes, escape "
+            "quotes/newlines, no trailing commas, "
+            "no code fences.\n"
+            f"\nRespond with EXACTLY {msg_count} messages "
+            "in JSON"
+            f"{', then one final object' if trailing_object else ''}"
+            ":\n"
+            "[\n"
+            f"  {example_msgs}"
+            f"{f',{chr(10)}  {trailing_object}' if trailing_object else ''}"
+            "\n"
+            "]\n"
+            "Each message object must contain only \"speaker\" "
+            "and \"message\".\n"
+            f"{extra_rule + chr(10) if extra_rule else ''}"
+            f"{narrator_rule}"
+            "ONLY the JSON array, nothing else.\n"
+            "CRITICAL: Follow the Length instruction "
+            "in the prompt exactly â€” never exceed the "
+            "stated character limit."
+            f"{lang_rule}"
+        )
+        return _annotated_prompt(
+            prompt, block, conversation_contract,
+            narrator_rule
+            + 'Follow the Length instruction and character limit exactly.'
+            + lang_rule + (extra_rule if not include_thread else ''),
+            speaker_names=bot_names, message_count=msg_count,
+            message_only=True, thread=include_thread,
+            thread_speaker_names=thread_speaker_names,
+        )
+
     # When actions are enabled, every message MUST
     # include an action — strip_conversation_actions()
     # enforces ActionChance per-message post-parse.
@@ -1512,7 +3240,8 @@ def append_conversation_json_instruction(
         )
 
     # EmoteChance RNG for conversations
-    if random.random() < _emote_chance:
+    emote_available = random.random() < _emote_chance
+    if emote_available:
         emote_rule = (
             "Emotes: Each message may include an "
             f"optional \"emote\" field (one of: "
@@ -1531,54 +3260,126 @@ def append_conversation_json_instruction(
         '"action": "..."' if action_speakers
         else '"action": null'
     )
+    addressee_rule = ''
+    if addressee_names:
+        addressee_rule = (
+            "Addressee: EVERY message MUST include an exact "
+            '"addressee" chosen from: '
+            + ", ".join(addressee_names)
+            + ". It must not be the speaker.\n"
+        )
+
+    def addressee_example(speaker_name: str) -> str:
+        for candidate in addressee_names or []:
+            if candidate.casefold() != speaker_name.casefold():
+                return f', "addressee": "{candidate}"'
+        return ''
+
+    message_example = (
+        "spoken words, or empty with non-null emote"
+        if allow_emote_only and emote_available
+        else "..."
+    )
     example_msgs = ',\n  '.join(
         [
-            f'{{"speaker": "{name}", "message": "...", '
+            f'{{"speaker": "{name}", "message": "{message_example}", '
             f'{emote_ex}, '
-            f'{action_ex}}}'
+            f'{action_ex}{addressee_example(name)}}}'
             for name in bot_names
         ]
     )
+    emote_only_rule = (
+        "A brief local reaction may use an empty message with one "
+        "non-null emote. Never leave both message and emote empty.\n"
+        if allow_emote_only and emote_available
+        else ""
+    )
 
-    lang_rule = get_language_rule()
-    if lang_rule:
-        prompt = prompt + lang_rule
     block = (
         f"\n\n{emote_rule}"
         f"{action_text}\n"
+        f"{addressee_rule}"
+        f"{emote_only_rule}"
         "JSON rules: Use double quotes, escape "
         "quotes/newlines, no trailing commas, no code fences.\n"
-        f"\nRespond with EXACTLY {msg_count} messages in JSON:\n"
+        f"\nRespond with EXACTLY {msg_count} messages in JSON"
+        f"{', then one final object' if trailing_object else ''}:\n"
         "[\n"
-        f"  {example_msgs}\n"
+        f"  {example_msgs}"
+        f"{f',{chr(10)}  {trailing_object}' if trailing_object else ''}\n"
         "]\n"
+        f"{extra_rule + chr(10) if extra_rule else ''}"
         "ONLY the JSON array, nothing else.\n"
         "CRITICAL: Follow the Length instruction "
         "in the prompt exactly — never exceed the "
         "stated character limit."
         f"{lang_rule}"
     )
-    return PromptParts(prompt, block)
+    return _annotated_prompt(
+        prompt, block, conversation_contract,
+        action_text + '\n' + addressee_rule + emote_only_rule
+        + 'Follow the Length instruction and character limit exactly.'
+        + lang_rule + (extra_rule if not include_thread else ''),
+        speaker_names=bot_names, message_count=msg_count, emote=emote_available,
+        action=bool(action_speakers), addressee_names=addressee_names or (),
+        emote_only=allow_emote_only, thread=include_thread,
+        thread_speaker_names=thread_speaker_names,
+    )
 
 
-# =============================================================================
-# MESSAGE TYPE SELECTION
-# =============================================================================
-def select_message_type() -> str:
-    """Randomly select a message type based on distribution."""
-    roll = random.randint(1, 100)
-    if roll <= MSG_TYPE_PLAIN:
-        return "plain"
-    elif roll <= MSG_TYPE_QUEST:
-        return "quest"
-    elif roll <= MSG_TYPE_LOOT:
-        return "loot"
-    elif roll <= MSG_TYPE_QUEST_REWARD:
-        return "quest_reward"
-    elif roll <= MSG_TYPE_TRADE:
-        return "trade"
-    else:
-        return "spell"
+def select_conversation_message_count(
+    participant_count: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Select a bounded conversation length.
+
+    A conversation cannot contain fewer messages than
+    participants because every selected speaker must be
+    able to contribute at least once.
+    """
+    participants = max(1, int(participant_count))
+    lower = max(participants, int(minimum))
+    upper = max(lower, int(maximum))
+    return random.randint(lower, upper)
+
+
+def build_conversation_json_repair_prompt(
+    prompt: str,
+    bot_names: List[str],
+    message_only: bool = False,
+    *, structured_output: bool = False,
+) -> str:
+    """Build the shared one-attempt conversation repair prompt."""
+    if structured_output:
+        contract = getattr(prompt, 'response_contract', None)
+        if contract is None or contract.kind != 'conversation':
+            raise ValueError('Structured repair requires conversation metadata')
+        return prompt + (
+            '\n\nYour previous output was invalid. Return ONLY the JSON '
+            'object required by the supplied schema, with exactly '
+            f'{contract.message_count} messages. Preserve the original '
+            'scene, selected speakers and response rules.'
+        )
+    msg_count = extract_conversation_msg_count(prompt)
+    repair_prompt = (
+        "Your previous output was invalid JSON. "
+        "Output ONLY a JSON array of "
+        f"{msg_count if msg_count else 'the required number of'} "
+        "messages with the speakers: "
+        f"{', '.join(bot_names)}. Use double quotes, "
+        "escape quotes/newlines, no trailing commas, "
+        "no code fences."
+    )
+    if message_only:
+        repair_prompt += (
+            " Each object must contain only "
+            "\"speaker\" and \"message\"."
+        )
+    lang_rule = get_language_rule()
+    if lang_rule:
+        repair_prompt += lang_rule
+    return repair_prompt
 
 
 # =============================================================================
@@ -1611,7 +3412,19 @@ def calculate_dynamic_delay(
         # Player is waiting — fast reply.  The LLM
         # already took several seconds ("thinking"),
         # so keep the typing simulation short.
-        return random.uniform(4.0, 8.0)
+        try:
+            low = int(config.get(
+                'LLMChatter.ResponsiveDelayMin', 4000
+            )) / 1000.0
+            high = int(config.get(
+                'LLMChatter.ResponsiveDelayMax', 8000
+            )) / 1000.0
+        except (ValueError, TypeError):
+            low, high = 4.0, 8.0
+        low, high = max(0.0, low), max(0.0, high)
+        if high < low:
+            low, high = high, low
+        return random.uniform(low, high)
 
     # Ambient/idle — full simulation
     reading_time = (
@@ -1672,7 +3485,7 @@ def get_effective_speaker_cooldown(
     where 5 = reference full party size.
     """
     base = int(config.get(
-        'LLMChatter.BotSpeakerCooldownSeconds', 900
+        'LLMChatter.BotSpeakerCooldownSeconds', 120
     ))
     return max(60, min(base, base * num_bots // 5))
 
@@ -1693,6 +3506,7 @@ def run_single_reaction(
     max_tokens_override: int = None,
     context: str = '',
     message_transform: Any = None,
+    delay_resolver: Any = None,
     metadata: dict = None,
     label: str = 'single_reaction',
     num_bots: int = 1,
@@ -1711,8 +3525,9 @@ def run_single_reaction(
     3. strip_speaker_prefix
     4. cleanup_message
     5. length clamp
-    6. optional emote fallback
-    7. insert_chat_message
+    6. optional delivery-delay resolution
+    7. optional emote fallback
+    8. insert_chat_message
 
     Returns:
       {'ok': bool, 'message': str|None, 'emote': str|None,
@@ -1794,19 +3609,32 @@ def run_single_reaction(
                 'error_reason': 'transform_error',
             }
 
-    if len(message) > 255:
-        message = message[:252] + "..."
+    message = shorten_chat_message(message)
+
+    resolved_delay = delay_seconds
+    if callable(delay_resolver):
+        try:
+            resolved_delay = float(
+                delay_resolver(message)
+            )
+        except Exception:
+            return {
+                'ok': False,
+                'message': message,
+                'emote': None,
+                'error_reason': 'delay_resolver_error',
+            }
 
     emote = parsed.get('emote')
 
     try:
-        insert_chat_message(
+        message_id = insert_chat_message(
             db,
             bot_guid,
             speaker_name,
             message,
             channel=channel,
-            delay_seconds=delay_seconds,
+            delay_seconds=resolved_delay,
             event_id=event_id,
             sequence=sequence,
             emote=emote,
@@ -1832,6 +3660,8 @@ def run_single_reaction(
         'ok': True,
         'message': message,
         'emote': emote,
+        'delay_seconds': resolved_delay,
+        'message_id': message_id,
         'error_reason': None,
     }
 
@@ -1846,16 +3676,22 @@ def find_addressed_bot(
       - 'bot': matched bot name or None
       - 'multi_addressed': True if the message is
         directed at multiple bots
+      - 'brief_casual': True when a similarly brief,
+        casual response fits the conversational context
+      - 'reply_optional': True when silence is a natural
+        response to that brief casual turn
 
     Three-pass approach for name hint:
     1. Exact whole-word match (case-insensitive)
     2. Fuzzy fallback for names >= 4 chars
-    Then LLM analysis confirms the hint and assesses
-    whether multiple bots are addressed.
+    Then LLM analysis confirms the hint, resolves implicit
+    context, and assesses audience and conversational scale.
     """
     no_match = {
         'bot': None,
         'multi_addressed': False,
+        'brief_casual': False,
+        'reply_optional': False,
     }
     if not message or not bot_names:
         return no_match
@@ -1906,6 +3742,8 @@ def find_addressed_bot(
         return {
             'bot': name_hint,
             'multi_addressed': False,
+            'brief_casual': False,
+            'reply_optional': False,
         }
 
     # LLM analysis for bot identification and
@@ -1935,11 +3773,19 @@ def find_addressed_bot(
         f"Respond with ONLY a JSON object "
         f"(no markdown, no explanation):\n"
         f'{{"bot": "BotName", '
-        f'"multi_addressed": true}}\n\n'
+        f'"multi_addressed": true, '
+        f'"brief_casual": false, '
+        f'"requires_reply": true}}\n\n'
         f"Rules:\n"
         f'- "bot": the single bot most likely '
-        f"being addressed, or null if the "
-        f"message is general/undirected.\n"
+        f"being addressed explicitly or implicitly, or "
+        f"null if the message is general/undirected. "
+        f"Use the recent chat to recognize a natural "
+        f"continuation directed at the immediately prior "
+        f"speaker even when the player does not repeat "
+        f"that speaker's name. The latest player line may "
+        f"already appear at the end of recent chat; treat "
+        f"it as the same message, not a separate turn.\n"
         f'- "multi_addressed": true if the '
         f"player is addressing or expecting "
         f"responses from multiple bots. "
@@ -1954,13 +3800,46 @@ def find_addressed_bot(
         f"  * General observations that could "
         f"prompt group discussion\n"
         f'- If only one bot is addressed, '
-        f'"multi_addressed" must be false.'
+        f'"multi_addressed" must be false.\n'
+        f'- "brief_casual": true only when a minimal social response '
+        f"would satisfy the player's conversational purpose. Judge meaning "
+        f"and conversational function, not keywords or message length alone. "
+        f"An open invitation to share information, news, experiences, advice, "
+        f"an explanation or a story is false, even if terse or informal: "
+        f"a concrete or developed contribution may be welcome. This permits "
+        f"detail without requiring a long answer. Acknowledgments, routine "
+        f"social exchanges and closures are true when elaboration would "
+        f"feel disproportionate. Use recent history to decide what a short "
+        f"follow-up invites; do not classify it from its size in isolation. "
+        f"If a turn also contains a substantive request, do not let its "
+        f"social framing hide that request. Decide whether a reply is "
+        f"required separately from how much it should say.\n"
+        f'- "requires_reply": judge the whole exchange: would silence '
+        f"feel natural, or would it feel like ignoring the player? Set true "
+        f"when the player contributes to an ongoing exchange, responds to "
+        f"a bot's interest, or invites further engagement. This remains "
+        f"true even if a few words would be enough in reply. The absence "
+        f"of a question does not mean the conversation is finished. "
+        f"Questions always require a reply. Set false only when the turn "
+        f"clearly needs no further engagement and silence would naturally "
+        f"close or leave the exchange at rest. An acknowledgment can serve "
+        f"that purpose after an exchange is complete, but its conversational "
+        f"function depends on the recent history. Do not infer closure "
+        f"merely from a message being casual, brief or declarative. When "
+        f"uncertain, favor a reply. If uncertain only whether engagement "
+        f"is needed, prefer a short acknowledgment (brief_casual=true), "
+        f"unless the conversational purpose clearly calls for detail. "
+        f"Reply necessity and reply length remain separate decisions. "
+        f"Judge meaning and context, "
+        f"not keywords, punctuation, or message length alone."
     )
 
     try:
         result = quick_llm_analyze(
-            client, config, prompt, max_tokens=60,
+            client, config, prompt, max_tokens=80,
             label='find_addressed_bot',
+            response_contract=ResponseContract('analysis',
+                                               speaker_names=bot_names),
         )
     except Exception:
         logger.error(
@@ -1970,12 +3849,16 @@ def find_addressed_bot(
         return {
             'bot': name_hint,
             'multi_addressed': False,
+            'brief_casual': False,
+            'reply_optional': False,
         }
 
     if not result:
         return {
             'bot': name_hint,
             'multi_addressed': False,
+            'brief_casual': False,
+            'reply_optional': False,
         }
 
     # Parse JSON response
@@ -1992,6 +3875,8 @@ def find_addressed_bot(
         return {
             'bot': name_hint,
             'multi_addressed': False,
+            'brief_casual': False,
+            'reply_optional': False,
         }
 
     # Extract bot name
@@ -2035,10 +3920,52 @@ def find_addressed_bot(
     else:
         multi = bool(raw_multi)
 
+    raw_brief = parsed.get('brief_casual', False)
+    if isinstance(raw_brief, str):
+        brief_casual = raw_brief.lower() not in (
+            'false', '0', 'no', ''
+        )
+    else:
+        brief_casual = bool(raw_brief)
+
+    raw_required = parsed.get('requires_reply', True)
+    if isinstance(raw_required, str):
+        requires_reply = raw_required.lower() not in (
+            'false', '0', 'no', ''
+        )
+    else:
+        requires_reply = bool(raw_required)
+    reply_optional = brief_casual and not requires_reply
+
     return {
         'bot': matched_bot,
         'multi_addressed': multi,
+        'brief_casual': brief_casual,
+        'reply_optional': reply_optional,
     }
+
+
+def should_reply_to_optional_casual(
+    config: Dict,
+    analysis: Dict,
+) -> bool:
+    """Roll once for semantically optional casual turns."""
+    if not (
+        analysis.get('brief_casual')
+        and analysis.get('reply_optional')
+    ):
+        return True
+
+    try:
+        chance = int(config.get(
+            'LLMChatter.PlayerChat.'
+            'OptionalCasualReplyChance',
+            20,
+        ))
+    except (AttributeError, TypeError, ValueError):
+        chance = 20
+    chance = max(0, min(100, chance))
+    return random.randint(1, 100) <= chance
 
 
 # =============================================================================
@@ -2077,50 +4004,147 @@ def fuzzy_name_match(
     return differences <= max_distance
 
 
+def _resolve_conversation_speaker(
+    speaker: str,
+    bot_names: List[str],
+    unique_tokens_only: bool,
+) -> Optional[str]:
+    exact = [
+        name for name in bot_names
+        if speaker.casefold() == name.casefold()
+    ]
+    if len(exact) == 1:
+        return exact[0]
+
+    if unique_tokens_only:
+        label_tokens = re.findall(r'[\w]+', speaker.casefold())
+        if len(label_tokens) != 1:
+            return None
+        label = label_tokens[0]
+        matches = []
+        for name in bot_names:
+            name_tokens = re.findall(r'[\w]+', name.casefold())
+            if label in name_tokens:
+                matches.append(name)
+        return matches[0] if len(matches) == 1 else None
+
+    for bot_name in bot_names:
+        if fuzzy_name_match(speaker, bot_name):
+            return bot_name
+    return None
+
+
+_THREAD_TAIL_RE = re.compile(r'\s*\{\s*"thread"')
+
+
+def _conversation_array_items(cleaned: str):
+    """Decode a conversation JSON array.
+
+    Returns the list, or None when no usable array exists. If the
+    full array does not decode, complete leading objects are kept
+    only when what failed is a trailing ``thread`` bookkeeping
+    element (or the array simply ends); broken dialogue is still
+    rejected as before.
+    """
+    start = cleaned.find('[')
+    if start == -1:
+        return None
+    end = cleaned.rfind(']')
+    if end > start:
+        try:
+            data = json.loads(cleaned[start:end + 1])
+            return data if isinstance(data, list) else None
+        except json.JSONDecodeError:
+            pass
+    decoder = json.JSONDecoder()
+    items = []
+    pos = start + 1
+    size = len(cleaned)
+    while pos < size:
+        while pos < size and (
+            cleaned[pos].isspace() or cleaned[pos] == ','
+        ):
+            pos += 1
+        if pos >= size or cleaned[pos] == ']':
+            return items or None
+        if cleaned[pos] != '{':
+            break
+        try:
+            obj, pos = decoder.raw_decode(cleaned, pos)
+        except ValueError:
+            break
+        items.append(obj)
+    tail = cleaned[pos:]
+    if items and (not tail.strip() or _THREAD_TAIL_RE.match(tail)):
+        return items
+    return None
+
+
+def count_conversation_items(response: str) -> int:
+    """Count the dialogue objects (with a speaker) the model sent.
+
+    Lets callers tell whether every line the model wrote survived
+    parsing and filtering. Returns 0 when nothing decodes.
+    """
+    cleaned = re.sub(
+        r'```(?:json)?', '', (response or '').strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    items = _conversation_array_items(cleaned) or []
+    return sum(
+        1 for item in items
+        if isinstance(item, dict) and 'speaker' in item
+    )
+
+
 def parse_conversation_response(
-    response: str, bot_names: List[str]
+    response: str,
+    bot_names: List[str],
+    *,
+    unique_tokens_only: bool = False,
+    addressee_names: Optional[List[str]] = None,
+    allow_emote_only: bool = False,
 ) -> list:
-    """Parse conversation JSON response into message list."""
+    """Parse conversation JSON response into message list.
+
+    Non-object elements and speakerless objects (such as the
+    trailing party ``thread`` report) are skipped. When only an
+    optional trailing ``thread`` element is malformed or cut off,
+    the complete dialogue objects before it are still returned.
+    """
     try:
-        cleaned = response.strip()
+        cleaned = (response or '').strip()
         cleaned = re.sub(
             r'```(?:json)?', '', cleaned,
             flags=re.IGNORECASE
         ).strip()
-        json_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-        if json_match:
-            try:
-                messages = json.loads(json_match.group())
-            except json.JSONDecodeError:
-                start = cleaned.find('[')
-                end = cleaned.rfind(']')
-                if start != -1 and end != -1 and end > start:
-                    messages = json.loads(
-                        cleaned[start:end + 1]
-                    )
-                else:
-                    raise
+        messages = _conversation_array_items(cleaned)
+        if messages is not None:
             result = []
             for msg in messages:
-                speaker = msg.get('speaker', '').strip()
-                message = msg.get('message', '').strip()
-                if speaker and message:
-                    matched_name = None
-                    for bot_name in bot_names:
-                        if fuzzy_name_match(speaker, bot_name):
-                            matched_name = bot_name
-                            break
+                if not isinstance(msg, dict):
+                    continue
+                speaker = str(msg.get('speaker') or '').strip()
+                message = str(msg.get('message') or '').strip()
+                raw_emote = msg.get('emote')
+                emote = validate_emote(raw_emote)
+                if speaker and (
+                    message
+                    or (allow_emote_only and emote)
+                ):
+                    matched_name = _resolve_conversation_speaker(
+                        speaker,
+                        bot_names,
+                        unique_tokens_only,
+                    )
                     if matched_name:
                         entry = {
                             'name': matched_name,
                             'message': message,
                         }
                         # Extract optional emote
-                        raw_emote = msg.get('emote')
-                        if raw_emote:
-                            entry['emote'] = (
-                                validate_emote(raw_emote)
-                            )
+                        if emote:
+                            entry['emote'] = emote
                         # Extract optional action
                         raw_action = msg.get('action')
                         action = _sanitize_action(
@@ -2128,6 +4152,17 @@ def parse_conversation_response(
                         )
                         if action:
                             entry['action'] = action
+                        if addressee_names:
+                            raw_addressee = str(
+                                msg.get('addressee', '')
+                            ).strip()
+                            addressee = _resolve_conversation_speaker(
+                                raw_addressee,
+                                addressee_names,
+                                True,
+                            )
+                            if addressee:
+                                entry['addressee'] = addressee
                         result.append(entry)
             return result
     except json.JSONDecodeError:
@@ -2139,18 +4174,20 @@ def parse_extra_data(
     raw_data: str, event_id=None, event_type=None
 ) -> dict:
     """Parse extra_data JSON with repair attempts."""
+    from chatter_bg_delivery import normalize_bg_transport
+
     if not raw_data:
         return {}
 
     try:
-        return json.loads(raw_data)
+        return normalize_bg_transport(json.loads(raw_data), event_type)
     except json.JSONDecodeError:
         pass
 
     repaired = repair_json_string(raw_data)
     try:
         result = json.loads(repaired)
-        return result
+        return normalize_bg_transport(result, event_type)
     except json.JSONDecodeError:
         pass
     except Exception:
@@ -2287,11 +4324,14 @@ def format_item_context(
 # =============================================================================
 def build_anti_repetition_context(
     recent_messages: list,
-    max_items: int = 10
+    max_items: int = 10,
+    allow_same_subject: bool = False,
 ) -> str:
     """Format recent messages as an anti-repetition
     prompt injection block.
 
+    allow_same_subject=True keeps the ban on repeated wording but
+    lets an ongoing conversation keep developing its subject.
     Returns empty string if no recent messages.
     """
     if not recent_messages:
@@ -2326,8 +4366,14 @@ def build_anti_repetition_context(
     return (
         "ANTI-REPETITION: These messages were recently "
         "said in this area. You MUST NOT repeat or "
-        "closely paraphrase ANY of them. Say something "
-        "completely different.\n"
+        "closely paraphrase ANY of them. "
+        + (
+            "Developing the same subject with a new point "
+            "is fine.\n"
+            if allow_same_subject
+            else "Say something completely different.\n"
+        )
+        +
         f"{lines}"
         f"{lang_note}"
     )
@@ -2727,6 +4773,254 @@ def build_talent_context(
                 f"{spec_personality}")
 
     return result
+
+
+def format_name_list(names) -> str:
+    """Join names naturally: "A", "A and B", "A, B and C"."""
+    names = [str(n).strip() for n in names or [] if str(n).strip()]
+    if len(names) <= 1:
+        return names[0] if names else ''
+    return ', '.join(names[:-1]) + ' and ' + names[-1]
+
+
+def describe_item_type(item_class, subclass, inventory_type) -> str:
+    """Readable item type with its subtype, from item_template's
+    class, subclass and InventoryType.
+
+    "weapon: two-handed sword", "armor: plate chest piece",
+    "armor: ring", "gem: red gem", "recipe: tailoring pattern".
+    Falls back to the class name alone when the subtype is unknown.
+    """
+    try:
+        item_class = int(item_class)
+        subclass = int(subclass)
+        inventory_type = int(inventory_type)
+    except (TypeError, ValueError):
+        return 'item'
+    category = ITEM_CLASS_NAMES.get(item_class, 'Item').lower()
+    if item_class == 2:
+        kind = WEAPON_SUBCLASS_NAMES.get(subclass)
+        if not kind:
+            return category
+        hand = WEAPON_HAND_NAMES.get(inventory_type)
+        kind = kind.lower()
+        return f"{category}: {kind} ({hand})" if hand else (
+            f"{category}: {kind}")
+    if item_class == 4:
+        kind = ARMOR_KIND_SUBCLASS_NAMES.get(subclass)
+        piece = ARMOR_PIECE_NAMES.get(inventory_type)
+        if kind:
+            return f"{category}: {kind}"
+        if not piece:
+            return category
+        material = ARMOR_SUBCLASS_NAMES.get(subclass, '').lower()
+        # Cloaks are cloth by rule and jewelry has no material.
+        if material in ('cloth', 'leather', 'mail', 'plate') and (
+                inventory_type != 16):
+            return f"{category}: {material} {piece}"
+        return f"{category}: {piece}"
+    kind = ITEM_SUBCLASS_NAMES.get(item_class, {}).get(subclass)
+    if kind and kind != category:
+        return f"{category}: {kind}"
+    return category
+
+
+# Items whose usability means something to a player (equipment is
+# handled separately): consumables, recipes, glyphs, and companion
+# pets and mounts.
+_USABLE_ITEM_KINDS = {0: None, 9: None, 16: None, 15: {2, 5}}
+
+
+def loot_roll_states_use(item_class, item_subclass, is_equipment) -> bool:
+    """Whether a roll prompt should state if the bot can use the
+    item. Trade goods, reagents, gems, junk, keys and quest items
+    are left out: "you can use it" means nothing for them."""
+    if is_equipment:
+        return True
+    try:
+        item_class, item_subclass = int(item_class), int(item_subclass)
+    except (TypeError, ValueError):
+        return False
+    if item_class not in _USABLE_ITEM_KINDS:
+        return False
+    subclasses = _USABLE_ITEM_KINDS[item_class]
+    return subclasses is None or item_subclass in subclasses
+
+
+def loot_roll_use_ideas(
+    item_class, item_subclass, is_equipment,
+    item_use=None, required_level=0,
+) -> List[str]:
+    """Possible reasons to roll on an item, offered to the bot only
+    as ideas, never as its motive. Built from facts: the item kind
+    and whether this bot can use it (item_use from C++: yes, class,
+    proficiency, skill, level or no; None for older payloads)."""
+    try:
+        item_class, item_subclass = int(item_class), int(item_subclass)
+    except (TypeError, ValueError):
+        item_class, item_subclass = -1, 0
+    try:
+        level = int(required_level or 0)
+    except (TypeError, ValueError):
+        level = 0
+    sell = "to sell it"
+    friend = "to pass it to an ally or friend who can use it"
+    if is_equipment:
+        if item_use == 'level':
+            later = (
+                f"to use it once you reach level {level}"
+                if level else "to use it once you are higher level"
+            )
+            return [later, sell]
+        if item_use in ('class', 'proficiency', 'skill', 'no'):
+            return [sell, friend]
+        if item_class in (2, 4):
+            ideas = ["to wear or wield it yourself", sell]
+            if item_class == 4:
+                ideas.append("for how it looks")
+            return ideas
+        if item_class in (1, 11):
+            return ["to carry more in it", sell]
+        return ["to use it yourself", sell]
+    if item_class == 3:
+        return ["to set it into your gear", sell,
+                "to keep it for its looks"]
+    if item_class == 9:
+        if item_use == 'yes':
+            return ["to learn it", sell]
+        return ["to pass it to someone with the right profession", sell]
+    if item_class == 16:
+        if item_use == 'yes':
+            return ["to use it yourself", sell]
+        return [friend, sell]
+    if item_class == 0:
+        return ["to keep it for a hard fight", sell]
+    if item_class in (5, 7):
+        return ["for crafting", sell]
+    if item_class == 15 and item_subclass in (2, 3, 5):
+        return ["to keep it", sell]
+    return [sell, "to keep it"]
+
+
+def format_weapon_list(weapons) -> str:
+    """Render equipped weapons as "Name (type)" phrases."""
+    parts = []
+    for weapon in weapons or []:
+        name = (weapon.get('name') or '').strip()
+        kind = (weapon.get('kind') or '').strip()
+        if not name:
+            continue
+        parts.append(f"{name} ({kind})" if kind else name)
+    return ', '.join(parts)
+
+
+def format_pet_phrase(pet) -> str:
+    """Render a pet as "Name, a Species" (or just one)."""
+    if not pet:
+        return ''
+    name = (pet.get('name') or '').strip()
+    species = (pet.get('species') or '').strip()
+    if name and species and name.lower() != species.lower():
+        article = (
+            'an' if species[:1].lower() in 'aeiou' else 'a'
+        )
+        return f"{name}, {article} {species}"
+    return name or species
+
+
+def build_gear_context(
+    db, char_guid, char_class=None, config=None,
+    subject=None,
+) -> str:
+    """Describe what a bot carries and who follows it.
+
+    Returns a short line naming equipped weapons and, for
+    pet classes, the pet by name and species — so bots stop
+    inventing gear or treating their own pet as a stranger.
+    Empty string when there is nothing worth stating.
+
+    Pass `subject` (a bot name) for multi-speaker prompts,
+    which describe bots from the outside. Without it the
+    line is second person, for prompts the bot itself
+    speaks through.
+    """
+    from chatter_db import (
+        get_character_pet,
+        get_character_weapons,
+    )
+
+    if config is not None and str(
+        config.get('LLMChatter.GearContext.Enable', '1')
+    ).strip() not in ('1', 'true', 'True'):
+        return ''
+
+    try:
+        guid = int(char_guid or 0)
+    except (TypeError, ValueError):
+        return ''
+    if guid <= 0:
+        return ''
+
+    parts = []
+    subject = (subject or '').strip()
+
+    weapons = format_weapon_list(
+        get_character_weapons(db, guid)
+    )
+    if weapons:
+        parts.append(
+            f"{subject} wields {weapons}."
+            if subject
+            else f"You are wielding {weapons}."
+        )
+
+    # Only hunters and warlocks keep a permanent companion,
+    # so other classes never pay for the pet lookup.
+    class_name = char_class
+    if isinstance(class_name, int):
+        class_name = CLASS_NAMES.get(class_name, '')
+    if str(class_name or '').lower() in ('hunter', 'warlock'):
+        pet = format_pet_phrase(
+            get_character_pet(db, guid)
+        )
+        if pet:
+            parts.append(
+                f"{subject}'s pet is {pet} — a familiar "
+                "companion, not a stranger."
+                if subject
+                else f"Your pet is {pet} — a companion you "
+                "know well, not a stranger."
+            )
+
+    return ' '.join(parts)
+
+
+def attach_speaker_gear(db, bots, config=None) -> None:
+    """Give every speaker in a list a third-person gear line.
+
+    Multi-speaker prompts introduce bots from the outside
+    ("Veliana is a level 26 Blood Elf Priest"), so the
+    second-person string built for solo prompts cannot be
+    reused there. Stores the result as 'gear_third'.
+    """
+    for bot in bots or []:
+        if bot.get('gear_third') is not None:
+            continue
+        guid = bot.get('guid')
+        name = (bot.get('name') or '').strip()
+        if not guid or not name:
+            continue
+        bot['gear_third'] = build_gear_context(
+            db, guid, bot.get('class'), config,
+            subject=name,
+        )
+
+
+def append_speaker_gear(parts, bot, indent='  ') -> None:
+    """Append a speaker's gear line to a prompt part list."""
+    line = (bot.get('gear_third') or '').strip()
+    if line:
+        parts.append(f"{indent}{line}")
 
 
 # =============================================================================

@@ -216,7 +216,7 @@ static int GetGoInterestScore(GameObject* go)
 static bool IsInterestingCreature(
     Creature* cr, Player* bot)
 {
-    if (!cr || !cr->IsAlive())
+    if (!cr || !bot || !cr->IsAlive())
         return false;
 
     if (cr->IsPet() || cr->IsTotem()
@@ -225,6 +225,8 @@ static bool IsInterestingCreature(
     if (cr->IsInCombat())
         return false;
     if (cr->IsPlayer())
+        return false;
+    if (cr->IsHostileTo(bot))
         return false;
 
     CreatureTemplate const* tmpl =
@@ -337,7 +339,6 @@ void CheckNearbyGameObjects()
 
         if (player->IsInCombat()
             || player->InBattleground()
-            || player->IsMounted()
             || player->IsFlying())
             continue;
 
@@ -414,7 +415,7 @@ void CheckNearbyGameObjects()
                 continue;
 
             std::string goName =
-                go->GetGOInfo()->name;
+                GetLocalizedGameObjectName(go);
             if (goName.empty())
                 continue;
 
@@ -475,7 +476,7 @@ void CheckNearbyGameObjects()
             if (!IsInterestingCreature(cr, bot))
                 continue;
 
-            std::string crName = cr->GetName();
+            std::string crName = GetLocalizedCreatureName(cr);
             if (crName.empty())
                 continue;
 
@@ -494,7 +495,7 @@ void CheckNearbyGameObjects()
             sp.name = crName;
             sp.typeName = GetCreatureRoleName(cr);
             sp.subName =
-                cr->GetCreatureTemplate()->SubName;
+                GetLocalizedCreatureSubName(cr);
             sp.distance = bot->GetDistance(cr);
             sp.entry = cr->GetEntry();
             sp.spellFocusId = 0;
@@ -559,9 +560,9 @@ void CheckNearbyGameObjects()
                 R"("spell_focus_id":{},)"
                 R"("level":{},)"
                 R"("is_creature":{}}})",
-                JsonEscape(c.name),
-                JsonEscape(c.typeName),
-                JsonEscape(c.subName),
+                ChatterJsonEscape(c.name),
+                ChatterJsonEscape(c.typeName),
+                ChatterJsonEscape(c.subName),
                 c.distance,
                 c.entry,
                 c.spellFocusId,
@@ -575,18 +576,10 @@ void CheckNearbyGameObjects()
         uint32 mapId = bot->GetMapId();
         AreaTableEntry const* zone =
             sAreaTableStore.LookupEntry(zoneId);
-        AreaTableEntry const* area =
-            sAreaTableStore.LookupEntry(areaId);
-        char const* zp = zone
-            ? zone->area_name[
-                sWorld->GetDefaultDbcLocale()]
-            : nullptr;
-        std::string zoneName = zp ? zp : "";
-        char const* sp = area
-            ? area->area_name[
-                sWorld->GetDefaultDbcLocale()]
-            : nullptr;
-        std::string subzoneName = sp ? sp : "";
+        std::string zoneName =
+            GetAreaNameForLocale(zoneId);
+        std::string subzoneName =
+            GetAreaNameForLocale(areaId);
         bool inCity =
             zone
             && (zone->flags & AREA_FLAG_CAPITAL);
@@ -601,9 +594,9 @@ void CheckNearbyGameObjects()
             + std::to_string(
                 group->GetGUID().GetCounter())
             + ",\"zone_name\":\""
-            + JsonEscape(zoneName)
+            + ChatterJsonEscape(zoneName)
             + "\",\"subzone_name\":\""
-            + JsonEscape(subzoneName)
+            + ChatterJsonEscape(subzoneName)
             + "\",\"in_city\":"
             + std::string(
                 inCity ? "true" : "false")

@@ -36,7 +36,7 @@ services:
       - ./modules/mod-llm-chatter/tools:/app/tools:ro
       - ./env/dist/etc/modules/mod_llm_chatter.conf:/etc/llm_chatter.conf:ro
     command: >
-      sh -c "pip install -q anthropic openai mysql-connector-python &&
+      sh -c "pip install -q -r /app/tools/requirements.txt &&
              cd /app/tools && python llm_chatter_bridge.py --config /etc/llm_chatter.conf"
     depends_on:
       ac-database:

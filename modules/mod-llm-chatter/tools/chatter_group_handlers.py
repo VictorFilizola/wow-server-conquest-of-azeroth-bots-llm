@@ -3,6 +3,8 @@
 import logging
 import random
 import re
+import threading
+import time
 from chatter_shared import (
     parse_extra_data,
     get_class_name,
@@ -18,16 +20,42 @@ from chatter_shared import (
     get_dungeon_bosses,
     format_item_link,
     format_item_context,
+    format_name_list,
     run_single_reaction,
     parse_conversation_response,
     calculate_dynamic_delay,
     build_talent_context,
+    build_gear_context,
+    attach_speaker_gear,
     build_zone_metadata,
     build_group_travel_metadata,
     build_travel_state_from_row,
     format_travel_context,
     strip_conversation_actions,
+    localize_creature_name,
+    localize_item_name,
+    describe_item_type,
+    loot_roll_states_use,
+    loot_roll_use_ideas,
+    localize_quest_name,
+    shorten_chat_message,
+    brief_casual_response_fits,
+    bound_brief_casual_response,
+    build_brief_casual_repair_prompt,
+    is_pvp_enemy,
+    is_pvp_identity_known,
+    format_location_label,
+    instance_has_sky,
+    get_quest_memory_texts,
+    clean_quest_text,
+    quest_memory_background,
 )
+from chatter_guild_profile import (
+    get_character_guild_name,
+    indefinite_article,
+    same_guild_note,
+)
+from chatter_player_context import player_context_text
 from chatter_db import (
     fail_event,
     get_group_location,
@@ -38,10 +66,13 @@ from chatter_party_gate import (
     defer_event_for_party_gate,
     should_defer_party_generation,
 )
-from chatter_constants import BG_MAP_NAMES, RAID_MAP_IDS
+from chatter_constants import (
+    BG_MAP_NAMES, CAPITAL_CITY_ZONES, RAID_MAP_IDS,
+)
 from chatter_text import (
     strip_speaker_prefix,
     cleanup_message,
+    split_action_prefix,
 )
 from chatter_llm import call_llm
 from chatter_group_state import (
@@ -57,12 +88,24 @@ from chatter_group_state import (
     get_bot_mood_label,
     update_bot_mood,
 )
+from chatter_member_gender import (
+    gender_from_id,
+    genders_by_named_guid,
+    with_party_genders,
+)
+from chatter_threads import render_for_player_reply
+from chatter_persona import (
+    format_backstory_block,
+    party_reaction_backstory,
+)
 from chatter_group_prompts import (
     build_kill_reaction_prompt,
     build_loot_reaction_prompt,
+    build_loot_roll_prompt,
     build_combat_reaction_prompt,
     build_death_reaction_prompt,
     build_levelup_reaction_prompt,
+    levelup_growth,
     build_quest_complete_reaction_prompt,
     build_quest_objectives_reaction_prompt,
     build_achievement_reaction_prompt,
@@ -86,16 +129,24 @@ from chatter_group_prompts import (
     build_quest_accept_conversation_prompt,
 )
 from chatter_raid_base import (
-    dual_worker_dispatch,
+    fire_subgroup_worker,
 )
 from chatter_raid_prompts import (
     build_raid_battle_cry_prompt,
 )
 from chatter_handler_pipeline import (
     run_group_handler,
+    _build_bot_from_db,
     _maybe_talent_context,
 )
-from chatter_memory import queue_memory
+from chatter_class_style import class_style
+from chatter_memory import (
+    claim_discovery,
+    claim_dungeon_memory,
+    is_milestone_achievement,
+    pick_event_bots,
+    queue_memory,
+)
 from chatter_bg_prompts import (
     build_bg_achievement_prompt,
     build_bg_spell_cast_prompt,
@@ -113,12 +164,18 @@ logger = logging.getLogger(__name__)
 def _resolve_zone_name(
     db, group_id, extra_data_zone_name
 ):
-    """Resolve the authoritative zone name for a
-    group using llm_group_bot_traits (single source
-    of truth, updated by C++ OnPlayerUpdateZone).
+    """Resolve the zone name for a group in the configured chatter
+    language.
 
-    Falls back to C++ extra_data zone_name if
-    the traits lookup fails.
+    Localization is driven from the stable zone_id by the bridge, so
+    that every name in a prompt comes from one consistent locale.
+    LLMChatter.Language is the authoritative setting on both sides:
+    the C++ zone_name in extra_data is resolved through the module
+    locale too, so the two agree.
+
+    The C++ string is still a useful fallback -- it covers ids the
+    bridge has no table entry for -- so it is used whenever the
+    bridge lookup comes back empty.
 
     Returns zone_name string.
     """
@@ -127,16 +184,67 @@ def _resolve_zone_name(
     )
     if zone_id:
         resolved = get_zone_name(zone_id)
-        if resolved and not resolved.startswith(
-            'zone '
-        ):
+        if resolved:
             return resolved
-    # Fallback to C++ extra_data zone_name
     return extra_data_zone_name or 'somewhere'
 
 
+def _pvp_kill_memory(db, ctx):
+    """Memory: the reacting bot remembers defeating a
+    named opposing-faction enemy in the open world.
+
+    Uses the same chance setting as battleground
+    PvP kill memories. Anonymous enemies are not
+    remembered because nobody saw who they were.
+    """
+    extra_data = ctx['extra_data']
+    if not is_pvp_identity_known(extra_data):
+        return
+    config = ctx['config']
+    mem_chance = int(config.get(
+        'LLMChatter.Memory'
+        '.PvPKillGenerationChance', 30
+    ))
+    if random.random() * 100 >= mem_chance:
+        return
+    enemy_name = extra_data.get('enemy_name') or ''
+    if not enemy_name:
+        return
+    try:
+        enemy_desc = ' '.join(p for p in (
+            gender_from_id(extra_data.get('enemy_gender')),
+            get_race_name(
+                int(extra_data.get('enemy_race', 0))),
+            get_class_name(
+                int(extra_data.get('enemy_class', 0))),
+        ) if p)
+    except (TypeError, ValueError):
+        enemy_desc = ''
+    context = f"Defeated {enemy_name}"
+    if enemy_desc:
+        context += f", a {enemy_desc}"
+    faction = extra_data.get('enemy_faction') or ''
+    if faction:
+        context += f" of the {faction}"
+    context += ", in the open world"
+    queue_memory(
+        config, ctx['group_id'],
+        ctx['bot_guid'], 0,
+        memory_type='pvp_kill',
+        event_context=context,
+        bot_name=ctx['bot_name'],
+        bot_class=ctx['bot']['class'],
+        bot_race=ctx['bot']['race'],
+        bot_gender=ctx['bot'].get('gender', ''),
+    )
+
+
 def _kill_post_success(db, ctx, message):
-    """Memory: bots remember boss/rare kills."""
+    """Memory: bots remember boss/rare kills and
+    named overworld PvP kills."""
+    if is_pvp_enemy(ctx['extra_data']):
+        _pvp_kill_memory(db, ctx)
+        return
     is_boss = ctx['is_boss']
     is_rare = ctx['is_rare']
     if not (is_boss or is_rare):
@@ -149,7 +257,7 @@ def _kill_post_success(db, ctx, message):
     creature_name = ctx['creature_name']
     boss_mem_chance = int(config.get(
         'LLMChatter.Memory'
-        '.BossKillGenerationChance', 60
+        '.BossKillGenerationChance', 70
     ))
     mc = db.cursor(dictionary=True)
     mc.execute(
@@ -162,7 +270,7 @@ def _kill_post_success(db, ctx, message):
         (group_id,),
     )
     all_bots = mc.fetchall()
-    for ab in all_bots:
+    for ab in pick_event_bots(config, all_bots):
         if (random.random() * 100
                 >= boss_mem_chance):
             continue
@@ -192,6 +300,73 @@ def _kill_post_success(db, ctx, message):
             )
 
 
+_burst_lock = threading.Lock()
+# (kind, group_id) -> time of the last reaction that was voiced.
+_burst_voiced_at = {}
+# (kind, group_id) -> tokens of reactions currently being generated.
+_burst_inflight = {}
+
+
+def _burst_reserve(kind, config, extra_data, window_key,
+                   default_window, boss_passes):
+    """Reserve a slot for a group `kind` reaction, or return None when
+    it should stay silent.
+
+    One fight often raises the same event several times at once: a
+    boss dies with rare-flagged escorts, or every bot enters combat on
+    the same pull. Without a group-level guard each produces its own
+    near-identical line and the moment gets buried.
+
+    A reaction is suppressed while another one for the group is being
+    generated, or when one was voiced less than the window ago. With
+    `boss_passes`, boss events always get a slot. _burst_finish()
+    starts the window only for a voiced reaction; a failed one just
+    gives its slot back, so it never silences the next.
+
+    Returns None when suppressed, () when no guard applies (no group,
+    or window <= 0), else a reservation for commit/release.
+    """
+    group_id = int(extra_data.get('group_id', 0) or 0)
+    try:
+        window = int(config.get(window_key, default_window))
+    except (TypeError, ValueError):
+        window = default_window
+    if not group_id or window <= 0:
+        return ()
+    is_boss = bool(int(extra_data.get('is_boss', 0) or 0))
+    key = (kind, group_id)
+    token = object()
+    now = time.time()
+    with _burst_lock:
+        if not (boss_passes and is_boss):
+            if _burst_inflight.get(key):
+                return None
+            if now - _burst_voiced_at.get(key, 0) < window:
+                return None
+        _burst_inflight.setdefault(key, set()).add(token)
+        if len(_burst_voiced_at) > 1000:
+            cutoff = now - 600
+            for k in [k for k, at in _burst_voiced_at.items()
+                      if at < cutoff]:
+                del _burst_voiced_at[k]
+    return (key, token)
+
+
+def _burst_finish(reservation, voiced):
+    """End a reservation; start the group window only if it voiced."""
+    if not reservation:
+        return
+    key, token = reservation
+    with _burst_lock:
+        tokens = _burst_inflight.get(key)
+        if tokens is not None:
+            tokens.discard(token)
+            if not tokens:
+                del _burst_inflight[key]
+        if voiced:
+            _burst_voiced_at[key] = time.time()
+
+
 def process_group_kill_event(
     db, client, config, event
 ):
@@ -200,12 +375,38 @@ def process_group_kill_event(
     The killing bot reacts to a boss/rare kill
     in party chat.
     """
+    extra_data = parse_extra_data(
+        event.get('extra_data'), event['id'],
+        'bot_group_kill',
+    )
+    reservation = ()
+    if extra_data:
+        reservation = _burst_reserve(
+            'kill', config, extra_data,
+            'LLMChatter.GroupChatter.KillBurstWindow', 30,
+            boss_passes=True,
+        )
+        if reservation is None:
+            _mark_event(db, event['id'], 'skipped')
+            return False
+    ok = False
+    try:
+        ok = _run_kill_reaction(db, client, config, event, extra_data)
+        return ok
+    finally:
+        _burst_finish(reservation, bool(ok))
+
+
+def _run_kill_reaction(db, client, config, event, extra_data):
     return run_group_handler(
         db, client, config, event,
+        pre_parsed_extra=extra_data,
         event_type_label='bot_group_kill',
         extract_fields=lambda ed: {
-            'creature_name': ed.get(
-                'creature_name', 'something'),
+            'creature_name': localize_creature_name(
+                db, ed.get(
+                    'creature_name', 'something'),
+                ed.get('creature_entry')),
             'is_boss': bool(int(
                 ed.get('is_boss', 0))),
             'is_rare': bool(int(
@@ -226,6 +427,9 @@ def process_group_kill_event(
                     ctx['speaker_talent']),
                 stored_tone=ctx['stored_tone'],
                 map_id=ctx['map_id'],
+                db=ctx['db'],
+                zone_id=ctx['zone_id'],
+                area_id=ctx['area_id'],
             )
         ),
         needs_map_id=True,
@@ -252,8 +456,10 @@ def process_group_loot_event(
             'looter_name': ed.get(
                 'looter_name',
                 ed.get('bot_name', 'Unknown')),
-            'item_name': ed.get(
-                'item_name', 'something'),
+            'item_name': localize_item_name(
+                db, ed.get(
+                    'item_name', 'something'),
+                ed.get('item_entry')),
             'item_quality': int(
                 ed.get('item_quality', 2)),
             'item_entry': int(
@@ -286,14 +492,125 @@ def process_group_loot_event(
             else 'loot'
         ),
         message_transform=lambda msg: (
-            _loot_msg_xform(msg, event)
+            _loot_msg_xform(db, msg, event)
         ),
         label='reaction_loot',
     )
 
 
-def _loot_msg_xform(raw_message, event):
-    """Inject clickable item link into loot msg."""
+def _loot_roll_is_equipment(extra_data) -> bool:
+    """C++ sends item_is_equipment; older payloads lack it, and any
+    item with an equipment slot counts as equipment."""
+    flag = extra_data.get('item_is_equipment')
+    if flag is not None:
+        return bool(int(flag))
+    try:
+        return int(extra_data.get('item_inventory_type') or 0) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _loot_roll_use_fields(extra_data) -> dict:
+    """Whether the bot can use the item (C++ item_use), stated only
+    for kinds where it means something, and the idea list built
+    from it. Older payloads without item_use state nothing."""
+    item_class = extra_data.get('item_class', -1)
+    item_subclass = extra_data.get('item_subclass', 0)
+    is_equipment = _loot_roll_is_equipment(extra_data)
+    item_use = extra_data.get('item_use') or None
+    try:
+        required_level = int(
+            extra_data.get('item_required_level') or 0)
+    except (TypeError, ValueError):
+        required_level = 0
+    return {
+        'item_use': (
+            item_use
+            if loot_roll_states_use(
+                item_class, item_subclass, is_equipment)
+            else None),
+        'required_level': required_level,
+        'use_ideas': loot_roll_use_ideas(
+            item_class, item_subclass, is_equipment,
+            item_use, required_level),
+    }
+
+
+def process_group_loot_roll_event(
+    db, client, config, event
+):
+    """Handle a bot_group_loot_roll event.
+
+    A party bot that rolled Need or Greed on an item
+    says why in party chat. C++ applies the chance,
+    cooldown and per-item cap, and drops the line at
+    delivery if the roll has closed by then.
+    """
+    return run_group_handler(
+        db, client, config, event,
+        event_type_label='bot_group_loot_roll',
+        extract_fields=lambda ed: {
+            'item_name': localize_item_name(
+                db, ed.get(
+                    'item_name', 'something'),
+                ed.get('item_entry')),
+            'item_quality': int(
+                ed.get('item_quality', 2)),
+            'item_entry': int(
+                ed.get('item_entry', 0)),
+            'roll_vote': (
+                'need'
+                if str(ed.get('roll_vote', '')).lower()
+                    == 'need'
+                else 'greed'),
+            'item_type': describe_item_type(
+                ed.get('item_class', -1),
+                ed.get('item_subclass', 0),
+                ed.get('item_inventory_type', 0)),
+            **_loot_roll_use_fields(ed),
+        },
+        build_prompt=lambda ctx: (
+            build_loot_roll_prompt(
+                ctx['bot'], ctx['traits'],
+                ctx['item_name'],
+                ctx['item_quality'],
+                ctx['mode'],
+                ctx['roll_vote'],
+                ctx['item_type'],
+                chat_history=ctx['chat_hist'],
+                extra_data=ctx['extra_data'],
+                speaker_talent_context=(
+                    ctx['speaker_talent']),
+                stored_tone=ctx['stored_tone'],
+                map_id=ctx['map_id'],
+                item_use=ctx['item_use'],
+                required_level=ctx['required_level'],
+                use_ideas=ctx['use_ideas'],
+            )
+        ),
+        needs_map_id=True,
+        message_transform=lambda msg: (
+            _loot_msg_xform(db, msg, event)
+        ),
+        label='reaction_loot_roll',
+    )
+
+
+def _loot_msg_xform(db, raw_message, event):
+    """Inject a clickable item link into a loot message.
+
+    The prompt asks the model to write the stable {item} token rather
+    than the item's name. That token is what we substitute here, which
+    keeps the link working in inflected languages: the language rule
+    tells the model to decline proper nouns, so the written form of a
+    name often will not match the nominative we hold, and an
+    exact-name match would silently drop the link.
+
+    Two fallbacks remain for messages that do not carry the token --
+    older queued events, or a model that ignored the instruction:
+    an exact (case-insensitive) name match, then any [bracketed]
+    span, mirroring replace_placeholders()'s own fallback.
+    """
     import json
     try:
         ed = json.loads(
@@ -302,17 +619,53 @@ def _loot_msg_xform(raw_message, event):
     except Exception:
         return raw_message
     item_entry = int(ed.get('item_entry', 0))
-    item_name = ed.get('item_name', '')
+    item_name = localize_item_name(
+        db, ed.get('item_name', ''), item_entry,
+    )
     item_quality = int(ed.get('item_quality', 2))
-    if item_entry and item_name:
-        link = format_item_link(
-            item_entry, item_quality, item_name,
-        )
+    if not (item_entry and item_name):
+        return raw_message
+
+    link = format_item_link(
+        item_entry, item_quality, item_name,
+    )
+
+    # Preferred path: the stable token, immune to declension.
+    token_pattern = r'\{item(?::[^}]*)?\}'
+    if re.search(token_pattern, raw_message):
         return re.sub(
-            re.escape(item_name), link,
+            token_pattern, lambda _m: link,
+            raw_message, count=1,
+        )
+
+    # Fallback: the model wrote the name verbatim. Absorb the
+    # brackets when it already wrote [Name], since the link supplies
+    # its own pair and would otherwise render as [[Name]].
+    bracketed_name = r'\[\s*' + re.escape(item_name) + r'\s*\]'
+    if re.search(bracketed_name, raw_message, flags=re.IGNORECASE):
+        return re.sub(
+            bracketed_name, lambda _m: link,
             raw_message, count=1,
             flags=re.IGNORECASE,
         )
+    if re.search(
+        re.escape(item_name), raw_message,
+        flags=re.IGNORECASE,
+    ):
+        return re.sub(
+            re.escape(item_name), lambda _m: link,
+            raw_message, count=1,
+            flags=re.IGNORECASE,
+        )
+
+    # Last resort: a bracketed span, as replace_placeholders does.
+    bracket_pattern = r'\[[^\]]{2,40}\]'
+    if re.search(bracket_pattern, raw_message):
+        return re.sub(
+            bracket_pattern, lambda _m: link,
+            raw_message, count=1,
+        )
+
     return raw_message
 
 def _maybe_raid_battle_cry(
@@ -438,37 +791,56 @@ def process_group_combat_event(
         ):
             _mark_event(db, event_id, 'skipped')
             return False
+        # Every bot entering combat on one pull raises its own
+        # event; only the first speaks for the group.
+        reservation = _burst_reserve(
+            'pull', config, ed,
+            'LLMChatter.GroupChatter.PullBurstWindow', 15,
+            boss_passes=False,
+        )
+        if reservation is None:
+            _mark_event(db, event_id, 'skipped')
+            return False
+    else:
+        reservation = ()
 
-    result = run_group_handler(
-        db, client, config, event,
-        event_type_label='bot_group_combat',
-        extract_fields=lambda ed: {
-            'creature_name': ed.get(
-                'creature_name', 'something'),
-            'is_boss': bool(int(
-                ed.get('is_boss', 0))),
-            'is_elite': bool(int(
-                ed.get('is_elite', 0))),
-        },
-        build_prompt=lambda ctx: (
-            build_combat_reaction_prompt(
-                ctx['bot'], ctx['traits'],
-                ctx['creature_name'],
-                ctx['is_boss'], ctx['mode'],
-                chat_history=ctx['chat_hist'],
-                is_elite=ctx['is_elite'],
-                extra_data=ctx['extra_data'],
-                speaker_talent_context=(
-                    ctx['speaker_talent']),
-                stored_tone=ctx['stored_tone'],
-            )
-        ),
-        delay_seconds=1,
-        max_tokens_override=60,
-        inject_mood=False,
-        label='reaction_combat',
-        bg_fallback_prompt=build_bg_combat_prompt,
-    )
+    result = False
+    try:
+        result = run_group_handler(
+            db, client, config, event,
+            event_type_label='bot_group_combat',
+            extract_fields=lambda ed: {
+                'creature_name': localize_creature_name(
+                    db, ed.get(
+                        'creature_name', 'something'),
+                    ed.get('creature_entry')),
+                'is_boss': bool(int(
+                    ed.get('is_boss', 0))),
+                'is_elite': bool(int(
+                    ed.get('is_elite', 0))),
+            },
+            build_prompt=lambda ctx: (
+                build_combat_reaction_prompt(
+                    ctx['bot'], ctx['traits'],
+                    ctx['creature_name'],
+                    ctx['is_boss'], ctx['mode'],
+                    chat_history=ctx['chat_hist'],
+                    is_elite=ctx['is_elite'],
+                    extra_data=ctx['extra_data'],
+                    speaker_talent_context=(
+                        ctx['speaker_talent']),
+                    stored_tone=ctx['stored_tone'],
+                    db=ctx['db'],
+                )
+            ),
+            delay_seconds=1,
+            max_tokens_override=60,
+            inject_mood=False,
+            label='reaction_combat',
+            bg_fallback_prompt=build_bg_combat_prompt,
+        )
+    finally:
+        _burst_finish(reservation, bool(result))
 
     # Attempt raid battle cry regardless of whether
     # the party reaction succeeded — the reactor bot
@@ -526,6 +898,8 @@ def process_group_death_event(
                     ctx['speaker_talent']),
                 stored_tone=ctx['stored_tone'],
                 map_id=ctx['map_id'],
+                zone_id=ctx['zone_id'],
+                area_id=ctx['area_id'],
             )
         ),
         needs_map_id=True,
@@ -545,20 +919,49 @@ def _levelup_post_success(db, ctx, message):
     new_level = ctx['new_level']
     is_bot = ctx['is_bot']
     leveler_guid = ctx['leveler_guid']
+    is_rp = ctx['mode'] == 'roleplay'
+    leveler_gender = genders_by_named_guid(
+        db, {leveler_name: leveler_guid},
+    ).get(leveler_name)
+    leveler = (
+        f"{leveler_name} ({leveler_gender})"
+        if leveler_gender else leveler_name
+    )
+    # Roleplay says what grew, by calling, as the party
+    # reaction does: a warrior's strength, a hunter's aim.
+    calling, growth = ('', '')
+    if is_rp:
+        calling, growth = levelup_growth(
+            ctx.get('leveler_race', ''),
+            ctx.get('leveler_class', ''),
+            class_style(
+                db, leveler_guid, ctx.get('leveler_class', ''),
+            ) if ctx.get('leveler_class') else '',
+        )
+    in_growth = f" in {growth}" if growth else ""
+    as_calling = (
+        f", {indefinite_article(calling)} {calling},"
+        if calling else ""
+    )
+    other_context = (
+        f"{leveler}{as_calling} grew noticeably stronger{in_growth}"
+        if is_rp else f"{leveler} reached level {new_level}"
+    )
+    self_context = (
+        f"I felt myself grow noticeably stronger{in_growth}"
+        if is_rp else f"I reached level {new_level}"
+    )
 
     mem_chance = int(config.get(
         'LLMChatter.Memory'
-        '.LevelUpGenerationChance', 50
+        '.LevelUpGenerationChance', 60
     ))
     if random.random() * 100 < mem_chance:
         queue_memory(
             config, group_id,
             reactor_guid, 0,
             memory_type='level_up',
-            event_context=(
-                f"{leveler_name} reached"
-                f" level {new_level}"
-            ),
+            event_context=other_context,
             bot_name=reactor_name,
             bot_class=ctx['bot']['class'],
             bot_race=ctx['bot']['race'],
@@ -581,10 +984,7 @@ def _levelup_post_success(db, ctx, message):
                 config, group_id,
                 leveler_guid, 0,
                 memory_type='level_up',
-                event_context=(
-                    f"I reached level"
-                    f" {new_level}"
-                ),
+                event_context=self_context,
                 bot_name=leveler_name,
                 bot_class=get_class_name(
                     lv_row['class']
@@ -620,6 +1020,12 @@ def process_group_levelup_event(
                 ed.get('bot_level', 1)),
             'is_bot': bool(int(
                 ed.get('is_bot', 1))),
+            'leveler_class': get_class_name(
+                int(ed.get('leveler_class', 0))
+            ) if ed.get('leveler_class') else '',
+            'leveler_race': get_race_name(
+                int(ed.get('leveler_race', 0))
+            ) if ed.get('leveler_race') else '',
         },
         build_prompt=lambda ctx: (
             build_levelup_reaction_prompt(
@@ -628,10 +1034,22 @@ def process_group_levelup_event(
                 ctx['new_level'],
                 ctx['is_bot'],
                 ctx['mode'],
+                # Roleplay names the calling from the payload
+                # and never reads leveler_desc.
+                leveler_desc=_race_class_of(
+                    ctx['db'], ctx['leveler_guid'],
+                    ctx['leveler_name'],
+                ) if ctx['mode'] != 'roleplay' else '',
                 chat_history=ctx['chat_hist'],
                 speaker_talent_context=(
                     ctx['speaker_talent']),
                 stored_tone=ctx['stored_tone'],
+                leveler_race=ctx['leveler_race'],
+                leveler_class=ctx['leveler_class'],
+                leveler_style=class_style(
+                    ctx['db'], ctx['leveler_guid'],
+                    ctx['leveler_class'],
+                ) if ctx['mode'] == 'roleplay' else '',
             )
         ),
         needs_reactor_from_db=True,
@@ -641,9 +1059,70 @@ def process_group_levelup_event(
         post_success=_levelup_post_success,
     )
 
+def _quest_player(db, player_name):
+    """(race, class, gender) labels of a character, for
+    filling quest-text placeholders; '' when unknown."""
+    race = cls = gender = ''
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT race, class, gender FROM characters"
+            " WHERE name = %s",
+            (player_name,),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        if row:
+            race = get_race_name(row['race'])
+            cls = get_class_name(row['class'])
+            gender = get_gender_label(row.get('gender') or 0)
+    except Exception:
+        logger.debug("quest player lookup failed", exc_info=True)
+    return race, cls, gender
+
+
+def _quest_background(db, quest_id, player_name):
+    """The quest-giver's words for a quest memory, with the
+    quest-text placeholders filled in for the player."""
+    return quest_memory_background(get_quest_memory_texts(
+        db, quest_id, player_name, *_quest_player(db, player_name),
+    ))
+
+
+# Prompt length of the quest texts; the worldserver sends
+# longer raw text so the cut lands on a sentence.
+_QUEST_DETAILS_CHARS = 350
+_QUEST_OBJECTIVES_CHARS = 200
+
+
+def _quest_prompt_texts(db, extra_data, player_name):
+    """(details, objectives) of a quest event for prompts:
+    client placeholders ($N, $B, $G...) filled in for the
+    character who took the quest, and cut at a sentence."""
+    details = extra_data.get('quest_details', '')
+    objectives = extra_data.get('quest_objectives', '')
+    if not (details or objectives):
+        return '', ''
+    who = _quest_player(db, player_name) if '$' in (
+        details + objectives) else ('', '', '')
+    return (
+        clean_quest_text(
+            details, player_name, *who,
+            limit=_QUEST_DETAILS_CHARS),
+        clean_quest_text(
+            objectives, player_name, *who,
+            limit=_QUEST_OBJECTIVES_CHARS),
+    )
+
+
 def _quest_complete_memory(db, ctx, message):
     """Post-success: queue memory for quest
-    completion."""
+    completion, with how the quest-giver described the
+    task and what they said when it was done.
+    Memory.Enable and the chance come before the quest
+    text lookups."""
+    if not int(ctx['config'].get('LLMChatter.Memory.Enable', 1)):
+        return
     mem_chance = int(ctx['config'].get(
         'LLMChatter.Memory'
         '.QuestGenerationChance', 40,
@@ -654,8 +1133,12 @@ def _quest_complete_memory(db, ctx, message):
             ctx['bot_guid'], 0,
             memory_type='quest_complete',
             event_context=(
-                f"Completed quest:"
-                f" {ctx['quest_name']}"
+                f"Finished the task"
+                f" \"{ctx['quest_name']}\" together"
+            ),
+            background=_quest_background(
+                db, ctx.get('quest_id'),
+                ctx.get('completer_name', ''),
             ),
             bot_name=ctx['bot_name'],
             bot_class=ctx['bot']['class'],
@@ -685,6 +1168,23 @@ def process_group_quest_complete_event(
     if not extra_data:
         _mark_event(db, event_id, 'skipped')
         return False
+
+    # Localize quest_name in-place (Blizzard-localized
+    # title from quest_template_locale) so every
+    # downstream consumer -- conversation path, memory
+    # context, and the fallback single-reaction prompt --
+    # picks it up automatically via this same extra_data
+    # dict (safe no-op when quest_id is missing or the
+    # configured language has no locale mapping).
+    quest_id_for_locale = int(
+        extra_data.get('quest_id', 0)
+    )
+    if quest_id_for_locale:
+        extra_data['quest_name'] = localize_quest_name(
+            db, extra_data.get(
+                'quest_name', 'a quest'),
+            quest_id_for_locale,
+        )
 
     conv_chance = int(config.get(
         'LLMChatter.GroupChatter'
@@ -745,7 +1245,10 @@ def process_group_quest_complete_event(
                         40,
                     ))
                     if (
-                        random.random() * 100
+                        int(config.get(
+                            'LLMChatter.Memory.Enable', 1
+                        ))
+                        and random.random() * 100
                         < mem_ch
                     ):
                         queue_memory(
@@ -755,8 +1258,14 @@ def process_group_quest_complete_event(
                                 'quest_complete'
                             ),
                             event_context=(
-                                f"Completed quest:"
-                                f" {quest_name}"
+                                f"Finished the task"
+                                f" \"{quest_name}\""
+                                f" together"
+                            ),
+                            background=_quest_background(
+                                db,
+                                extra_data.get('quest_id'),
+                                completer_name,
                             ),
                             bot_name=reactor_name,
                             bot_class=bot_class,
@@ -785,22 +1294,22 @@ def process_group_quest_complete_event(
             turnin_npc = query_quest_turnin_npc(
                 config, quest_id,
             )
+        completer = ed.get(
+            'completer_name',
+            ed.get('bot_name', 'someone'),
+        )
+        details, objectives = _quest_prompt_texts(
+            db, ed, completer,
+        )
         return {
-            'completer_name': ed.get(
-                'completer_name',
-                ed.get('bot_name', 'someone'),
-            ),
+            'completer_name': completer,
             'quest_name': ed.get(
                 'quest_name', 'a quest',
             ),
             'quest_id': quest_id,
             'turnin_npc': turnin_npc,
-            'quest_details': ed.get(
-                'quest_details', '',
-            ),
-            'quest_objectives': ed.get(
-                'quest_objectives', '',
-            ),
+            'quest_details': details,
+            'quest_objectives': objectives,
         }
 
     def _build(ctx):
@@ -823,6 +1332,7 @@ def process_group_quest_complete_event(
                 ),
                 stored_tone=ctx['stored_tone'],
                 zone_id=ctx.get('zone_id', 0),
+                area_id=ctx.get('area_id', 0),
             )
         )
 
@@ -860,6 +1370,23 @@ def process_group_quest_objectives_event(
     if not extra_data:
         _mark_event(db, event_id, 'skipped')
         return False
+
+    # Localize quest_name in-place (Blizzard-localized
+    # title from quest_template_locale) so every
+    # downstream consumer -- conversation path, memory
+    # context, and the fallback single-reaction prompt --
+    # picks it up automatically via this same extra_data
+    # dict (safe no-op when quest_id is missing or the
+    # configured language has no locale mapping).
+    quest_id_for_locale = int(
+        extra_data.get('quest_id', 0)
+    )
+    if quest_id_for_locale:
+        extra_data['quest_name'] = localize_quest_name(
+            db, extra_data.get(
+                'quest_name', 'a quest'),
+            quest_id_for_locale,
+        )
 
     reactor_guid = int(
         extra_data.get('bot_guid', 0)
@@ -921,20 +1448,20 @@ def process_group_quest_objectives_event(
             )
 
     def _extract(ed):
+        completer = ed.get(
+            'completer_name',
+            ed.get('bot_name', 'someone'),
+        )
+        details, objectives = _quest_prompt_texts(
+            db, ed, completer,
+        )
         return {
-            'completer_name': ed.get(
-                'completer_name',
-                ed.get('bot_name', 'someone'),
-            ),
+            'completer_name': completer,
             'quest_name': ed.get(
                 'quest_name', 'a quest',
             ),
-            'quest_details': ed.get(
-                'quest_details', '',
-            ),
-            'quest_objectives': ed.get(
-                'quest_objectives', '',
-            ),
+            'quest_details': details,
+            'quest_objectives': objectives,
         }
 
     def _build(ctx):
@@ -956,6 +1483,7 @@ def process_group_quest_objectives_event(
                 ),
                 stored_tone=ctx['stored_tone'],
                 zone_id=ctx.get('zone_id', 0),
+                area_id=ctx.get('area_id', 0),
             )
         )
 
@@ -1081,17 +1609,25 @@ def _check_achievement_batch(
 
 
 def _achievement_post_success(db, ctx, message):
-    """Memory: ALL bots remember the achievement.
-    Skip in BG (achievements fire constantly).
+    """Memory: up to MaxBotsPerEvent bots remember the
+    deed, each knowing who earned it. Skip in BG
+    (achievements fire constantly) and, in roleplay,
+    pure milestones ("Level 30", "50 Quests") that have
+    no deed to remember.
     """
     if ctx['extra_data'].get('is_battleground'):
         return
     config = ctx['config']
     group_id = ctx['group_id']
     achievement_name = ctx['achievement_name']
+    if ctx['mode'] == 'roleplay' and is_milestone_achievement(
+            achievement_name):
+        return
+    achiever_guid = int(ctx.get('achiever_guid') or 0)
+    achiever_name = ctx.get('achiever_name') or "someone"
     achv_chance = int(config.get(
         'LLMChatter.Memory'
-        '.AchievementGenerationChance', 35
+        '.AchievementGenerationChance', 60
     ))
     mc = db.cursor(dictionary=True)
     mc.execute(
@@ -1104,16 +1640,20 @@ def _achievement_post_success(db, ctx, message):
         (group_id,),
     )
     all_bots = mc.fetchall()
-    for ab in all_bots:
+    for ab in pick_event_bots(config, all_bots):
         if random.random() * 100 >= achv_chance:
             continue
+        earner = (
+            "I" if int(ab['bot_guid']) == achiever_guid
+            else achiever_name
+        )
         try:
             queue_memory(
                 config, group_id,
                 ab['bot_guid'], 0,
                 memory_type='achievement',
                 event_context=(
-                    f"Earned achievement:"
+                    f"{earner} earned recognition for:"
                     f" {achievement_name}"
                 ),
                 bot_name=ab['bot_name'],
@@ -1184,6 +1724,56 @@ def process_group_achievement_event(
         return True
     batched_names = batch_result
 
+    # BG: always use the BG prompt (the generic one has
+    # no score/flag/faction context), spoken by a bot
+    # in the player's sub-group.
+    if extra_data.get('is_battleground'):
+        # The same BG achievement ("Know Thy Enemy") is
+        # earned by bot after bot; comment on it again
+        # only after the repeat window.
+        repeat = _burst_reserve(
+            'bg_achievement:' + str(achievement_name),
+            config, extra_data,
+            'LLMChatter.BGChatter.AchievementRepeatWindowSec',
+            300, boss_passes=False,
+        )
+        if repeat is None:
+            _mark_event(db, event_id, 'skipped')
+            return False
+        # Early in a BG everyone earns HK achievements
+        # at once; voice at most one per window.
+        reservation = _burst_reserve(
+            'bg_achievement', config, extra_data,
+            'LLMChatter.BGChatter.AchievementCooldownSec',
+            45, boss_passes=False,
+        )
+        if reservation is None:
+            _burst_finish(repeat, False)
+            _mark_event(db, event_id, 'skipped')
+            return False
+        if batched_names:
+            extra_data['achiever_name'] = format_name_list(
+                batched_names)
+            extra_data['achiever_count'] = len(batched_names)
+        extra_data['event_type'] = (
+            'bot_group_achievement')
+        result = False
+        try:
+            result = bool(fire_subgroup_worker(
+                db, client, config,
+                event, extra_data,
+                prompt_fn=build_bg_achievement_prompt,
+                label='reaction_achievement',
+            ))
+        finally:
+            _burst_finish(reservation, result)
+            _burst_finish(repeat, result)
+        _mark_event(
+            db, event_id,
+            'completed' if result else 'skipped',
+        )
+        return result
+
     # Pick a different bot to react
     reactor_data = get_other_group_bot(
         db, group_id, achiever_guid,
@@ -1197,22 +1787,6 @@ def process_group_achievement_event(
             db, group_id, achiever_guid,
         )
         if not trait_data:
-            if extra_data.get('is_battleground'):
-                extra_data['event_type'] = (
-                    'bot_group_achievement')
-                result = dual_worker_dispatch(
-                    db, client, config,
-                    event, extra_data,
-                    subgroup_prompt_fn=(
-                        build_bg_achievement_prompt),
-                    raid_prompt_fn=None,
-                )
-                _mark_event(
-                    db, event_id,
-                    'completed' if result
-                    else 'skipped',
-                )
-                return result
             _mark_event(db, event_id, 'skipped')
             return False
         reactor_guid = achiever_guid
@@ -1251,6 +1825,7 @@ def process_group_achievement_event(
         event_type_label='bot_group_achievement',
         extract_fields=lambda ed: {
             'achiever_name': achiever_name,
+            'achiever_guid': achiever_guid,
             'achievement_name': achievement_name,
             'is_bot': is_bot,
             'batched_names': batched_names,
@@ -1369,6 +1944,67 @@ def process_group_resurrect_event(
         label='reaction_rez',
     )
 
+def _place_background(zone_id, area_id, map_id, zone_name=''):
+    """Descriptions of the zone (the instance, inside one) and
+    the subzone for a memory's background block; empty when
+    none is known."""
+    zone = get_zone_name(zone_id) or zone_name or 'the region'
+    lines = []
+    zone_desc = get_dungeon_flavor(map_id) or get_zone_flavor(zone_id)
+    if zone_desc:
+        lines.append(f"About {zone}: {zone_desc}")
+    if area_id and area_id != zone_id:
+        subzone_lore = get_subzone_lore(zone_id, area_id)
+        if subzone_lore:
+            subzone = get_subzone_name(zone_id, area_id) or 'this place'
+            lines.append(f"About {subzone}: {subzone_lore}")
+    return lines
+
+
+def _travelled_as_ghost(extra_data, bot_guid):
+    """True when the player or the bot keeping the memory is dead:
+    a ghost running back to its body is not travelling with the
+    party, and a quiet moment on the road never happened."""
+    if extra_data.get('player_dead'):
+        return True
+    dead = extra_data.get('dead_bot_guids') or []
+    return int(bot_guid) in {int(guid) for guid in dead}
+
+
+def _ambient_memory_context(db, zone_id, area_id, map_id, zone_name):
+    """The facts an ambient memory may record: where the
+    party travels, and the time of day, season and live
+    weather. Nothing else happened, so the memory prompt
+    must not invent an incident."""
+    from chatter_group import get_recent_weather
+    from chatter_prompts import (
+        get_season_context, get_time_of_day_context,
+    )
+    place = format_location_label(zone_id, area_id) or zone_name
+    in_instance = get_dungeon_flavor(map_id) is not None
+    facts = []
+    # Indoor instances have no sky; open-air ones keep time
+    # and season but never weather, as in the other prompts.
+    # Unlike the chat prompts, every known fact goes in: the
+    # memory may record nothing else.
+    if not in_instance or instance_has_sky(map_id):
+        facts.append(f"Time of day: {get_time_of_day_context()[1]}")
+        facts.append(f"Season: {get_season_context()[1]}")
+        if zone_id and not in_instance:
+            try:
+                weather = get_recent_weather(db, zone_id)
+            except Exception:
+                weather = None
+                logger.debug(
+                    "ambient weather lookup failed", exc_info=True)
+            if weather:
+                facts.append(f"Current weather: {weather}")
+    context = f"Travelling through {place}; nothing else happened"
+    if facts:
+        context += ". " + "; ".join(facts)
+    return context
+
+
 def process_group_zone_transition_event(
     db, client, config, event
 ):
@@ -1481,6 +2117,13 @@ def process_group_zone_transition_event(
         'race': get_race_name(char_row['race']),
         'level': char_row['level'],
         'gender': get_gender_label(char_row['gender']),
+        'guild_name': get_character_guild_name(
+            db, bot_guid
+        ),
+        'gear': build_gear_context(
+            db, bot_guid,
+            get_class_name(char_row['class']), config,
+        ),
     }
 
 
@@ -1514,6 +2157,18 @@ def process_group_zone_transition_event(
             player_name=player_name,
             solo_bot=solo_bot,
         )
+        prompt = with_party_genders(
+            prompt, db, group_id, bot['name'],
+        )
+        # Backstory (roleplay only, config-gated), as in
+        # the shared reaction pipeline.
+        zt_backstory = party_reaction_backstory(
+            config, trait_data.get('backstory'), mode,
+        )
+        if zt_backstory:
+            prompt += (
+                f"\n{format_backstory_block(zt_backstory, mode)}"
+            )
 
         # Use raid chat in raid instances so all
         # sub-groups see the message
@@ -1558,19 +2213,26 @@ def process_group_zone_transition_event(
         try:
             ambient_chance = int(config.get(
                 'LLMChatter.Memory.AmbientChance',
-                15,
+                20,
             ))
+            # A travel memory needs to know the place it
+            # records; with no description, none is kept.
+            place_background = _place_background(
+                zone_id, area_id, map_id, zone_name,
+            )
             if (
                 ambient_chance > 0
+                and place_background
+                and not _travelled_as_ghost(extra_data, bot_guid)
                 and random.randint(1, 100)
                     <= ambient_chance
             ):
                 queue_memory(
                     config, group_id, bot_guid, 0,
                     memory_type='ambient',
-                    event_context=(
-                        f"Traveling through "
-                        f"{zone_name}"
+                    event_context=_ambient_memory_context(
+                        db, zone_id, area_id, map_id,
+                        zone_name,
                     ),
                     bot_name=bot_name,
                     bot_class=bot['class'],
@@ -1578,6 +2240,7 @@ def process_group_zone_transition_event(
                     bot_gender=bot.get(
                         'gender', ''
                     ),
+                    background=place_background,
                 )
         except Exception:
             logger.error(
@@ -1614,6 +2277,23 @@ def process_group_quest_accept_event(
     if not extra_data:
         _mark_event(db, event_id, 'skipped')
         return False
+
+    # Localize quest_name in-place (Blizzard-localized
+    # title from quest_template_locale) so every
+    # downstream consumer -- conversation path, memory
+    # context, and the fallback single-reaction prompt --
+    # picks it up automatically via this same extra_data
+    # dict (safe no-op when quest_id is missing or the
+    # configured language has no locale mapping).
+    quest_id_for_locale = int(
+        extra_data.get('quest_id', 0)
+    )
+    if quest_id_for_locale:
+        extra_data['quest_name'] = localize_quest_name(
+            db, extra_data.get(
+                'quest_name', 'a quest'),
+            quest_id_for_locale,
+        )
 
     conv_chance = int(config.get(
         'LLMChatter.GroupChatter'
@@ -1675,11 +2355,15 @@ def process_group_quest_accept_event(
 
     # -- Fall through to statement via pipeline --
     def _extract(ed):
+        acceptor = ed.get(
+            'acceptor_name',
+            ed.get('bot_name', 'someone'),
+        )
+        details, objectives = _quest_prompt_texts(
+            db, ed, acceptor,
+        )
         return {
-            'acceptor_name': ed.get(
-                'acceptor_name',
-                ed.get('bot_name', 'someone'),
-            ),
+            'acceptor_name': acceptor,
             'quest_name': ed.get(
                 'quest_name', 'a quest',
             ),
@@ -1687,12 +2371,8 @@ def process_group_quest_accept_event(
                 ed.get('quest_level', 0)
             ),
             'zone_name': zone_name,
-            'quest_details': ed.get(
-                'quest_details', '',
-            ),
-            'quest_objectives': ed.get(
-                'quest_objectives', '',
-            ),
+            'quest_details': details,
+            'quest_objectives': objectives,
         }
 
     def _build(ctx):
@@ -1716,6 +2396,7 @@ def process_group_quest_accept_event(
                 ),
                 stored_tone=ctx['stored_tone'],
                 zone_id=ctx.get('zone_id', 0),
+                area_id=ctx.get('area_id', 0),
             )
         )
 
@@ -1787,12 +2468,166 @@ def process_group_quest_accept_batch_event(
                 stored_tone=ctx['stored_tone'],
                 zone_id=ctx['extra_data'].get(
                     'zone_id', 0),
+                area_id=ctx['area_id'],
             )
         ),
+        needs_map_id=True,
         delay_seconds=2,
         mood_key='quest',
         label='reaction_quest_accept',
     )
+
+
+def _race_class_of(db, guid, name):
+    """'Dwarf Priest' for a character, or ''.
+
+    The name is the fallback key when an event carries no guid
+    (events queued before level-ups sent leveler_guid).
+    """
+    if not guid and name:
+        found = get_character_info_by_name(db, name)
+        guid = found['guid'] if found else 0
+    if not guid:
+        return ''
+    info = _build_bot_from_db(db, guid, name)
+    if not info:
+        return ''
+    return f"{info['race']} {info['class']}"
+
+
+def _pick_group_speaker(db, group_id):
+    """A random bot (bot_guid, bot_name) of the group, or None."""
+    if not group_id:
+        return None
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT bot_guid, bot_name FROM llm_group_bot_traits "
+        "WHERE group_id = %s",
+        (group_id,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    return random.choice(rows) if rows else None
+
+
+def process_group_discovery_event(db, client, config, event):
+    """Handle a bot_group_discovery event: the real player
+    discovered a new subzone while grouped with bots.
+
+    Memory only, no chat line. Bots that were near the
+    player at that moment (C++ nearby_bot_guids, within
+    about 100 yards), when both they and the player are at
+    least DiscoveryMinLevel, remember discovering the place
+    together, with the zone and subzone descriptions as
+    background. Capital cities and subzones without a
+    description are skipped.
+    """
+    event_id = event['id']
+    extra_data = parse_extra_data(
+        event.get('extra_data'), event_id,
+        'bot_group_discovery',
+    ) or {}
+    try:
+        queue_discovery_memories(db, config, extra_data)
+    except Exception:
+        logger.error(
+            "discovery memory failed event=%s", event_id,
+            exc_info=True,
+        )
+    _mark_event(db, event_id, 'completed')
+    return True
+
+
+def queue_discovery_memories(db, config, extra_data) -> int:
+    """Queue discovery memories; returns how many bots got
+    one queued."""
+    if not int(config.get('LLMChatter.Memory.Enable', 1)):
+        return 0
+    try:
+        group_id = int(extra_data.get('group_id') or 0)
+        zone_id = int(extra_data.get('zone_id') or 0)
+        area_id = int(extra_data.get('area_id') or 0)
+        player_level = int(extra_data.get('player_level') or 0)
+        player_guid = int(extra_data.get('player_guid') or 0)
+    except (TypeError, ValueError):
+        return 0
+    min_level = int(config.get(
+        'LLMChatter.Memory.DiscoveryMinLevel', 15))
+    if not group_id or not zone_id or not area_id:
+        return 0
+    if player_level < min_level or zone_id in CAPITAL_CITY_ZONES:
+        return 0
+    try:
+        nearby = {
+            int(g) for g in (extra_data.get('nearby_bot_guids') or [])
+        }
+    except (TypeError, ValueError):
+        nearby = set()
+    if not nearby:
+        return 0
+    subzone_lore = get_subzone_lore(zone_id, area_id)
+    if not subzone_lore:
+        return 0
+    subzone = (
+        get_subzone_name(zone_id, area_id)
+        or extra_data.get('area_name') or 'a new place'
+    )
+    zone = get_zone_name(zone_id) or 'the region'
+    player_name = extra_data.get('player_name') or 'the player'
+    background = _place_background(
+        zone_id, area_id, int(extra_data.get('map_id') or 0),
+    )
+
+    # Rolls first: no DB work unless a bot will remember.
+    chance = int(config.get(
+        'LLMChatter.Memory.DiscoveryGenerationChance', 60))
+    chosen = [
+        g for g in pick_event_bots(config, sorted(nearby))
+        if random.random() * 100 < chance
+    ]
+    if not chosen:
+        return 0
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT t.bot_guid, t.bot_name,"
+        " c.class, c.race, c.gender, c.level"
+        " FROM llm_group_bot_traits t"
+        " JOIN characters c ON c.guid = t.bot_guid"
+        " WHERE t.group_id = %s AND t.bot_guid IN ("
+        + ','.join(['%s'] * len(chosen)) + ")",
+        (group_id, *chosen),
+    )
+    # The worldserver already sends only bots of the minimum
+    # level; an older payload may not.
+    bots = [
+        b for b in cursor.fetchall()
+        if int(b.get('level') or 0) >= min_level
+    ]
+    cursor.close()
+    if not bots:
+        return 0
+    # One per discovery, not per bot, against the session cap.
+    if not claim_discovery(group_id, int(config.get(
+            'LLMChatter.Memory.MaxDiscoveriesPerSession', 3))):
+        return 0
+    queued = 0
+    for bot in bots:
+        queue_memory(
+            config, group_id, bot['bot_guid'], player_guid,
+            memory_type='discovery',
+            event_context=(
+                f"{player_name} discovered {subzone} in {zone}, "
+                f"and I was there with them"
+            ),
+            bot_name=bot['bot_name'],
+            bot_class=get_class_name(bot['class']),
+            bot_race=get_race_name(bot['race']),
+            bot_gender=get_gender_label(bot.get('gender') or 0),
+            player_name=player_name,
+            background=background,
+        )
+        queued += 1
+    return queued
 
 
 def process_group_dungeon_entry_event(
@@ -1800,11 +2635,25 @@ def process_group_dungeon_entry_event(
 ):
     """Handle a bot_group_dungeon_entry event.
 
-    The bot that entered a dungeon or raid instance
-    reacts in party chat.
+    A bot in the group reacts in party chat when the
+    real player enters a dungeon or raid instance.
     """
+    extra_data = parse_extra_data(
+        event.get('extra_data'), event['id'],
+        'bot_group_dungeon_entry',
+    )
+    # C++ queues this on the player's entry and names no
+    # speaker, so pick one of the group's bots.
+    if extra_data and not extra_data.get('bot_guid'):
+        speaker = _pick_group_speaker(
+            db, int(extra_data.get('group_id', 0) or 0),
+        )
+        if speaker:
+            extra_data['bot_guid'] = speaker['bot_guid']
+            extra_data['bot_name'] = speaker['bot_name']
     return run_group_handler(
         db, client, config, event,
+        pre_parsed_extra=extra_data,
         event_type_label='bot_group_dungeon_entry',
         extract_fields=lambda ed: {
             'dungeon_map_id': int(
@@ -1832,7 +2681,36 @@ def process_group_dungeon_entry_event(
         delay_seconds=lambda ctx: random.randint(
             2, 4),
         inject_mood=False,
+        post_success=_dungeon_entry_memory,
         label='reaction_dungeon_entry',
+    )
+
+
+def _dungeon_entry_memory(db, ctx, message):
+    """Memory: the reacting bot remembers entering the
+    instance, once per session (joining inside one may
+    already have recorded it)."""
+    config = ctx['config']
+    map_id = int(ctx.get('dungeon_map_id') or 0)
+    dungeon = get_dungeon_flavor(map_id)
+    if not dungeon:
+        return
+    chance = int(config.get(
+        'LLMChatter.Memory.DungeonGenerationChance', 60
+    ))
+    if random.random() * 100 >= chance:
+        return
+    if not claim_dungeon_memory(
+            ctx['group_id'], ctx['bot_guid'], map_id):
+        return
+    queue_memory(
+        config, ctx['group_id'], ctx['bot_guid'], 0,
+        memory_type='dungeon',
+        event_context=f"Entered {dungeon.split(':')[0]}",
+        bot_name=ctx['bot_name'],
+        bot_class=ctx['bot']['class'],
+        bot_race=ctx['bot']['race'],
+        bot_gender=ctx['bot'].get('gender', ''),
     )
 
 def _wipe_post_success(db, ctx, message):
@@ -1892,6 +2770,8 @@ def process_group_wipe_event(
                     ctx['speaker_talent']),
                 stored_tone=ctx['stored_tone'],
                 map_id=ctx['map_id'],
+                zone_id=ctx['zone_id'],
+                area_id=ctx['area_id'],
             )
         ),
         needs_map_id=True,
@@ -1942,8 +2822,11 @@ def process_group_corpse_run_event(
                     ctx['speaker_talent']),
                 stored_tone=ctx['stored_tone'],
                 map_id=ctx['evt_map_id'],
+                zone_id=ctx['zone_id'],
+                area_id=ctx['area_id'],
             )
         ),
+        needs_map_id=True,
         needs_reactor_from_db=True,
         delay_seconds=2,
         inject_mood=False,
@@ -2144,6 +3027,7 @@ def process_group_nearby_object_event(
                 subzone_lore=subzone_lore,
                 zone_meta=zone_meta,
                 map_id=map_id,
+                zone_flavor=zf,
             )
             if ok:
                 return True
@@ -2165,6 +3049,7 @@ def process_group_nearby_object_event(
             'in_city': in_city,
             'in_dungeon': in_dungeon,
             'subzone_lore': subzone_lore,
+            'zone_flavor': zf,
             'rich_zone_meta': zone_meta,
             'obj_map_id': map_id,
         }
@@ -2201,6 +3086,7 @@ def process_group_nearby_object_event(
                 ),
                 map_id=ctx['obj_map_id'],
                 stored_tone=ctx['stored_tone'],
+                zone_flavor=ctx['zone_flavor'],
             )
         )
         if ctx['speaker_talent']:
@@ -2233,6 +3119,7 @@ def _nearby_object_conversation(
     subzone_lore=None,
     zone_meta=None,
     map_id=0,
+    zone_flavor=None,
 ):
     """Run a multi-bot conversation about nearby
     objects. Returns True on success."""
@@ -2259,7 +3146,8 @@ def _nearby_object_conversation(
         # Look up guid + traits from the traits table
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT bot_guid, trait1, trait2, trait3
+            SELECT bot_guid, trait1, trait2, trait3,
+                   tone, backstory
             FROM llm_group_bot_traits
             WHERE group_id = %s
                 AND bot_name = %s
@@ -2284,18 +3172,27 @@ def _nearby_object_conversation(
             continue
         bots.append({
             'name': name,
+            'guid': guid,
+            'tone': row.get('tone'),
+            'backstory': row.get('backstory'),
             'class': get_class_name(
                 char['class']
             ),
             'race': get_race_name(char['race']),
             'level': char['level'],
             'gender': get_gender_label(char['gender']),
+            'guild_name': get_character_guild_name(
+                db, guid
+            ),
         })
 
     if len(bots) < 2:
         # Not enough bots — fall back to skipped
         _mark_event(db, event_id, 'skipped')
         return False
+
+    _gate_conversation_backstories(bots, config, mode)
+    attach_speaker_gear(db, bots, config)
 
     bot_names = [b['name'] for b in bots]
     num_bots = len(bots)
@@ -2320,11 +3217,15 @@ def _nearby_object_conversation(
         speaker_talent_context=speaker_talent,
         subzone_lore=subzone_lore,
         map_id=map_id,
+        zone_flavor=zone_flavor,
+    )
+    prompt = with_party_genders(
+        prompt, db, group_id, '',
     )
 
     # Scale tokens with number of bots
     max_tokens = int(config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     ))
     conv_tokens = min(
         max_tokens * (1 + num_bots), 1000
@@ -2374,8 +3275,7 @@ def _nearby_object_conversation(
         )
         if not text:
             continue
-        if len(text) > 255:
-            text = text[:252] + "..."
+        text = shorten_chat_message(text)
 
         speaker_guid = bot_guids.get(
             msg['name']
@@ -2413,6 +3313,69 @@ def _nearby_object_conversation(
     return True
 
 
+def _bound_brief_player_conversation(
+    messages, fallback_messages,
+):
+    """Bound every selected speaker without losing the conversation."""
+    repaired_by_name = {
+        message.get('name'): message
+        for message in messages
+    }
+    bounded = []
+    for fallback in fallback_messages:
+        message = repaired_by_name.get(
+            fallback.get('name'), fallback
+        )
+        text, emote = bound_brief_casual_response(
+            str(message.get('message') or ''),
+            message.get('emote'),
+            str(fallback.get('message') or ''),
+            fallback.get('emote'),
+        )
+        updated = dict(message)
+        updated['message'] = text
+        updated['emote'] = emote
+        bounded.append(updated)
+    return bounded
+
+
+def _first_line_per_speaker(messages):
+    """Keep each speaker's first parsed line, in order.
+
+    The prompt asks every bot to speak exactly once; this enforces it
+    on the parsed reply before any repair or bounding, so the line that
+    survives is always the speaker's first one. Lines are dropped
+    whole, never cut.
+    """
+    seen = set()
+    kept = []
+    for message in messages:
+        name = message.get('name')
+        if name in seen:
+            continue
+        seen.add(name)
+        kept.append(message)
+    if len(kept) < len(messages):
+        logger.info(
+            "player_msg_conv: dropped %d extra line(s) "
+            "from repeated speakers",
+            len(messages) - len(kept),
+        )
+    return kept
+
+
+def _delivered_speech_key(text):
+    """Normalised spoken text of a final, cleaned line.
+
+    Compares what players will read: the leading *action* that
+    delivery sends as a separate /e is ignored, as are case,
+    punctuation and spacing. Returns '' when there is no speech.
+    """
+    spoken, _ = split_action_prefix(text or '')
+    words = re.sub(r'[^\w\s]', '', (spoken or '').lower()).split()
+    return ' '.join(words)
+
+
 def execute_player_msg_conversation(
     db, client, config, event_id,
     group_id, addressed_bot, all_bots,
@@ -2421,6 +3384,8 @@ def execute_player_msg_conversation(
     item_context="", link_context="",
     items_info=None,
     zone_id=0, area_id=0, map_id=0,
+    brief_casual=False,
+    bg_context=None,
 ):
     """Run a multi-bot conversation responding to
     a player's party chat message.
@@ -2501,12 +3466,17 @@ def execute_player_msg_conversation(
         bots.append({
             'name': name,
             'guid': guid,
+            'tone': row.get('tone'),
+            'backstory': row.get('backstory'),
             'class': get_class_name(
                 char['class']
             ),
             'race': get_race_name(char['race']),
             'level': char['level'],
             'gender': get_gender_label(char['gender']),
+            'guild_name': get_character_guild_name(
+                db, guid
+            ),
             'travel_mode': travel_state.get('mode') or '',
             'travel_context': travel_context,
             'travel_state': travel_state,
@@ -2514,6 +3484,11 @@ def execute_player_msg_conversation(
 
     if len(bots) < 2:
         return False
+
+    _gate_conversation_backstories(
+        bots, config, mode, skip=brief_casual,
+    )
+    attach_speaker_gear(db, bots, config)
 
     bot_names = [b['name'] for b in bots]
     num_bots = len(bots)
@@ -2554,15 +3529,36 @@ def execute_player_msg_conversation(
         link_context=link_context,
         speaker_talent_context=speaker_talent,
         target_talent_context=target_talent,
+        allow_action=not brief_casual,
         zone_id=zone_id,
         area_id=area_id,
         map_id=map_id,
+        brief_casual=brief_casual,
+        guild_notes=[
+            note for note in (
+                same_guild_note(
+                    db, b['guid'],
+                    player_info['guid'] if player_info else 0,
+                    player_name, bot_name=b['name'],
+                )
+                for b in bots
+            ) if note
+        ],
+        player_context=player_context_text(
+            db, player_info['guid'] if player_info else 0,
+            player_name, mode,
+        ),
+        bg_context=bg_context,
+        thread_context=render_for_player_reply(group_id, db),
+    )
+    prompt = with_party_genders(
+        prompt, db, group_id, '',
     )
 
     # Token budget: max_tokens * (1 + num_bots),
     # capped at 1000
     max_tokens = int(config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     ))
     conv_tokens = min(
         max_tokens * (1 + num_bots), 1000
@@ -2609,33 +3605,69 @@ def execute_player_msg_conversation(
     if not response:
         return False
 
-    messages = parse_conversation_response(
-        response, bot_names
-    )
+    messages = _first_line_per_speaker(parse_conversation_response(
+        response, bot_names,
+        allow_emote_only=brief_casual,
+    ))
     if not messages:
         return False
+    brief_fallback_messages = messages
+    if brief_casual and not all(
+        brief_casual_response_fits(
+            str(message.get('message') or ''),
+            message.get('emote'),
+        )
+        for message in messages
+    ):
+        repair_meta = dict(pmsg_meta)
+        repair_meta['brief_casual_repair'] = True
+        response = call_llm(
+            client,
+            build_brief_casual_repair_prompt(prompt),
+            config,
+            max_tokens_override=conv_tokens,
+            context=f"pmsg-conv-brief-repair:{names_ctx}",
+            label='group_player_msg_conv',
+            metadata=repair_meta,
+        )
+        messages = _first_line_per_speaker(parse_conversation_response(
+            response or '',
+            bot_names,
+            allow_emote_only=True,
+        ))
+    if brief_casual:
+        messages = _bound_brief_player_conversation(
+            messages, brief_fallback_messages
+        )
+        # A line that runs over its band is kept whole, not cut, so only
+        # an empty line (with no emote either) is unusable.
+        if not all(
+            str(message.get('message') or '').strip()
+            or message.get('emote')
+            for message in messages
+        ):
+            return False
 
-
-    # Insert messages with staggered delivery.
-    # Player msg conversations use responsive
-    # timing — player is actively waiting.
     strip_conversation_actions(
         messages, label='player_msg_conv'
     )
-    cumulative_delay = 2.0
-    prev_len = 0
-    for seq, msg in enumerate(messages):
-        msg_text = msg['message']
+    # Build the final lines first so a word-for-word copy of an
+    # earlier line is judged on what players would actually read.
+    # Copies are dropped whole; emote-only lines are never compared.
+    prepared = []
+    seen_speech = set()
+    for msg in messages:
         text = strip_speaker_prefix(
-            msg_text, msg['name']
+            msg['message'], msg['name']
         )
         text = cleanup_message(
             text, action=msg.get('action')
         )
-        if not text:
+        emote = msg.get('emote')
+        if not text and not emote:
             continue
-        if len(text) > 255:
-            text = text[:252] + "..."
+        if text:
+            text = shorten_chat_message(text)
 
         speaker_guid = bot_guids.get(
             msg['name']
@@ -2643,6 +3675,27 @@ def execute_player_msg_conversation(
         if not speaker_guid:
             continue
 
+        speech_key = _delivered_speech_key(text)
+        if speech_key and speech_key in seen_speech:
+            logger.info(
+                "player_msg_conv: dropped copied line from %s",
+                msg['name'],
+            )
+            continue
+        if speech_key:
+            seen_speech.add(speech_key)
+        prepared.append((msg['name'], speaker_guid, text, emote))
+
+    # A lone survivor is delivered as a single reply; nothing left
+    # falls back to the single-bot path.
+    if not prepared:
+        return False
+
+    # Insert messages with staggered delivery.
+    # Player msg conversations use responsive
+    # timing — player is actively waiting.
+    cumulative_delay = 2.0
+    for seq, (name, speaker_guid, text, emote) in enumerate(prepared):
         if seq > 0:
             # Skip prev_message_length — all msgs
             # were generated in one LLM call, no
@@ -2653,9 +3706,8 @@ def execute_player_msg_conversation(
             )
             cumulative_delay += delay
 
-        emote = msg.get('emote')
         insert_chat_message(
-            db, speaker_guid, msg['name'],
+            db, speaker_guid, name,
             text, channel='party',
             delay_seconds=cumulative_delay,
             event_id=event_id, sequence=seq,
@@ -2667,9 +3719,9 @@ def execute_player_msg_conversation(
         )
         _store_chat(
             db, group_id, speaker_guid,
-            msg['name'], True, text,
+            name, True,
+            text or f"[performed /{emote}]",
         )
-        prev_len = len(text)
 
     return True
 
@@ -2678,8 +3730,19 @@ def execute_player_msg_conversation(
 # QUEST CONVERSATION HELPERS
 # ============================================================
 
+def _gate_conversation_backstories(bots, config, mode, skip=False):
+    """Keep each speaker's backstory only when the roleplay-only
+    Backstory.PartyReactionChance gate passes for that speaker."""
+    for bot in bots:
+        bot['backstory'] = (
+            '' if skip else party_reaction_backstory(
+                config, bot.get('backstory'), mode,
+            )
+        )
+
+
 def _quest_conversation_pick_bots(
-    db, group_id, reactor_name, members,
+    db, group_id, reactor_name, members, config=None,
 ):
     """Pick 2-3 bots for a quest conversation.
     Reactor is always included. Returns
@@ -2704,7 +3767,8 @@ def _quest_conversation_pick_bots(
     for name in picked:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
-            SELECT bot_guid, trait1, trait2, trait3
+            SELECT bot_guid, trait1, trait2, trait3,
+                   tone, backstory
             FROM llm_group_bot_traits
             WHERE group_id = %s
                 AND bot_name = %s
@@ -2728,16 +3792,27 @@ def _quest_conversation_pick_bots(
             continue
         bots.append({
             'name': name,
+            'guid': guid,
+            'tone': row.get('tone'),
+            'backstory': row.get('backstory'),
             'class': get_class_name(
                 char['class']
             ),
             'race': get_race_name(char['race']),
             'level': char['level'],
             'gender': get_gender_label(char['gender']),
+            'guild_name': get_character_guild_name(
+                db, guid
+            ),
         })
 
     if len(bots) < 2:
         return None
+
+    _gate_conversation_backstories(
+        bots, config, get_chatter_mode(config or {}),
+    )
+    attach_speaker_gear(db, bots, config)
 
     return bots, traits_map, bot_guids
 
@@ -2765,8 +3840,7 @@ def _quest_conversation_deliver(
         )
         if not text:
             continue
-        if len(text) > 255:
-            text = text[:252] + "..."
+        text = shorten_chat_message(text)
 
         speaker_guid = bot_guids.get(
             msg['name']
@@ -2813,7 +3887,7 @@ def _quest_complete_conversation(
     to fall back to statement path.
     """
     result = _quest_conversation_pick_bots(
-        db, group_id, reactor_name, members,
+        db, group_id, reactor_name, members, config,
     )
     if not result:
         return False
@@ -2822,7 +3896,7 @@ def _quest_complete_conversation(
     mode = get_chatter_mode(config)
     history = _get_recent_chat(db, group_id)
     chat_hist = format_chat_history(history)
-    zone_id, _, _ = get_group_location(
+    zone_id, area_id, _ = get_group_location(
         db, group_id
     )
 
@@ -2835,11 +3909,8 @@ def _quest_complete_conversation(
             config, quest_id
         )
 
-    quest_details = extra_data.get(
-        'quest_details', ''
-    )
-    quest_objectives = extra_data.get(
-        'quest_objectives', ''
+    quest_details, quest_objectives = _quest_prompt_texts(
+        db, extra_data, completer_name,
     )
 
     msg_count = max(
@@ -2864,12 +3935,16 @@ def _quest_complete_conversation(
         msg_count=msg_count,
         speaker_talent_context=speaker_talent,
         zone_id=zone_id,
+        area_id=area_id,
+    )
+    prompt = with_party_genders(
+        prompt, db, group_id, '',
     )
 
     num_bots = len(bots)
     bot_names = [b['name'] for b in bots]
     max_tokens = int(config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     ))
     conv_tokens = min(
         max_tokens * (1 + num_bots), 1000
@@ -2917,7 +3992,7 @@ def _quest_objectives_conversation(
     success, False to fall back to statement path.
     """
     result = _quest_conversation_pick_bots(
-        db, group_id, reactor_name, members,
+        db, group_id, reactor_name, members, config,
     )
     if not result:
         return False
@@ -2926,15 +4001,12 @@ def _quest_objectives_conversation(
     mode = get_chatter_mode(config)
     history = _get_recent_chat(db, group_id)
     chat_hist = format_chat_history(history)
-    zone_id, _, _ = get_group_location(
+    zone_id, area_id, _ = get_group_location(
         db, group_id
     )
 
-    quest_details = extra_data.get(
-        'quest_details', ''
-    )
-    quest_objectives = extra_data.get(
-        'quest_objectives', ''
+    quest_details, quest_objectives = _quest_prompt_texts(
+        db, extra_data, completer_name,
     )
 
     msg_count = max(
@@ -2959,13 +4031,17 @@ def _quest_objectives_conversation(
             msg_count=msg_count,
             speaker_talent_context=speaker_talent,
             zone_id=zone_id,
+            area_id=area_id,
         )
+    )
+    prompt = with_party_genders(
+        prompt, db, group_id, '',
     )
 
     num_bots = len(bots)
     bot_names = [b['name'] for b in bots]
     max_tokens = int(config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     ))
     conv_tokens = min(
         max_tokens * (1 + num_bots), 1000
@@ -3013,7 +4089,7 @@ def _quest_accept_conversation(
     success, False to fall back to statement path.
     """
     result = _quest_conversation_pick_bots(
-        db, group_id, reactor_name, members,
+        db, group_id, reactor_name, members, config,
     )
     if not result:
         return False
@@ -3023,11 +4099,8 @@ def _quest_accept_conversation(
     history = _get_recent_chat(db, group_id)
     chat_hist = format_chat_history(history)
 
-    quest_details = extra_data.get(
-        'quest_details', ''
-    )
-    quest_objectives = extra_data.get(
-        'quest_objectives', ''
+    quest_details, quest_objectives = _quest_prompt_texts(
+        db, extra_data, acceptor_name,
     )
 
     msg_count = max(
@@ -3039,7 +4112,7 @@ def _quest_accept_conversation(
         bots[0]['class'] if bots else '',
         reactor_name,
     )
-    zone_id, _, _ = get_group_location(
+    zone_id, area_id, _ = get_group_location(
         db, group_id
     )
     prompt = build_quest_accept_conversation_prompt(
@@ -3056,12 +4129,16 @@ def _quest_accept_conversation(
         msg_count=msg_count,
         speaker_talent_context=speaker_talent,
         zone_id=zone_id,
+        area_id=area_id,
+    )
+    prompt = with_party_genders(
+        prompt, db, group_id, '',
     )
 
     num_bots = len(bots)
     bot_names = [b['name'] for b in bots]
     max_tokens = int(config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     ))
     conv_tokens = min(
         max_tokens * (1 + num_bots), 1000

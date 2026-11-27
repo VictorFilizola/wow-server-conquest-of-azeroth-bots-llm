@@ -11,14 +11,26 @@ import re
 
 from chatter_constants import (
     EVENT_DESCRIPTIONS, CLASS_NAMES, RACE_NAMES,
+    CAPITAL_CITY_ZONES,
 )
 from chatter_shared import (
     parse_extra_data, get_zone_name,
     run_single_reaction,
+    localize_creature_name,
+    get_chatter_mode,
+    get_race_name,
 )
+from chatter_identity import prepare_channel_persona
+from chatter_persona import build_persona_block
+from chatter_player_context import character_lore_lines
 from chatter_prompts import (
     build_zone_intrusion_prompt,
 )
+from chatter_member_gender import (
+    get_character_genders,
+    get_genders_by_guid,
+)
+from chatter_party_presence import with_group_presence
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +38,17 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # EVENT CONTEXT BUILDING
 # =============================================================================
-def build_event_context(event: dict) -> str:
-    """Build context string for an event."""
+def build_event_context(
+    event: dict, db=None
+) -> str:
+    """Build context string for an event.
+
+    db: optional DB connection, used to resolve
+    Blizzard-localized creature/NPC names for the
+    world-boss/rare/creature-death branches below
+    (falls back to the plain English target_name
+    when omitted or when no locale row exists).
+    """
     event_type = event['event_type']
     extra_data = parse_extra_data(
         event.get('extra_data'),
@@ -75,29 +96,41 @@ def build_event_context(event: dict) -> str:
             )
 
     elif event_type == 'world_boss_spawn':
-        target = event.get('target_name', 'A world boss')
+        target = localize_creature_name(
+            db,
+            event.get(
+                'target_name', 'A world boss'),
+            event.get('target_entry'))
         context_parts.append(
             f"{target} has been spotted in the world!"
         )
 
     elif event_type == 'rare_spawn':
-        target = event.get(
-            'target_name', 'A rare creature'
-        )
+        target = localize_creature_name(
+            db,
+            event.get(
+                'target_name', 'A rare creature'),
+            event.get('target_entry'))
         context_parts.append(
             f"A rare creature ({target}) has appeared "
             f"nearby."
         )
 
     elif event_type == 'creature_death_boss':
-        target = event.get('target_name', 'A boss')
+        target = localize_creature_name(
+            db,
+            event.get('target_name', 'A boss'),
+            event.get('target_entry'))
         killer = extra_data.get('killer_name', 'someone')
         context_parts.append(
             f"{target} has been defeated by {killer}!"
         )
 
     elif event_type == 'creature_death_rare':
-        target = event.get('target_name', 'A rare')
+        target = localize_creature_name(
+            db,
+            event.get('target_name', 'A rare'),
+            event.get('target_entry'))
         context_parts.append(
             f"A rare creature ({target}) was just killed."
         )
@@ -150,11 +183,19 @@ def build_event_context(event: dict) -> str:
         item_name = extra_data.get(
             'item_name', 'something valuable'
         )
-        quality = extra_data.get('quality', 0)
-        quality_name = [
-            'poor', 'common', 'uncommon',
-            'rare', 'epic', 'legendary'
-        ][min(quality, 5)]
+        try:
+            quality = int(extra_data.get(
+                'item_quality', extra_data.get('quality', 0)
+            ) or 0)
+        except (TypeError, ValueError):
+            quality = 0
+        quality_names = [
+            'poor', 'common', 'uncommon', 'rare',
+            'epic', 'legendary', 'artifact', 'heirloom',
+        ]
+        quality_name = quality_names[
+            max(0, min(quality, len(quality_names) - 1))
+        ]
         context_parts.append(
             f"{subject} found a {quality_name} item: "
             f"{item_name}!"
@@ -624,17 +665,18 @@ def build_event_context(event: dict) -> str:
         zone = extra_data.get(
             'zone_name', 'the area'
         )
-        is_capital = extra_data.get(
-            'is_capital', False
-        )
-        capital_str = (
-            " (a capital city)" if is_capital
+        # Only a real city is a city: a bot intruder's
+        # payload always claimed a capital.
+        city_str = (
+            " (a city)"
+            if int(event.get('zone_id') or 0)
+            in CAPITAL_CITY_ZONES
             else ""
         )
         context_parts.append(
             f"An enemy player ({intruder}, "
             f"level {level}) has entered "
-            f"{zone}{capital_str}."
+            f"{zone}{city_str}."
         )
 
     else:
@@ -651,6 +693,27 @@ def build_event_context(event: dict) -> str:
 # =============================================================================
 # ZONE INTRUSION HANDLER
 # =============================================================================
+def _intrusion_lore(db, guid, name, race_id, class_id, outlook=True):
+    """Third-person race and class lines for one side of an
+    intrusion; empty when either is unknown.
+
+    outlook=False drops the race outlook line: the speaker's
+    race flavour already carries the same worldview.
+    """
+    try:
+        race = get_race_name(int(race_id or 0))
+        class_name = CLASS_NAMES.get(int(class_id or 0), '')
+    except (TypeError, ValueError):
+        return []
+    lines = character_lore_lines(db, guid, name, race, class_name)
+    if not outlook:
+        lines = [
+            line for line in lines
+            if not line.startswith(f"{race} outlook:")
+        ]
+    return lines
+
+
 def process_zone_intrusion_event(
     db, client, config, event
 ):
@@ -677,12 +740,67 @@ def process_zone_intrusion_event(
     if not defender_guid:
         return True
 
+    # Genders: defender by guid; the intruder is always a player
+    # character, so a name lookup is safe.
+    defender_gender = get_genders_by_guid(
+        db, [defender_guid]
+    ).get(int(defender_guid))
+    if defender_gender:
+        extra_data['defender_gender'] = defender_gender
+    intruder_name = extra_data.get('intruder_name')
+    if intruder_name:
+        intruder_gender = get_character_genders(
+            db, [intruder_name]
+        ).get(intruder_name)
+        if intruder_gender:
+            extra_data['intruder_gender'] = intruder_gender
+
+    # The defender's own voice, as in General chat.
+    persona_block = ''
+    try:
+        persona = prepare_channel_persona(
+            db, client, config, int(defender_guid),
+            defender_name, 'general',
+        )
+        persona_block = build_persona_block(
+            persona, get_chatter_mode(config)
+        )
+    except Exception:
+        logger.error(
+            "zone intrusion persona failed", exc_info=True
+        )
+
+    # Who both characters are: race outlook, class
+    # calling and their pairing.
+    lore = {
+        'defender': _intrusion_lore(
+            db, defender_guid, defender_name,
+            extra_data.get('defender_race'),
+            extra_data.get('defender_class'),
+            outlook=False,
+        ),
+        'intruder': _intrusion_lore(
+            db, event.get('subject_guid'), intruder_name,
+            extra_data.get('intruder_race'),
+            extra_data.get('intruder_class'),
+        ),
+    }
+
     # Build prompt
     prompt = build_zone_intrusion_prompt(
-        extra_data, config
+        extra_data, config,
+        zone_id=int(event.get('zone_id') or 0),
+        persona_block=persona_block,
+        lore=lore,
     )
     if not prompt:
         return True
+    # Group awareness (issue #94): a grouped defender knows its own
+    # group; the prompt is unchanged otherwise.
+    prompt = with_group_presence(
+        prompt, db, config, extra_data,
+        [(defender_guid, defender_name)], 'a yell across the zone',
+    )
 
     result = run_single_reaction(
         db,
@@ -694,7 +812,9 @@ def process_zone_intrusion_event(
         channel='yell',
         delay_seconds=2,
         event_id=event.get('id'),
-        max_tokens_override=60,
+        # Room to finish the sentence: a reply cut at the token
+        # limit would be yelled mid-word.
+        max_tokens_override=100,
         allow_emote_fallback=False,
         label='reaction_zone_intrusion',
     )

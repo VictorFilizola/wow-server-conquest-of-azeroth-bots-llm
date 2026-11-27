@@ -74,12 +74,12 @@ Pre-configured for **DeepSeek** (with custom roleplay personas for all 21 CoA cl
 LLMChatter.Provider        = openrouter
 LLMChatter.Model           = deepseek-chat
 LLMChatter.OpenRouter.BaseUrl = https://api.deepseek.com
-LLMChatter.OpenRouter.ApiKey  = "YOUR_DEEPSEEK_API_KEY"
+LLMChatter.OpenRouter.ApiKey  = YOUR_DEEPSEEK_API_KEY
 ```
 
 To switch providers:
-* **OpenAI:** `Provider = openai`, `Model = gpt-4o-mini`, `OpenAI.ApiKey = "sk-..."`
-* **Anthropic:** `Provider = anthropic`, `Model = claude-3-5-haiku-latest`, `Anthropic.ApiKey = "sk-..."`
+* **OpenAI:** `Provider = openai`, `Model = gpt-4o-mini`, `OpenAI.ApiKey = sk-...`
+* **Anthropic:** `Provider = anthropic`, `Model = claude-3-5-haiku-latest`, `Anthropic.ApiKey = sk-ant-...`
 * **Ollama (local):** `Provider = ollama`, `Model = qwen2.5:7b-instruct`, `Ollama.BaseUrl = http://host.docker.internal:11434`
 
 Restart the worldserver and bridge container after editing:

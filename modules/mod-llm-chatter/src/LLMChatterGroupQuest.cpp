@@ -87,7 +87,7 @@ void FlushQuestAcceptBatches()
                     std::to_string(
                         b.reactorGuid) + ","
                 "\"bot_name\":\"" +
-                    JsonEscape(b.reactorName)
+                    ChatterJsonEscape(b.reactorName)
                     + "\","
                 "\"bot_class\":" +
                     std::to_string(
@@ -104,10 +104,10 @@ void FlushQuestAcceptBatches()
                 "\"is_bot\":1,"
                 "\"acceptor_is_bot\":0,"
                 "\"acceptor_name\":\"" +
-                    JsonEscape(b.acceptorName)
+                    ChatterJsonEscape(b.acceptorName)
                     + "\","
                 "\"quest_name\":\"" +
-                    JsonEscape(q.questName)
+                    ChatterJsonEscape(q.questName)
                     + "\","
                 "\"quest_id\":" +
                     std::to_string(q.questId)
@@ -116,14 +116,14 @@ void FlushQuestAcceptBatches()
                     std::to_string(q.questLevel)
                     + ","
                 "\"zone_name\":\"" +
-                    JsonEscape(b.zoneName)
+                    ChatterJsonEscape(b.zoneName)
                     + "\","
                 "\"quest_details\":\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         b.firstQuestDetails)
                     + "\","
                 "\"quest_objectives\":\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         b.firstQuestObjectives)
                     + "\","
                 "\"group_id\":" +
@@ -168,7 +168,7 @@ void FlushQuestAcceptBatches()
                 if (i > 0) questNamesArr += ",";
                 questNamesArr +=
                     "\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         b.quests[i].questName) +
                     "\"";
             }
@@ -184,7 +184,7 @@ void FlushQuestAcceptBatches()
                     std::to_string(
                         b.reactorGuid) + ","
                 "\"bot_name\":\"" +
-                    JsonEscape(b.reactorName)
+                    ChatterJsonEscape(b.reactorName)
                     + "\","
                 "\"bot_class\":" +
                     std::to_string(
@@ -201,7 +201,7 @@ void FlushQuestAcceptBatches()
                 "\"is_bot\":1,"
                 "\"acceptor_is_bot\":0,"
                 "\"acceptor_name\":\"" +
-                    JsonEscape(b.acceptorName)
+                    ChatterJsonEscape(b.acceptorName)
                     + "\","
                 "\"quest_names\":" +
                     questNamesArr + ","
@@ -209,7 +209,7 @@ void FlushQuestAcceptBatches()
                     std::to_string(
                         b.quests.size()) + ","
                 "\"zone_name\":\"" +
-                    JsonEscape(b.zoneName)
+                    ChatterJsonEscape(b.zoneName)
                     + "\","
                 "\"group_id\":" +
                     std::to_string(b.groupId) +
@@ -333,7 +333,7 @@ public:
             std::string playerName =
                 player->GetName();
             std::string questName =
-                quest->GetTitle();
+                GetLocalizedQuestTitle(quest);
             uint32 zoneId = player->GetZoneId();
             std::string zoneName =
                 GetZoneName(zoneId);
@@ -342,7 +342,7 @@ public:
                 "\"bot_guid\":" +
                     std::to_string(botGuid) + ","
                 "\"bot_name\":\"" +
-                    JsonEscape(botName) + "\","
+                    ChatterJsonEscape(botName) + "\","
                 "\"bot_class\":" +
                     std::to_string(
                         reactor->getClass()) + ","
@@ -361,9 +361,9 @@ public:
                         IsPlayerBot(player)
                             ? "1" : "0") + ","
                 "\"acceptor_name\":\"" +
-                    JsonEscape(playerName) + "\","
+                    ChatterJsonEscape(playerName) + "\","
                 "\"quest_name\":\"" +
-                    JsonEscape(questName) + "\","
+                    ChatterJsonEscape(questName) + "\","
                 "\"quest_id\":" +
                     std::to_string(questId) + ","
                 "\"quest_level\":" +
@@ -371,16 +371,16 @@ public:
                         quest->GetQuestLevel())
                     + ","
                 "\"zone_name\":\"" +
-                    JsonEscape(zoneName) + "\","
+                    ChatterJsonEscape(zoneName) + "\","
                 "\"quest_details\":\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         NormalizeChatTextForDb(
-                            quest->GetDetails(), 200))
+                            GetLocalizedQuestDetails(quest), 600))
                     + "\","
                 "\"quest_objectives\":\"" +
-                    JsonEscape(
+                    ChatterJsonEscape(
                         NormalizeChatTextForDb(
-                            quest->GetObjectives(), 150))
+                            GetLocalizedQuestObjectives(quest), 300))
                     + "\","
                 "\"group_id\":" +
                     std::to_string(groupId) +
@@ -420,14 +420,14 @@ public:
         // --- Debounce path: accumulate into batch ---
         // Gather all data from game objects BEFORE
         // acquiring the mutex to minimize hold time.
-        std::string questName = quest->GetTitle();
+        std::string questName = GetLocalizedQuestTitle(quest);
         int32 questLevel = quest->GetQuestLevel();
         std::string questDetails =
             NormalizeChatTextForDb(
-                quest->GetDetails(), 200);
+                GetLocalizedQuestDetails(quest), 600);
         std::string questObjectives =
             NormalizeChatTextForDb(
-                quest->GetObjectives(), 150);
+                GetLocalizedQuestObjectives(quest), 300);
         std::string playerName = player->GetName();
 
         // Pre-select reactor outside lock (only

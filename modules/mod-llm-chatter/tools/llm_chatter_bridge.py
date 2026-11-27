@@ -17,9 +17,13 @@ This script:
 """
 
 import argparse
+import atexit
+import hashlib
 import json
 import logging
+import os
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,14 +34,13 @@ import openai
 
 import chatter_ambient
 
+from chatter_identity import config_int as profile_config_int
+from chatter_identity_jobs import prepare_guild_profiles, guild_profiles_enabled
 from chatter_constants import (
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_GOOGLE_MODEL,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_OPENROUTER_MODEL,
-    MSG_TYPE_PLAIN, MSG_TYPE_QUEST,
-    MSG_TYPE_LOOT, MSG_TYPE_QUEST_REWARD,
-    MSG_TYPE_TRADE, MSG_TYPE_SPELL,
     GOOGLE_OPENAI_BASE_URL,
     OPENROUTER_BASE_URL,
 )
@@ -46,6 +49,7 @@ from chatter_db import (
     any_real_players_online,
     cleanup_stale_groups,
     cleanup_all_session_data,
+    load_race_names,
 )
 from chatter_shared import (
     format_location_label,
@@ -53,16 +57,21 @@ from chatter_shared import (
     get_chatter_mode,
     set_race_lore_chance,
     set_race_vocab_chance,
+    set_race_class_notes_enabled,
     set_action_chance,
     set_emote_chance,
     set_language,
     get_language_label,
     is_supported_language_code,
-    parse_config, get_db_connection,
+    parse_config, parse_config_sections, format_config_for_log,
+    get_db_connection,
     parse_extra_data,
     wait_for_database,
     stagger_if_needed,
 )
+from chatter_guild_profile import get_character_guild_name
+from chatter_member_gender import attach_bot_genders
+from chatter_party_presence import note_group_event
 from chatter_events import (
     cleanup_expired_events,
     reset_stuck_processing_events,
@@ -73,17 +82,33 @@ from chatter_group import (
     check_bot_questions,
 )
 from chatter_group_state import (
+    normalize_active_group_personalities,
     regenerate_missing_identity_tones,
 )
 from chatter_general import (
     init_general_config,
     process_general_player_msg_event,
 )
-from chatter_cache import refill_precache_pool
+from chatter_cache import (
+    discard_ready_precache,
+    refill_precache_pool,
+)
 from chatter_event_registry import (
     build_handler_map,
     validate_registry,
 )
+from llm_compat import describe_model_compatibility
+from chatter_llm import (
+    compatible_reasoning_effort, log_structured_target,
+    reset_structured_diagnostics, resolve_model, check_structured_dependencies,
+    openai_compatible_client_kwargs, openai_compatible_target_error,
+)
+from chatter_letters import (
+    letters_enabled,
+    process_reactivity,
+    rumors_enabled,
+)
+from chatter_structured import structured_output_enabled
 
 # Configure logging
 logging.basicConfig(
@@ -97,6 +122,191 @@ logger = logging.getLogger(__name__)
 # (fires on every Ollama API call)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
+
+
+# =============================================================================
+# SINGLE-INSTANCE LOCK
+# =============================================================================
+# Prevents two bridge processes from accidentally running against the
+# same config/DB at once (e.g. a stray manual `nohup ... &` left
+# alongside the systemd-managed instance), which would duplicate LLM
+# calls and DB writes.
+
+
+def _resolve_runtime_dir(config=None):
+    """Pick a writable directory to hold the bridge lock file.
+
+    The lock deliberately does NOT live next to the script: the
+    documented Docker setup mounts the tools directory read-only
+    (./modules/mod-llm-chatter/tools:/app:ro), so a lock written
+    there would fail and stop the bridge from starting at all.
+
+    Order of preference: an explicit LLMChatter.RuntimeDir config
+    key, then the usual runtime/temp environment variables, then
+    the platform temp directory.
+    """
+    candidates = []
+    if config:
+        configured = str(
+            config.get('LLMChatter.RuntimeDir', '')
+        ).strip()
+        if configured:
+            candidates.append(configured)
+    for var in (
+        'LLM_CHATTER_RUNTIME_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR',
+    ):
+        value = os.environ.get(var, '').strip()
+        if value:
+            candidates.append(value)
+    candidates.append(tempfile.gettempdir())
+
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(path, os.W_OK):
+            return path
+    return tempfile.gettempdir()
+
+
+def _lock_file_path(config_path, runtime_dir):
+    """Build the lock filename for one bridge instance.
+
+    Keyed by the resolved config path so that two intentionally
+    separate bridges (different configs, different databases) can
+    run side by side without locking each other out, while two
+    launches of the SAME config still collide as intended.
+    """
+    resolved = os.path.realpath(os.path.abspath(config_path))
+    digest = hashlib.sha256(
+        resolved.encode('utf-8')
+    ).hexdigest()[:16]
+    return os.path.join(
+        runtime_dir, 'llm_chatter_bridge.%s.lock' % digest
+    )
+
+
+# Advisory whole-file locking, one backend per platform. fcntl exists
+# only on Unix and msvcrt only on Windows, so importing either one
+# unconditionally breaks the bridge on the other platform before any
+# configuration has been read.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - platform dependent
+    msvcrt = None
+
+
+def _lock_file_exclusive(handle):
+    """Take a non-blocking exclusive lock, or raise OSError if held.
+
+    Both backends raise OSError when another process holds the region,
+    so callers treat failure identically on either platform.
+    """
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    raise OSError('no file-locking backend on this platform')
+
+
+def _unlock_file(handle):
+    """Release a lock taken by _lock_file_exclusive."""
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+# Kept alive for the whole process lifetime: closing this handle
+# would drop the kernel lock, so it must not be garbage collected.
+_lock_handle = None
+
+
+def _acquire_single_instance_lock(config_path, config=None):
+    """Refuse to start if another live bridge holds this config's lock.
+
+    Uses an advisory whole-file lock (flock) rather than a bare PID
+    file. Two things fall out of that for free: the kernel releases
+    the lock when the holder dies, so a crashed bridge can never
+    leave a stale lock behind that needs cleaning up by hand; and
+    the acquisition is atomic, so two bridges starting at the same
+    instant cannot both decide they are the only one.
+    """
+    global _lock_handle
+
+    runtime_dir = _resolve_runtime_dir(config)
+    lock_path = _lock_file_path(config_path, runtime_dir)
+
+    try:
+        handle = open(lock_path, 'a+')
+    except OSError as exc:
+        # A missing lock is worth a warning, but it is not worth
+        # refusing to run: better a bridge with no guard than no
+        # bridge at all.
+        logger.warning(
+            "Could not open lock file %s (%s); starting without a "
+            "single-instance guard", lock_path, exc,
+        )
+        return
+
+    try:
+        _lock_file_exclusive(handle)
+    except OSError:
+        try:
+            handle.seek(0)
+            holder = handle.read().strip() or 'unknown'
+        except OSError:
+            holder = 'unknown'
+        handle.close()
+        logger.error(
+            "Another bridge is already running for this config "
+            "(PID %s, lock file %s); refusing to start a second "
+            "instance", holder, lock_path,
+        )
+        sys.exit(1)
+
+    # Record our PID purely so the message above can name a culprit;
+    # the lock itself is held by the kernel, not by this content.
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+    except OSError:
+        pass
+
+    _lock_handle = handle
+    logger.debug("Acquired bridge lock %s", lock_path)
+
+    def _release_lock():
+        # The pathname is deliberately left on disk. Unlinking it opens
+        # a handoff race: another bridge can lock the still-open file
+        # after the unlock, and once the name is gone a third bridge
+        # creates a fresh file at the same path and locks that instead,
+        # so two of them run believing they hold the only lock. The
+        # file is empty-ish and keyed by config hash, so leaving it
+        # costs one small inode per configured bridge.
+        try:
+            _unlock_file(handle)
+        except OSError:
+            pass
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+    atexit.register(_release_lock)
 
 
 # =============================================================================
@@ -183,7 +393,7 @@ def process_pending_requests(
         # an LLM call this poll cycle (avoids two
         # systems delivering in the same bucket).
         poll_iv = int(config.get(
-            'LLMChatter.Bridge.PollIntervalSeconds', 3
+            'LLMChatter.Bridge.PollIntervalSeconds', 1
         ))
         stagger_min = float(config.get(
             'LLMChatter.Bridge.InterSystemStaggerMin',
@@ -218,8 +428,13 @@ def process_pending_requests(
                     else raw_race
                 ),
                 'level': request['bot1_level'],
-                'zone': request['bot1_zone']
+                'zone': request['bot1_zone'],
+                'guild_name': get_character_guild_name(
+                    db, request['bot1_guid']
+                ),
             }
+            # The queue row has no gender column.
+            attach_bot_genders(db, [bot])
             success = process_statement(
                 db, cursor, client,
                 config, request, bot
@@ -263,6 +478,9 @@ def process_pending_requests(
                         f'{prefix}_level'
                     ],
                     'zone': zone,
+                    'guild_name': get_character_guild_name(
+                        db, request[f'{prefix}_guid']
+                    ),
                 }
 
             # Bot 1 (always present)
@@ -286,6 +504,7 @@ def process_pending_requests(
                     'bot4', request['bot1_zone']
                 ))
 
+            attach_bot_genders(db, bots)
             success = process_conversation(
                 db, cursor, client,
                 config, request, bots
@@ -358,7 +577,7 @@ def fetch_pending_events(db, config, max_count):
               OR e.event_type = 'player_general_msg'
               OR e.event_type = 'player_enters_zone'
               OR e.event_type LIKE 'proximity_%%'
-              OR e.event_type = 'guild_idle_chatter'
+              OR e.event_type LIKE 'guild_%%'
               OR (
                   EXISTS (
                       SELECT 1 FROM characters c
@@ -424,6 +643,26 @@ def fetch_pending_events(db, config, max_count):
                         "event_type=%s",
                         et, exc_info=True,
                     )
+            elif et in (
+                'guild_player_message',
+                'guild_login_greeting',
+            ):
+                try:
+                    extra = event.get('extra_data')
+                    if isinstance(extra, str):
+                        extra = json.loads(extra)
+                    if isinstance(extra, dict):
+                        session_id = int(
+                            extra.get('session_id') or 0
+                        )
+                        if session_id:
+                            group_id = -session_id
+                except Exception:
+                    logger.error(
+                        "Failed to parse Guild session "
+                        "from extra_data",
+                        exc_info=True,
+                    )
             event['_group_id'] = group_id
             claimed.append(event)
 
@@ -460,6 +699,63 @@ _ORPHAN_GUARD_EXEMPT = frozenset({
     'bot_group_emote_reaction',
 })
 
+# A group event can reach the orphan guard before the
+# join handler has written the group's traits: join_batch
+# runs in the urgent lane and most group events in the
+# filler lane, and a Dungeon Finder group can even queue
+# its dungeon entry before the join. Young events are
+# put back for a short retry instead of being dropped.
+_GROUP_SETUP_GRACE_DEFAULT = 30
+_GROUP_SETUP_RETRY_DEFAULT = 3
+
+
+def _defer_or_expire_orphan(
+    cursor, db, event, grace_seconds, retry_seconds
+):
+    """Handle a group event whose group has no traits.
+
+    Returns 'deferred' when the event is younger than
+    the grace window (DB clock) and was put back to
+    pending, otherwise 'expired'.
+    """
+    event_id = event['id']
+    if grace_seconds > 0:
+        cursor.execute(
+            "UPDATE llm_chatter_events"
+            " SET status = 'pending',"
+            " react_after = NOW()"
+            " + INTERVAL %s SECOND"
+            " WHERE id = %s"
+            " AND status = 'processing'"
+            " AND created_at > NOW()"
+            " - INTERVAL %s SECOND",
+            (retry_seconds, event_id, grace_seconds)
+        )
+        db.commit()
+        if cursor.rowcount == 1:
+            logger.debug(
+                "Group event %s (%s) waits for group %s"
+                " setup; retry in %ss",
+                event_id, event['event_type'],
+                event.get('_group_id'), retry_seconds,
+            )
+            return 'deferred'
+
+    cursor.execute(
+        "UPDATE llm_chatter_events"
+        " SET status = 'expired'"
+        " WHERE id = %s",
+        (event_id,)
+    )
+    db.commit()
+    logger.info(
+        "Group event %s (%s) expired: group %s has"
+        " no traits",
+        event_id, event['event_type'],
+        event.get('_group_id'),
+    )
+    return 'expired'
+
 # Handler map built from central event registry.
 # player_general_msg uses a local adapter, so we
 # inject it after registry-driven generation.
@@ -473,6 +769,14 @@ EVENT_LOG_OVERRIDES = {
     'bot_group_screenshot_observation': 'Screenshot vision',
     'bot_group_general_reaction': 'General-to-party relay',
     'player_general_msg': 'General chat event',
+    'guild_meet_greeting': 'Guild meet greeting',
+    'guild_join_zone_announce': 'Guild join announcement',
+    'guild_npc_encounter': 'Guild NPC encounter',
+    'guild_player_message': 'Guild player turn',
+    'guild_login_greeting': 'Guild login greeting',
+    'guild_member_join': 'Guild join greeting',
+    'guild_rank_change': 'Guild rank change',
+    'guild_motd_comment': 'Guild MOTD comment',
     'player_enters_zone': 'Zone intrusion',
     'bot_group_low_health': 'State callout',
     'bot_group_oom': 'State callout',
@@ -486,6 +790,9 @@ EVENT_LOG_OVERRIDES = {
     'bg_node_contested': 'BG event',
     'bg_node_captured': 'BG event',
     'bg_pvp_kill': 'BG event',
+    'guild_pvp_kill': 'Guild PvP kill',
+    'guild_pvp_death': 'Guild PvP death',
+    'zone_pvp_death': 'General PvP death',
     'bg_score_milestone': 'BG event',
     'bg_idle_chatter': 'BG event',
     'raid_boss_pull': 'Raid event',
@@ -589,6 +896,14 @@ def _event_summary(event):
     elif et == 'bot_group_loot':
         parts = [
             ('looter', subj),
+            ('item',
+             ed.get('item_name', '')),
+        ]
+    elif et == 'bot_group_loot_roll':
+        parts = [
+            ('roller', subj),
+            ('vote',
+             ed.get('roll_vote', '')),
             ('item',
              ed.get('item_name', '')),
         ]
@@ -760,10 +1075,27 @@ def process_single_event(event, client, config):
                 )
                 db.commit()
                 return False
+            if (
+                event_type.startswith('guild_')
+                and str(config.get(
+                    'LLMChatter.GuildChatter.Enable',
+                    '1',
+                )).strip() != '1'
+            ):
+                cursor.execute(
+                    "UPDATE llm_chatter_events "
+                    "SET status = 'skipped' "
+                    "WHERE id = %s",
+                    (event_id,),
+                )
+                db.commit()
+                return False
             # Skip orphaned group events: if the
             # group has no traits rows (already
             # cleaned up after player logout /
             # group disband), mark expired and skip.
+            # A young event may only be racing the
+            # group's setup, so it is retried first.
             # Lifecycle events are exempt — see
             # _ORPHAN_GUARD_EXEMPT at module scope.
             if (event_type.startswith('bot_group_')
@@ -779,13 +1111,23 @@ def process_single_event(event, client, config):
                         (gid,)
                     )
                     if not cursor.fetchone():
-                        cursor.execute(
-                            "UPDATE llm_chatter_events"
-                            " SET status = 'expired'"
-                            " WHERE id = %s",
-                            (event_id,)
+                        _defer_or_expire_orphan(
+                            cursor, db, event,
+                            _config_int(
+                                config,
+                                'LLMChatter.Bridge.'
+                                'GroupSetupGraceSeconds',
+                                _GROUP_SETUP_GRACE_DEFAULT,
+                                minimum=0,
+                            ),
+                            _config_int(
+                                config,
+                                'LLMChatter.Bridge.'
+                                'GroupSetupRetrySeconds',
+                                _GROUP_SETUP_RETRY_DEFAULT,
+                                minimum=1,
+                            ),
                         )
-                        db.commit()
                         return False
                 else:
                     logger.warning(
@@ -793,6 +1135,22 @@ def process_single_event(event, client, config):
                         " no _group_id — orphan"
                         " guard skipped",
                         event_type,
+                    )
+            # Group awareness (issue #94): remember the
+            # facts of quest / dungeon / boss / zone events
+            # once the orphan guard passed and
+            # before the handler runs, so grouped bots know
+            # them when they speak outside party chat.
+            if event_type.startswith('bot_group_'):
+                try:
+                    _extra = event.get('extra_data')
+                    if isinstance(_extra, (str, bytes)):
+                        _extra = json.loads(_extra)
+                    note_group_event(db, event, _extra, config)
+                except Exception:
+                    logger.error(
+                        "group awareness feed failed",
+                        exc_info=True,
                     )
             # Log location context for group events
             if (event_type.startswith('bot_group_')
@@ -919,21 +1277,6 @@ def _priority_bridge_yield_enabled(config):
     )
 
 
-def _priority_safety_enabled(config):
-    """Phase 4 gate for emergency provider-safety mode."""
-    return (
-        _config_enabled(
-            config,
-            'LLMChatter.PrioritySystem.Enable'
-        )
-        and _config_enabled(
-            config,
-            'LLMChatter.PrioritySystem.SafetyEnable',
-            '1'
-        )
-    )
-
-
 def _has_ready_event_backlog(db, priority_floor=None):
     """Check for any ready pending event, optionally by floor."""
     cursor = db.cursor()
@@ -962,6 +1305,23 @@ def _has_urgent_event_backlog(db, urgent_floor):
     return _has_ready_event_backlog(
         db, priority_floor=urgent_floor
     )
+
+
+def _poll_delay(
+    players_online, work_in_flight,
+    active_interval, idle_interval,
+):
+    """Seconds to wait before the next main-loop pass.
+
+    A fixed fast poll burns CPU on an empty server, and the
+    configured interval applied unconditionally adds itself to
+    every direct player reply. Stay fast while anyone is online
+    or work is still in flight; fall back to the configured
+    interval only when the server is genuinely idle.
+    """
+    if players_online or work_in_flight:
+        return active_interval
+    return idle_interval
 
 
 def _has_pending_legacy_requests(db):
@@ -1032,14 +1392,6 @@ def _evict_unused_group_locks(
         for gid in stale:
             del group_locks[gid]
         return len(stale)
-
-
-def _count_in_flight_jobs(*futures):
-    """Count active worker tasks for provider-safety heuristics."""
-    return sum(
-        1 for future in futures
-        if future is not None
-    )
 
 
 def _write_db_snapshot(db, snapshot_dir):
@@ -1169,8 +1521,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load config
+    # Load config first so the lock can honour LLMChatter.RuntimeDir.
     config = parse_config(args.config)
+
+    # Guard against accidentally running a second instance against
+    # the same config/DB (e.g. a stray manual launch left alongside
+    # the systemd-managed process). Keyed by config path, so a
+    # deliberately separate second bridge is still allowed.
+    _acquire_single_instance_lock(args.config, config)
 
     # Check if enabled - if disabled, wait and check
     # periodically
@@ -1185,13 +1543,16 @@ def main():
     set_race_vocab_chance(int(config.get(
         'LLMChatter.RaceVocabChance', 15
     )))
+    set_race_class_notes_enabled(str(config.get(
+        'LLMChatter.RaceClassNotes.Enable', '1'
+    )) == '1')
     set_action_chance(int(config.get(
         'LLMChatter.ActionChance', 10
     )), mode=config.get(
         'LLMChatter.ChatterMode', 'normal'
     ).lower())
     set_emote_chance(int(config.get(
-        'LLMChatter.EmoteChance', 50
+        'LLMChatter.EmoteChance', 20
     )))
     language_code = str(config.get(
         'LLMChatter.Language', 'GB'
@@ -1216,6 +1577,9 @@ def main():
         init_request_logger,
     )
     init_request_logger(config)
+    reset_structured_diagnostics()
+    if not check_structured_dependencies(structured_output_enabled(config)):
+        sys.exit(1)
 
     # Derive snapshot dir from log path
     import os as _os
@@ -1239,6 +1603,8 @@ def main():
         default_model = DEFAULT_GOOGLE_MODEL
     elif provider == 'openrouter':
         default_model = DEFAULT_OPENROUTER_MODEL
+    elif provider == 'openai_compatible':
+        default_model = ''
     model = config.get(
         'LLMChatter.Model', default_model
     )
@@ -1264,6 +1630,10 @@ def main():
             'LLMChatter.OpenAI.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'openai' selected but "
+                "LLMChatter.OpenAI.ApiKey is empty."
+            )
             sys.exit(1)
         client = openai.OpenAI(api_key=api_key)
     elif provider == 'google':
@@ -1271,6 +1641,10 @@ def main():
             'LLMChatter.Google.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'google' selected but "
+                "LLMChatter.Google.ApiKey is empty."
+            )
             sys.exit(1)
         client = openai.OpenAI(
             api_key=api_key,
@@ -1284,6 +1658,10 @@ def main():
             'LLMChatter.OpenRouter.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'openrouter' selected but "
+                "LLMChatter.OpenRouter.ApiKey is empty."
+            )
             sys.exit(1)
         headers = {}
         referer = config.get(
@@ -1306,26 +1684,82 @@ def main():
         if headers:
             kwargs['default_headers'] = headers
         client = openai.OpenAI(**kwargs)
+    elif provider == 'openai_compatible':
+        error = openai_compatible_target_error(config)
+        if error:
+            logger.error(
+                "FATAL: provider 'openai_compatible' selected but "
+                "%s.", error,
+            )
+            sys.exit(1)
+        client = openai.OpenAI(
+            **openai_compatible_client_kwargs(config)
+        )
     else:
-        # Anthropic (default)
+        # Anthropic is the documented default when Provider is unset.
+        # A *typo* in LLMChatter.Provider also lands here; fail loudly
+        # rather than silently pretending Anthropic was intended.
+        if provider != 'anthropic':
+            logger.error(
+                "FATAL: unknown LLMChatter.Provider '%s'. Valid values: "
+                "anthropic, openai, google, openrouter, ollama, "
+                "openai_compatible.",
+                provider,
+            )
+            sys.exit(1)
         api_key = config.get(
             'LLMChatter.Anthropic.ApiKey', ''
         )
         if not api_key:
+            logger.error(
+                "FATAL: provider 'anthropic' selected but "
+                "LLMChatter.Anthropic.ApiKey is empty."
+            )
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
 
+    # An explicitly selected openai_compatible QuickAnalyze target
+    # has no defaults and never falls back to the main provider.
+    qa_provider = config.get(
+        'LLMChatter.QuickAnalyze.Provider', ''
+    ).strip().lower()
+    if qa_provider == 'openai_compatible' and qa_provider != provider:
+        error = openai_compatible_target_error(
+            config, 'LLMChatter.QuickAnalyze.Model'
+        )
+        if error:
+            logger.error(
+                "FATAL: LLMChatter.QuickAnalyze.Provider "
+                "'openai_compatible' selected but %s.", error,
+            )
+            sys.exit(1)
+
     # Get poll interval
     poll_interval = int(config.get(
-        'LLMChatter.Bridge.PollIntervalSeconds', 3
+        'LLMChatter.Bridge.PollIntervalSeconds', 1
     ))
+    # Cadence used while the server is busy. Direct player
+    # chat is picked up on this interval, so it stays well
+    # below a second; the configured interval above applies
+    # only once nothing is happening.
+    try:
+        active_poll_interval = float(config.get(
+            'LLMChatter.Bridge.ActivePollIntervalSeconds', 0.2
+        ))
+    except (TypeError, ValueError):
+        active_poll_interval = 0.2
+    if active_poll_interval <= 0:
+        active_poll_interval = 0.2
+    active_poll_interval = min(
+        active_poll_interval, float(poll_interval)
+    )
 
     # Max concurrent event workers
     try:
         max_concurrent = max(1, min(int(
             config.get(
                 'LLMChatter.Bridge.MaxConcurrent',
-                '3'
+                '5'
             )
         ), 10))
     except (ValueError, TypeError):
@@ -1368,16 +1802,29 @@ def main():
     logger.info("=" * 60)
     logger.info(f"ChatterMode: {chatter_mode}")
     logger.info(f"Provider: {provider}")
+    log_structured_target(
+        'main', provider, resolve_model(model, provider),
+        structured_output_enabled(config),
+    )
     logger.info(
         f"Model: {model}"
     )
+    if provider in (
+        'openai', 'google', 'openrouter', 'ollama',
+        'openai_compatible',
+    ):
+        logger.info(
+            "Model compatibility: %s",
+            describe_model_compatibility(
+                provider,
+                model,
+                compatible_reasoning_effort(provider, config),
+            ),
+        )
     if provider == 'ollama':
         base_url = config.get(
             'LLMChatter.Ollama.BaseUrl',
             'http://localhost:11434'
-        )
-        context_size = config.get(
-            'LLMChatter.Ollama.ContextSize', 2048
         )
         disable_thinking = (
             config.get(
@@ -1386,17 +1833,21 @@ def main():
             ) == '1'
         )
         logger.info(f"Ollama URL: {base_url}")
-        logger.info(f"Context size: {context_size}")
         logger.info(
             f"Thinking mode: "
-            f"{'disabled (/no_think)' if disable_thinking else 'enabled'}"
+            f"{'disabled' if disable_thinking else 'enabled'}"
+        )
+    if provider == 'openai_compatible':
+        logger.info(
+            "OpenAI-compatible URL: %s",
+            openai_compatible_client_kwargs(config)['base_url'],
         )
     logger.info(f"Poll interval: {poll_interval}s")
     logger.info(
         f"Max concurrent: {max_concurrent}"
     )
     base_max = config.get(
-        'LLMChatter.MaxTokens', 200
+        'LLMChatter.MaxTokens', 350
     )
     convo_max = config.get(
         'LLMChatter.ConversationMaxTokens', base_max
@@ -1410,17 +1861,6 @@ def main():
     logger.info(
         f"Event system: "
         f"{'enabled' if use_event_system else 'disabled'}"
-    )
-    logger.info(
-        f"Message type distribution: "
-        f"{MSG_TYPE_PLAIN}% plain, "
-        f"{MSG_TYPE_QUEST - MSG_TYPE_PLAIN}% quest, "
-        f"{MSG_TYPE_LOOT - MSG_TYPE_QUEST}% loot, "
-        f"{MSG_TYPE_QUEST_REWARD - MSG_TYPE_LOOT}% "
-        f"quest+reward, "
-        f"{MSG_TYPE_TRADE - MSG_TYPE_QUEST_REWARD}% "
-        f"trade, "
-        f"{MSG_TYPE_SPELL - MSG_TYPE_TRADE}% spell"
     )
     precache_enabled = config.get(
         'LLMChatter.GroupChatter.PreCacheEnable',
@@ -1436,13 +1876,11 @@ def main():
     )
     logger.info(
         f"  ChatterMode: "
-        f"{config.get('LLMChatter.ChatterMode', 'roleplay')}"
+        f"{config.get('LLMChatter.ChatterMode', 'normal')}"
     )
     logger.info(
         f"  Ollama.BaseUrl: "
         f"{config.get('LLMChatter.Ollama.BaseUrl', 'http://localhost:11434')}"
-        f"  ContextSize: "
-        f"{config.get('LLMChatter.Ollama.ContextSize', 2048)}"
         f"  DisableThinking: "
         f"{config.get('LLMChatter.Ollama.DisableThinking', 1)}"
     )
@@ -1472,7 +1910,7 @@ def main():
         f"  TriggerChance: "
         f"{config.get('LLMChatter.TriggerChance', 15)}%"
         f"  EventReactionChance: "
-        f"{config.get('LLMChatter.EventReactionChance', 15)}%"
+        f"{config.get('LLMChatter.EventReactionChance', 25)}%"
     )
     logger.info(
         f"  WeatherAmbientChance: "
@@ -1497,7 +1935,7 @@ def main():
         f"  TransportCooldown: "
         f"{config.get('LLMChatter.TransportCooldownSeconds', 600)}s"
         f"  WeatherCooldown: "
-        f"{config.get('LLMChatter.WeatherCooldownSeconds', 1800)}s"
+        f"{config.get('LLMChatter.WeatherCooldownSeconds', 300)}s"
         f"  WeatherAmbientCooldown: "
         f"{config.get('LLMChatter.WeatherAmbientCooldownSeconds', 120)}s"
     )
@@ -1509,9 +1947,9 @@ def main():
     )
     logger.info(
         f"  HolidayCityChance: "
-        f"{config.get('LLMChatter.HolidayCityChance', 10)}%"
+        f"{config.get('LLMChatter.HolidayCityChance', 20)}%"
         f"  HolidayZoneChance: "
-        f"{config.get('LLMChatter.HolidayZoneChance', 5)}%"
+        f"{config.get('LLMChatter.HolidayZoneChance', 15)}%"
         f"  MinorEventChance: "
         f"{config.get('LLMChatter.Events.MinorEventChance', 20)}%"
     )
@@ -1519,9 +1957,9 @@ def main():
     logger.info("Group chatter:")
     logger.info(
         f"  IdleChance: "
-        f"{config.get('LLMChatter.GroupChatter.IdleChance', 10)}%"
+        f"{config.get('LLMChatter.GroupChatter.IdleChance', 15)}%"
         f"  IdleCooldown: "
-        f"{config.get('LLMChatter.GroupChatter.IdleCooldown', 30)}s"
+        f"{config.get('LLMChatter.GroupChatter.IdleCooldown', 40)}s"
     )
     logger.info(
         f"  KillChanceNormal: "
@@ -1541,13 +1979,13 @@ def main():
     )
     logger.info(
         f"  SpellCastChance: "
-        f"{config.get('LLMChatter.GroupChatter.SpellCastChance', 10)}%"
+        f"{config.get('LLMChatter.GroupChatter.SpellCastChance', 30)}%"
     )
     logger.info(
         f"  NearbyObjectEnable: "
         f"{config.get('LLMChatter.GroupChatter.NearbyObjectEnable', 1)}"
         f"  NearbyObjectChance: "
-        f"{config.get('LLMChatter.GroupChatter.NearbyObjectChance', 10)}%"
+        f"{config.get('LLMChatter.GroupChatter.NearbyObjectChance', 20)}%"
     )
     logger.info(
         f"  BotQuestionEnable: "
@@ -1569,11 +2007,142 @@ def main():
     logger.info("General chat:")
     logger.info(
         f"  ReactionChance: "
-        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 40)}%"
+        f"{config.get('LLMChatter.GeneralChat.ReactionChance', 100)}%"
         f"  QuestionChance: "
-        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 80)}%"
+        f"{config.get('LLMChatter.GeneralChat.QuestionChance', 100)}%"
         f"  Cooldown: "
-        f"{config.get('LLMChatter.GeneralChat.Cooldown', 30)}s"
+        f"{config.get('LLMChatter.GeneralChat.Cooldown', 3)}s"
+    )
+    logger.info("-" * 60)
+    logger.info("Guild chatter:")
+    guild_reply_conversation_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.ConversationChance',
+        20,
+    )
+    guild_history_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'HistoryContextChance',
+        35,
+    )
+    guild_history_messages = config.get(
+        'LLMChatter.GuildChatter.'
+        'HistoryContextMessages',
+        15,
+    )
+    guild_multi_reply_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.MultiReplyChance',
+        15,
+    )
+    guild_multi_addressed_bonus = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.MultiAddressedBonus',
+        15,
+    )
+    guild_max_responders = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.MaxResponders',
+        3,
+    )
+    guild_summary_threshold = config.get(
+        'LLMChatter.GuildChatter.'
+        'SessionMemory.SummaryThresholdChars',
+        3500,
+    )
+    guild_summary_input_cap = config.get(
+        'LLMChatter.GuildChatter.'
+        'SessionMemory.SummaryMaxInputChars',
+        8000,
+    )
+    guild_recent_messages = config.get(
+        'LLMChatter.GuildChatter.'
+        'SessionMemory.KeepRecentMessages',
+        15,
+    )
+    guild_first_delay_min = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.FirstDelayMin',
+        8,
+    )
+    guild_first_delay_max = config.get(
+        'LLMChatter.GuildChatter.'
+        'PlayerReplies.FirstDelayMax',
+        20,
+    )
+    guild_login_enable = config.get(
+        'LLMChatter.GuildChatter.'
+        'LoginGreeting.Enable',
+        1,
+    )
+    guild_login_quick_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'LoginGreeting.QuickChance',
+        20,
+    )
+    guild_login_busy_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'LoginGreeting.BusyChance',
+        25,
+    )
+    guild_login_multi_chance = config.get(
+        'LLMChatter.GuildChatter.'
+        'LoginGreeting.MultiReplyChance',
+        75,
+    )
+    guild_login_max_responders = config.get(
+        'LLMChatter.GuildChatter.'
+        'LoginGreeting.MaxResponders',
+        4,
+    )
+    logger.info(
+        f"  Enable: "
+        f"{config.get('LLMChatter.GuildChatter.Enable', 1)}"
+        f"  PlayerReplies: "
+        f"{config.get('LLMChatter.GuildChatter.PlayerReplies.Enable', 1)}"
+        f"  SessionMemory: "
+        f"{config.get('LLMChatter.GuildChatter.SessionMemory.Enable', 1)}"
+    )
+    logger.info(
+        f"  AmbientHistoryChance: "
+        f"{guild_history_chance}%"
+        f"  AmbientHistoryMessages: "
+        f"{guild_history_messages}"
+    )
+    logger.info(
+        f"  ConversationChance: "
+        f"{guild_reply_conversation_chance}%"
+        f"  MultiReplyChance: "
+        f"{guild_multi_reply_chance}%"
+        f"  MultiAddressedBonus: "
+        f"{guild_multi_addressed_bonus}%"
+        f"  MaxResponders: "
+        f"{guild_max_responders}"
+    )
+    logger.info(
+        f"  FirstDelay: "
+        f"{guild_first_delay_min}-"
+        f"{guild_first_delay_max}s"
+        f"  RecentMessages: "
+        f"{guild_recent_messages}"
+    )
+    logger.info(
+        f"  LoginGreeting: "
+        f"{guild_login_enable}"
+        f"  QuickChance: "
+        f"{guild_login_quick_chance}%"
+        f"  BusyChance: "
+        f"{guild_login_busy_chance}%"
+        f"  MultiReplyChance: "
+        f"{guild_login_multi_chance}%"
+        f"  MaxResponders: "
+        f"{guild_login_max_responders}"
+    )
+    logger.info(
+        f"  SummaryThreshold: "
+        f"{guild_summary_threshold} chars"
+        f"  SummaryInputCap: "
+        f"{guild_summary_input_cap} chars"
     )
     logger.info("-" * 60)
     logger.info("Raid chatter:")
@@ -1587,7 +2156,7 @@ def main():
         f"  ActionChance: "
         f"{config.get('LLMChatter.ActionChance', 10)}%"
         f"  EmoteChance: "
-        f"{config.get('LLMChatter.EmoteChance', 50)}%"
+        f"{config.get('LLMChatter.EmoteChance', 20)}%"
         f"  RaceLoreChance: "
         f"{config.get('LLMChatter.RaceLoreChance', 15)}%"
     )
@@ -1611,9 +2180,9 @@ def main():
     )
     logger.info(
         f"  Bridge.PollInterval: "
-        f"{config.get('LLMChatter.Bridge.PollIntervalSeconds', 3)}s"
+        f"{config.get('LLMChatter.Bridge.PollIntervalSeconds', 1)}s"
         f"  Bridge.MaxConcurrent: "
-        f"{config.get('LLMChatter.Bridge.MaxConcurrent', 3)}"
+        f"{config.get('LLMChatter.Bridge.MaxConcurrent', 5)}"
         f"  InterSystemStagger: "
         f"{inter_stagger_min}s\u2013{inter_stagger_max}s"
     )
@@ -1627,20 +2196,27 @@ def main():
         f"  DistanceUnit: "
         f"{config.get('LLMChatter.DistanceUnit', 'yards')}"
         f"  BotSpeakerCooldown: "
-        f"{config.get('LLMChatter.BotSpeakerCooldownSeconds', 900)}s"
+        f"{config.get('LLMChatter.BotSpeakerCooldownSeconds', 120)}s"
     )
     logger.info(
         f"  EventExpiration: "
         f"{config.get('LLMChatter.EventExpirationSeconds', 600)}s"
-        f"  LootRecentCooldown: "
-        f"{config.get('LLMChatter.LootRecentCooldownSeconds', 1200)}s"
     )
     logger.info(
         f"  BGChatter.MaxTokens: "
-        f"{config.get('LLMChatter.BGChatter.MaxTokens', 32)}"
-        f"  PrioritySystem.SafetyEnable: "
-        f"{config.get('LLMChatter.PrioritySystem.SafetyEnable', 1)}"
+        f"{config.get('LLMChatter.BGChatter.MaxTokens', 300)}"
     )
+    logger.info("=" * 60)
+
+    # Full active config, so users can confirm every value the bridge
+    # actually loaded without opening the file. Secrets are masked.
+    logger.info(
+        f"Active config ({len(config)} keys) from {args.config}:"
+    )
+    for line in format_config_for_log(
+        config, parse_config_sections(args.config)
+    ):
+        logger.info(line)
     logger.info("=" * 60)
 
     # Startup health check (preflight). Surfaces the most
@@ -1722,6 +2298,8 @@ def main():
         try:
             db = get_db_connection(config)
             reset_stuck_processing_events(db)
+            discard_ready_precache(db)
+            normalize_active_group_personalities(db, config)
 
             # Memory system startup recovery
             if int(config.get(
@@ -1733,10 +2311,14 @@ def main():
                 )
                 session_min = int(config.get(
                     'LLMChatter.Memory'
-                    '.SessionMinutes', 15
+                    '.SessionMinutes', 3
                 ))
                 activate_orphaned_memories(
-                    db, session_min
+                    db, session_min,
+                    int(config.get(
+                        'LLMChatter.Memory'
+                        '.MaxPerBotPlayer', 30
+                    )),
                 )
                 rehydrate_active_sessions(db)
         except Exception:
@@ -1759,15 +2341,24 @@ def main():
     last_idle_check = 0
     idle_check_interval = int(config.get(
         'LLMChatter.GroupChatter.IdleCheckInterval',
-        60
+        30
     ))
     last_cache_refill = 0
     cache_refill_interval = 30  # every 30 seconds
     last_question_check = 0
+    last_reactivity = 0
+    reactivity_interval = max(1, int(config.get(
+        'LLMChatter.Letters.PollSeconds', 30
+    )))
     question_check_interval = int(config.get(
         'LLMChatter.GroupChatter.'
         'BotQuestionCheckInterval',
         30
+    ))
+    last_tone_regen = 0
+    tone_regen_interval = int(config.get(
+        'LLMChatter.Bridge.ToneRegenIntervalSeconds',
+        60
     ))
 
     executor = ThreadPoolExecutor(
@@ -1783,8 +2374,15 @@ def main():
     bot_question_future = None
     legacy_future = None
     tone_regen_future = None
+    reactivity_future = None
+    guild_profile_future = None
+    last_guild_profile_scan = 0
     # Track online→offline transition for full wipe
     was_players_online = True
+    # Assume company until proven otherwise: if the first
+    # database check fails we would rather poll quickly than
+    # leave a player waiting on a stale idle interval.
+    players_online = True
 
     def _harvest_future(f, name):
         """Consume any unexpected worker failure."""
@@ -1858,6 +2456,14 @@ def main():
                 )
                 legacy_future = None
             if (
+                reactivity_future
+                and reactivity_future.done()
+            ):
+                _harvest_future(
+                    reactivity_future, "reactivity",
+                )
+                reactivity_future = None
+            if (
                 tone_regen_future
                 and tone_regen_future.done()
             ):
@@ -1866,6 +2472,10 @@ def main():
                     "tone-regeneration"
                 )
                 tone_regen_future = None
+
+            if guild_profile_future and guild_profile_future.done():
+                _harvest_future(guild_profile_future, "guild-profiles")
+                guild_profile_future = None
 
             # DB connection with proper lifecycle
             db = None
@@ -1921,6 +2531,30 @@ def main():
                     # player went offline (runs
                     # regardless of UseEventSystem)
                     cleanup_stale_groups(db)
+                    # Settle the memories of sessions
+                    # that ended without a farewell
+                    # (logout, crash), not only at the
+                    # next bridge start.
+                    if int(config.get(
+                        'LLMChatter.Memory.Enable', 1
+                    )):
+                        from chatter_memory import (
+                            activate_orphaned_memories,
+                        )
+                        activate_orphaned_memories(
+                            db,
+                            int(config.get(
+                                'LLMChatter.Memory'
+                                '.SessionMinutes', 3
+                            )),
+                            int(config.get(
+                                'LLMChatter.Memory'
+                                '.MaxPerBotPlayer', 30
+                            )),
+                        )
+                    # Race names the worldserver
+                    # wrote at its last startup
+                    load_race_names(db)
                     last_cleanup = current_time
 
                 # DB state snapshot for log viewer
@@ -1936,9 +2570,16 @@ def main():
                     )
                     last_db_snapshot = current_time
 
-                # Legacy requests (General ambient chatter)
-                # Runs freely every cycle — no deferral
-                if players_online and not legacy_future:
+                # Legacy requests (General ambient chatter).
+                # Cheap backlog check on the already-open
+                # connection avoids opening a brand-new DB
+                # connection every poll cycle when the queue
+                # is empty (was pegging CPU continuously).
+                if (
+                    players_online
+                    and not legacy_future
+                    and _has_pending_legacy_requests(db)
+                ):
                     legacy_future = (
                         executor.submit(
                             _run_in_worker,
@@ -1951,7 +2592,11 @@ def main():
                 if (
                     players_online
                     and not tone_regen_future
+                    and current_time
+                    - last_tone_regen
+                    >= tone_regen_interval
                 ):
+                    last_tone_regen = current_time
                     tone_regen_future = (
                         executor.submit(
                             _run_in_worker,
@@ -2025,6 +2670,23 @@ def main():
                             )
                             dispatched += 1
 
+                if (
+                    players_online
+                    and guild_profiles_enabled(config)
+                    and guild_profile_future is None
+                    and current_time - last_guild_profile_scan
+                    >= profile_config_int(
+                        config, 'LLMChatter.Profile.GuildScanIntervalSeconds',
+                        15, 1,
+                    )
+                    and not _has_urgent_event_backlog(db, _PRIORITY_URGENT_FLOOR)
+                ):
+                    last_guild_profile_scan = current_time
+                    guild_profile_future = executor.submit(
+                        _run_in_worker, "guild-profiles",
+                        prepare_guild_profiles, client, config,
+                    )
+
                 # Idle chatter -> worker pool
                 if (
                     players_online
@@ -2065,6 +2727,28 @@ def main():
                         )
                     )
 
+                # Letters and rumors -> worker pool. Deeds and
+                # due letters do not wait for anyone to be online.
+                if (
+                    (
+                        letters_enabled(config)
+                        or rumors_enabled(config)
+                    )
+                    and not reactivity_future
+                    and current_time
+                    - last_reactivity
+                    >= reactivity_interval
+                ):
+                    last_reactivity = current_time
+                    reactivity_future = (
+                        executor.submit(
+                            _run_in_worker,
+                            "reactivity",
+                            process_reactivity,
+                            client, config
+                        )
+                    )
+
                 # Pre-cache -> worker pool
                 if (
                     players_online
@@ -2091,11 +2775,28 @@ def main():
                     except Exception:
                         pass
 
-            # Fast poll so player messages are
-            # picked up quickly. Background tasks
-            # self-rate-limit via their own
-            # last_X / interval checks.
-            time.sleep(0.2)
+            # Poll cadence adapts rather than being fixed.
+            # A hardcoded fast poll burns CPU on an empty
+            # server; the configured interval applied
+            # unconditionally adds itself to every direct
+            # player reply. So: stay fast while anyone is
+            # online or work is still in flight, and fall
+            # back to Bridge.PollIntervalSeconds only when
+            # the server is genuinely idle. Background tasks
+            # self-rate-limit via their own last_X / interval
+            # checks either way.
+            work_in_flight = bool(
+                active_futures
+                or precache_future
+                or idle_chatter_future
+                or bot_question_future
+                or legacy_future
+                or tone_regen_future
+            )
+            time.sleep(_poll_delay(
+                players_online, work_in_flight,
+                active_poll_interval, poll_interval,
+            ))
 
         except KeyboardInterrupt:
             executor.shutdown(wait=False)

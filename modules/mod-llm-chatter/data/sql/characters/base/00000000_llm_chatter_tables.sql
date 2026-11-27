@@ -77,9 +77,27 @@ CREATE TABLE IF NOT EXISTS `llm_chatter_events` (
         'proximity_reply',
         'proximity_player_say',
         'proximity_player_conversation',
+        'proximity_player_emote',
+        'proximity_boss_approach',
+        'proximity_boss_player_say',
         'bot_backstory_regen',
         'bot_tone_regen',
-        'guild_idle_chatter'
+        'guild_idle_chatter',
+        'guild_player_message',
+        'guild_login_greeting',
+        'bot_group_duel_start',
+        'bot_group_duel_end',
+        'guild_pvp_kill',
+        'guild_pvp_death',
+        'zone_pvp_death',
+        'guild_meet_greeting',
+        'guild_join_zone_announce',
+        'guild_npc_encounter',
+        'guild_member_join',
+        'guild_rank_change',
+        'guild_motd_comment',
+        'bot_group_loot_roll',
+        'bot_group_discovery'
     ) NOT NULL,
     `event_scope` ENUM('global', 'zone', 'player') NOT NULL DEFAULT 'zone',
     `zone_id` INT UNSIGNED DEFAULT NULL,
@@ -117,6 +135,9 @@ CREATE TABLE IF NOT EXISTS `llm_chatter_queue` (
     `zone_id` INT UNSIGNED DEFAULT NULL,
     `weather` VARCHAR(32) DEFAULT NULL,
     `bot_count` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    `message_type` VARCHAR(16) DEFAULT NULL,
+    `item_context` JSON DEFAULT NULL,
+    `audience_context` JSON DEFAULT NULL,
     `bot2_guid` INT UNSIGNED DEFAULT NULL,
     `bot2_name` VARCHAR(64) DEFAULT NULL,
     `bot2_class` VARCHAR(32) DEFAULT NULL,
@@ -151,6 +172,10 @@ CREATE TABLE IF NOT EXISTS `llm_chatter_messages` (
     `bot_name` VARCHAR(64) NOT NULL,
     `message` TEXT NOT NULL,
     `emote` VARCHAR(32) DEFAULT NULL,
+    -- Free-text physical action from the LLM's `action` field.
+    -- Delivered as a /e text emote just before the spoken line
+    -- rather than inlined into `message` as *asterisks*.
+    `action` VARCHAR(120) DEFAULT NULL,
     `npc_spawn_id` INT UNSIGNED DEFAULT NULL,
     `player_guid` INT UNSIGNED DEFAULT NULL,
     `group_id` INT UNSIGNED DEFAULT NULL,
@@ -168,6 +193,10 @@ CREATE TABLE IF NOT EXISTS `llm_chatter_messages` (
     -- explicitly. See insert_chat_message() in chatter_db.py.
     `owner_subsystem` VARCHAR(16) NOT NULL DEFAULT 'group',
     `delivered` TINYINT(1) NOT NULL DEFAULT 0,
+    `drop_reason` VARCHAR(64) DEFAULT NULL,
+    `addressee_player_guid` INT UNSIGNED DEFAULT NULL,
+    `addressee_bot_guid` INT UNSIGNED DEFAULT NULL,
+    `addressee_npc_spawn_id` INT UNSIGNED DEFAULT NULL,
     `deliver_at` TIMESTAMP NULL DEFAULT NULL,
     `delivered_at` TIMESTAMP NULL DEFAULT NULL,
     PRIMARY KEY (`id`),
@@ -196,9 +225,9 @@ CREATE TABLE IF NOT EXISTS `llm_group_bot_traits` (
     `group_id` INT UNSIGNED NOT NULL,
     `bot_guid` INT UNSIGNED NOT NULL,
     `bot_name` VARCHAR(64) NOT NULL,
-    `trait1` VARCHAR(32) NOT NULL,
-    `trait2` VARCHAR(32) NOT NULL,
-    `trait3` VARCHAR(32) NOT NULL,
+    `trait1` VARCHAR(64) NOT NULL,
+    `trait2` VARCHAR(64) NOT NULL,
+    `trait3` VARCHAR(64) NOT NULL,
     `role` VARCHAR(16) DEFAULT NULL,
     `tone` VARCHAR(120) DEFAULT NULL,
     `zone` INT UNSIGNED NOT NULL DEFAULT 0,
@@ -231,6 +260,48 @@ CREATE TABLE IF NOT EXISTS `llm_general_chat_history` (
     `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX `idx_zone_id` (`zone_id`),
     INDEX `idx_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-player Guild Chat memory for one login session.
+CREATE TABLE IF NOT EXISTS `llm_guild_chat_sessions` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `player_guid` INT UNSIGNED NOT NULL,
+    `player_name` VARCHAR(64) NOT NULL,
+    `guild_id` INT UNSIGNED NOT NULL,
+    `turn_id` INT UNSIGNED NOT NULL DEFAULT 0,
+    `summary` TEXT DEFAULT NULL,
+    `summarized_through_id` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    `started_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `last_activity_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_guild_session_player` (`player_guid`),
+    KEY `idx_guild_session_guild` (`guild_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Delivered Guild lines visible during each player's login session.
+CREATE TABLE IF NOT EXISTS `llm_guild_session_history` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `session_id` BIGINT UNSIGNED NOT NULL,
+    `guild_id` INT UNSIGNED NOT NULL,
+    `speaker_guid` INT UNSIGNED NOT NULL DEFAULT 0,
+    `speaker_name` VARCHAR(64) NOT NULL,
+    `is_bot` TINYINT(1) NOT NULL DEFAULT 0,
+    `source_kind` ENUM(
+        'player',
+        'reply',
+        'ambient'
+    ) NOT NULL,
+    `source_event_id` INT UNSIGNED DEFAULT NULL,
+    `message` TEXT NOT NULL,
+    `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `delivered_at` TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_guild_history_session`
+        (`session_id`, `id`),
+    KEY `idx_guild_history_guild`
+        (`guild_id`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Pre-cached LLM responses for instant combat delivery
@@ -291,7 +362,7 @@ CREATE TABLE IF NOT EXISTS `llm_bot_memories` (
         'dungeon', 'party_member', 'player_message',
         'first_meeting', 'quest_complete', 'achievement',
         'level_up', 'bg_win', 'bg_loss',
-        'discovery', 'pvp_kill'
+        'discovery', 'pvp_kill', 'duel'
     ) NOT NULL,
     `memory`        TEXT         NOT NULL,
     `mood`          VARCHAR(32)  NOT NULL,
@@ -300,8 +371,125 @@ CREATE TABLE IF NOT EXISTS `llm_bot_memories` (
     `used`          TINYINT(1)   NOT NULL DEFAULT 0,
     `last_used_at`  TIMESTAMP    NULL DEFAULT NULL,
     `session_start` DOUBLE       NOT NULL,
+    `zone_id`       INT UNSIGNED DEFAULT NULL,
+    `map_id`        INT UNSIGNED DEFAULT NULL,
+    `companions`    VARCHAR(255) DEFAULT NULL,
     `created_at`    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     INDEX `idx_bot_player`        (`bot_guid`, `player_guid`),
     INDEX `idx_bot_player_active` (`bot_guid`, `player_guid`, `active`),
-    INDEX `idx_group`             (`group_id`, `active`)
+    INDEX `idx_group`             (`group_id`, `active`),
+    INDEX `idx_active_group`      (`active`, `group_id`, `bot_guid`, `player_guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- One outstanding screenshot preflight per explicitly bound account.
+-- Server snapshots stay in memory: restart invalidates pending captures.
+CREATE TABLE IF NOT EXISTS `llm_screenshot_proximity` (
+    `account_id` INT UNSIGNED NOT NULL,
+    `request_token` CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    `state` ENUM('requested', 'ready', 'observed', 'consumed') NOT NULL,
+    `player_guid` INT UNSIGNED DEFAULT NULL,
+    `observation` TEXT DEFAULT NULL,
+    `requested_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `expires_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`account_id`),
+    UNIQUE KEY `uq_request_token` (`request_token`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Race names as the worldserver knows them, rewritten at every startup.
+-- The bridge reads them for races outside the original ten (ChrRaces).
+CREATE TABLE IF NOT EXISTS `llm_chatter_race_names` (
+    `race_id` TINYINT UNSIGNED NOT NULL,
+    `name` VARCHAR(64) NOT NULL,
+    PRIMARY KEY (`race_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- World reactivity (letters and rumors).
+-- Triggers wait here until the bridge reads them. This is not
+-- llm_chatter_events: startup expires every pending event there, and
+-- a letter earned just before a restart must not be lost.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_inbox` (
+    `id`          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `kind`        ENUM('achievement', 'quest', 'level', 'login') NOT NULL,
+    `player_guid` INT UNSIGNED NOT NULL,
+    `trigger_id`  INT UNSIGNED NOT NULL DEFAULT 0,
+    `extra_data`  TEXT,
+    -- Failed handling attempts; a row at the bridge's limit is kept
+    -- for inspection but no longer picked up.
+    `attempts`    TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- One row per letter, from scheduling to delivery. The unique key is
+-- what keeps a dungeon with several achievements to a single letter.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_letters` (
+    `id`          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `player_guid` INT UNSIGNED NOT NULL,
+    `kind`        ENUM('memory', 'dungeon', 'raid', 'quest',
+                       'starter', 'profession') NOT NULL,
+    `letter_key`  VARCHAR(64) NOT NULL,
+    `status`      ENUM('scheduled', 'generating', 'ready', 'sending',
+                       'sent', 'failed', 'skipped')
+                  NOT NULL DEFAULT 'scheduled',
+    `not_before`  DATETIME NOT NULL,
+    `team`        ENUM('Alliance', 'Horde') NOT NULL,
+    `sender_type` ENUM('creature', 'bot') NOT NULL DEFAULT 'creature',
+    `sender_id`   INT UNSIGNED NOT NULL DEFAULT 0,
+    `subject`     VARCHAR(128) DEFAULT NULL,
+    `body`        TEXT DEFAULT NULL,
+    `items`       VARCHAR(255) DEFAULT NULL,
+    `context`     TEXT DEFAULT NULL,
+    `attempts`    TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                  ON UPDATE CURRENT_TIMESTAMP,
+    `sent_at`     DATETIME DEFAULT NULL,
+    UNIQUE KEY `uq_player_letter` (`player_guid`, `kind`, `letter_key`),
+    INDEX `idx_status_due` (`status`, `not_before`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-character letter pacing. Rolled once, so a level is not re-rolled
+-- at every login.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_player_state` (
+    `player_guid`           INT UNSIGNED NOT NULL PRIMARY KEY,
+    `team`                  ENUM('Alliance', 'Horde') NOT NULL,
+    `next_memory_at`        DATETIME DEFAULT NULL,
+    `starter_one_level`     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `starter_two_level`     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `starter_one_skill`     VARCHAR(32) DEFAULT NULL,
+    `next_profession_level` TINYINT UNSIGNED NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Rumors about a player that have been unlocked or told. A deed from
+-- before this feature gets a row the first time it is told, not fresh.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_rumors` (
+    `player_guid`    INT UNSIGNED NOT NULL,
+    `kind`           ENUM('achievement', 'quest', 'dungeon') NOT NULL,
+    `rumor_key`      VARCHAR(64) NOT NULL,
+    `fresh`          TINYINT(1) NOT NULL DEFAULT 0,
+    `voiced_count`   INT UNSIGNED NOT NULL DEFAULT 0,
+    `last_voiced_at` TIMESTAMP NULL DEFAULT NULL,
+    `created_at`     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`player_guid`, `kind`, `rumor_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- A rumor line queued for speech. It only counts as voiced once the
+-- message row shows it was delivered.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_rumor_voicings` (
+    `id`          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    `event_id`    INT UNSIGNED NOT NULL,
+    `player_guid` INT UNSIGNED NOT NULL,
+    `kind`        ENUM('achievement', 'quest', 'dungeon') NOT NULL,
+    `rumor_key`   VARCHAR(64) NOT NULL,
+    `created_at`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX `idx_event` (`event_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Where a fresh rumor may be told, read by proximity scans. Zone 0
+-- means anywhere.
+CREATE TABLE IF NOT EXISTS `llm_reactivity_fresh_rumor_zones` (
+    `player_guid` INT UNSIGNED NOT NULL,
+    `zone_id`     INT UNSIGNED NOT NULL,
+    `kind`        ENUM('achievement', 'quest', 'dungeon') NOT NULL,
+    `rumor_key`   VARCHAR(64) NOT NULL,
+    PRIMARY KEY (`player_guid`, `zone_id`, `kind`, `rumor_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

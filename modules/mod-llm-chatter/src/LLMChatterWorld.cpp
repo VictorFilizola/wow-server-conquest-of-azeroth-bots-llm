@@ -3,13 +3,21 @@
  */
 
 #include "LLMChatterAmbient.h"
+#include "LLMChatterAudience.h"
+#include "LLMChatterBossDialogue.h"
 #include "LLMChatterConfig.h"
+#include "LLMChatterScreenshot.h"
 #include "LLMChatterDelivery.h"
+#include "LLMChatterReactivity.h"
+#include "LLMChatterGuild.h"
 #include "LLMChatterGroup.h"
+#include "LLMChatterGroupAwareness.h"
 #include "LLMChatterGroupInternal.h"
 #include "LLMChatterNearby.h"
 #include "LLMChatterProximity.h"
+#include "LLMChatterProximityFight.h"
 #include "LLMChatterShared.h"
+#include "LLMChatterThemedAudience.h"
 
 #include "DatabaseEnv.h"
 #include "Group.h"
@@ -289,15 +297,19 @@ public:
                   WORLDHOOK_ON_STARTUP,
                   WORLDHOOK_ON_UPDATE}) {}
 
-    void OnAfterConfigLoad(bool /*reload*/) override
+    void OnAfterConfigLoad(bool reload) override
     {
         sLLMChatterConfig->LoadConfig();
+        if (reload && sLLMChatterConfig->IsEnabled())
+            LoadScriptedEmoteExclusions();
     }
 
     void OnStartup() override
     {
         if (!sLLMChatterConfig->IsEnabled())
             return;
+
+        LoadScriptedEmoteExclusions();
 
         CharacterDatabase.Execute(
             "DELETE FROM llm_chatter_messages "
@@ -316,6 +328,12 @@ public:
             "DELETE FROM llm_group_chat_history");
         CharacterDatabase.Execute(
             "DELETE FROM llm_group_cached_responses");
+        CharacterDatabase.Execute(
+            "DELETE FROM llm_guild_session_history");
+        CharacterDatabase.Execute(
+            "DELETE FROM llm_guild_chat_sessions");
+
+        SaveRaceNames();
 
         LoadTransportCache();
 
@@ -323,10 +341,14 @@ public:
 
         _lastTriggerTime = 0;
         _lastDeliveryTime = 0;
+        _lastLetterDeliveryTime = 0;
+        _lastGeneralAudienceRefreshTime = 0;
         _lastEnvironmentCheckTime = 0;
         _lastTransportCheckTime = 0;
         _lastGoScanTime = 0;
-        _lastProximityScanTime = 0;
+        _lastOutdoorProximityScanTime = 0;
+        _lastInstanceProximityScanTime = 0;
+        _lastBossDialogueCheckTime = 0;
         _lastQuestFlushTime = 0;
         _lastGroupJoinFlushTime = 0;
         _lastRaidMoraleTime = 0;
@@ -336,17 +358,40 @@ public:
 
     void OnUpdate(uint32 /*diff*/) override
     {
+        UpdatePendingGuildLoginGreetings();
+        UpdateScreenshotProximity();
+
         if (!sLLMChatterConfig->IsEnabled())
             return;
 
         uint32 now = getMSTime();
+
+        if (now - _lastGeneralAudienceRefreshTime >= 1000)
+        {
+            _lastGeneralAudienceRefreshTime = now;
+            RefreshGeneralAudienceSnapshot();
+        }
 
         if (now - _lastDeliveryTime
             >= sLLMChatterConfig->_deliveryPollMs)
         {
             _lastDeliveryTime = now;
             DeliverPendingMessages();
+            // Duel and PvP onlooker moments run on the delivery
+            // poll: emote steps are delivery-like output. The
+            // driver is cheap when nothing is pending.
+            if (sLLMChatterConfig->_proxChatterEnable)
+                ProcessPendingFightMoments();
         }
+
+        if (now - _lastLetterDeliveryTime
+            >= sLLMChatterConfig->_lettersPollSeconds * 1000)
+        {
+            _lastLetterDeliveryTime = now;
+            DeliverPendingReactivityLetters();
+        }
+
+        UpdateFreshRumorZones(now);
 
         if (now - _lastTriggerTime
             >= sLLMChatterConfig->_triggerIntervalSeconds
@@ -394,6 +439,22 @@ public:
             }
         }
 
+        {
+            // Bots vote within seconds of a drop and a
+            // roll lasts a minute, so a short cadence.
+            static time_t lastLootRollCheck = 0;
+            time_t nowSec = time(nullptr);
+            if (nowSec - lastLootRollCheck >= 2)
+            {
+                lastLootRollCheck = nowSec;
+                CheckGroupLootRolls();
+                // Subzone discoveries for bot memories;
+                // the explore flag is set as the player
+                // moves, so the same cadence suffices.
+                CheckGroupDiscoveries();
+            }
+        }
+
         if (sLLMChatterConfig->_nearbyObjectEnable
             && sLLMChatterConfig->_useGroupChatter
             && now - _lastGoScanTime
@@ -406,13 +467,40 @@ public:
         }
 
         if (sLLMChatterConfig->_proxChatterEnable
-            && now - _lastProximityScanTime
-                >= sLLMChatterConfig
-                       ->_proxChatterScanInterval
+            && now - _lastOutdoorProximityScanTime
+                >= std::max<uint32>(
+                       1,
+                       sLLMChatterConfig
+                           ->_proxChatterOutdoorScanInterval)
                     * 1000)
         {
-            _lastProximityScanTime = now;
-            CheckProximityChatter();
+            _lastOutdoorProximityScanTime = now;
+            CheckProximityChatter(false);
+        }
+
+        if (sLLMChatterConfig->_proxChatterEnable
+            && now - _lastInstanceProximityScanTime
+                >= std::max<uint32>(
+                       1,
+                       sLLMChatterConfig
+                           ->_proxChatterInstanceScanInterval)
+                    * 1000)
+        {
+            _lastInstanceProximityScanTime = now;
+            CheckProximityChatter(true);
+        }
+
+        if (sLLMChatterConfig->_proxChatterEnable
+            && sLLMChatterConfig->_proxBossDialogueEnable
+            && now - _lastBossDialogueCheckTime
+                >= std::max<uint32>(
+                    1,
+                    sLLMChatterConfig
+                        ->_proxBossApproachCheckInterval)
+                    * 1000)
+        {
+            _lastBossDialogueCheckTime = now;
+            CheckBossProximityDialogue();
         }
 
         if (sLLMChatterConfig->_useGroupChatter
@@ -469,10 +557,14 @@ public:
 private:
     uint32 _lastTriggerTime = 0;
     uint32 _lastDeliveryTime = 0;
+    uint32 _lastLetterDeliveryTime = 0;
+    uint32 _lastGeneralAudienceRefreshTime = 0;
     uint32 _lastEnvironmentCheckTime = 0;
     uint32 _lastTransportCheckTime = 0;
     uint32 _lastGoScanTime = 0;
-    uint32 _lastProximityScanTime = 0;
+    uint32 _lastOutdoorProximityScanTime = 0;
+    uint32 _lastInstanceProximityScanTime = 0;
+    uint32 _lastBossDialogueCheckTime = 0;
     uint32 _lastQuestFlushTime = 0;
     uint32 _lastGroupJoinFlushTime = 0;
     uint32 _lastRaidMoraleTime = 0;
@@ -591,19 +683,32 @@ private:
                     std::string cooldownKey =
                         "transport:"
                         + std::to_string(entry);
+                    // The area the transport is in as it arrives,
+                    // usually its harbour, so the bridge can describe
+                    // the place.
+                    uint32 dockArea = map->GetAreaId(
+                        transport->GetPhaseMask(),
+                        transport->GetPositionX(),
+                        transport->GetPositionY(),
+                        transport->GetPositionZ());
                     std::string extraData = "{"
                         "\"transport_entry\":"
                         + std::to_string(entry) + ","
                         "\"transport_name\":\""
-                        + JsonEscape(info.fullName) + "\","
+                        + ChatterJsonEscape(info.fullName) + "\","
                         "\"destination\":\""
-                        + JsonEscape(info.destination)
+                        + ChatterJsonEscape(info.destination)
                         + "\","
                         "\"transport_type\":\""
-                        + JsonEscape(info.transportType)
+                        + ChatterJsonEscape(info.transportType)
                         + "\","
+                        "\"dock_area_id\":"
+                        + std::to_string(dockArea) + ","
                         "\"verified_bots\":"
                         + verifiedJson + "}";
+                    // Grouped dockside bots know their own group
+                    // (issue #94); every speaker is guarded.
+                    AppendCandidateGroups(extraData, verifiedBots);
 
                     QueueEvent(
                         "transport_arrives",
@@ -662,11 +767,8 @@ private:
         // Bucket online, idle bot members of those guilds.
         std::unordered_map<uint32,
             std::vector<Player*>> byGuild;
-        PlayerBotMap allBots =
-            sRandomPlayerbotMgr.GetAllBots();
-        for (auto const& pair : allBots)
+        for (Player* bot : GetChatterBots())
         {
-            Player* bot = pair.second;
             if (!bot || !bot->IsInWorld()
                 || !bot->IsAlive())
                 continue;
@@ -685,16 +787,25 @@ private:
             byGuild[guildId].push_back(bot);
         }
 
+        std::random_device rd;
+        std::mt19937 generator(rd());
         for (uint32 guildId : activeGuilds)
         {
             auto it = byGuild.find(guildId);
             if (it == byGuild.end())
                 continue;
 
-            std::vector<Player*> const& members =
-                it->second;
+            std::vector<Player*> members = it->second;
             if (members.empty())
                 continue;
+
+            if (WasGuildPlayerInteractionRecent(
+                    guildId,
+                    sLLMChatterConfig
+                        ->_guildPlayerIdleSuppressionSeconds))
+            {
+                continue;
+            }
 
             auto cdIt = guildCooldowns.find(guildId);
             if (cdIt != guildCooldowns.end()
@@ -707,8 +818,25 @@ private:
                 > sLLMChatterConfig->_guildChatterChance)
                 continue;
 
-            Player* speaker =
-                members[urand(0, members.size() - 1)];
+            std::shuffle(
+                members.begin(), members.end(), generator);
+
+            bool isConversation =
+                members.size() >= 2
+                && urand(1, 100)
+                    <= sLLMChatterConfig
+                           ->_guildChatterConversationChance;
+            uint32 participantCount =
+                isConversation
+                    ? SelectConversationParticipantCount(
+                        static_cast<uint32>(members.size()),
+                        sLLMChatterConfig
+                            ->_guildChatterMaxParticipants)
+                    : 1;
+            std::vector<Player*> participants(
+                members.begin(),
+                members.begin() + participantCount);
+            Player* speaker = participants.front();
 
             Guild* guild =
                 sGuildMgr->GetGuildById(guildId);
@@ -721,7 +849,10 @@ private:
             uint32 added = 0;
             for (Player* m : members)
             {
-                if (m == speaker)
+                if (std::find(
+                        participants.begin(),
+                        participants.end(),
+                        m) != participants.end())
                     continue;
                 if (added)
                     mates += ", ";
@@ -730,15 +861,62 @@ private:
                     break;
             }
 
+            // PR #30 follow-up #1: pass the authoritative faction from
+            // GetTeamId() so the bridge need not derive it from a race map.
+            const char* teamName =
+                speaker->GetTeamId() == TEAM_ALLIANCE
+                    ? "Alliance"
+                    : "Horde";
+
+            std::string participantsJson = "[";
+            for (uint32 i = 0;
+                 i < participants.size();
+                 ++i)
+            {
+                Player* participant = participants[i];
+                if (i)
+                    participantsJson += ",";
+                participantsJson += fmt::format(
+                    R"({{"guid":{},"name":"{}",)"
+                    R"("zone_id":{},"area_id":{},"map_id":{}}})",
+                    participant->GetGUID().GetCounter(),
+                    ChatterJsonEscape(participant->GetName()),
+                    participant->GetZoneId(),
+                    participant->GetAreaId(),
+                    participant->GetMapId());
+            }
+            participantsJson += "]";
+
             std::string json = fmt::format(
-                R"({{"guild_name":"{}",)"
+                R"({{"guild_id":{},)"
+                R"("guild_name":"{}",)"
                 R"("speaker_name":"{}",)"
+                R"("mode":"{}",)"
+                R"("participants":{},)"
                 R"("guildmates":"{}",)"
-                R"("zone_id":{}}})",
-                JsonEscape(guildName),
-                JsonEscape(speaker->GetName()),
-                JsonEscape(mates),
-                speaker->GetZoneId());
+                R"("team":"{}",)"
+                R"("zone_id":{},)"
+                R"("area_id":{},)"
+                R"("weather":"{}",)"
+                // Online real members, so rumors rotate between readers.
+                R"("audience":{}}})",
+                guildId,
+                ChatterJsonEscape(guildName),
+                ChatterJsonEscape(speaker->GetName()),
+                isConversation
+                    ? "conversation"
+                    : "statement",
+                participantsJson,
+                ChatterJsonEscape(mates),
+                teamName,
+                speaker->GetZoneId(),
+                speaker->GetAreaId(),
+                ChatterJsonEscape(GetZoneWeatherName(
+                    speaker->GetZoneId())),
+                BuildAudienceListJson(
+                    CollectRealGuildMembers(guildId, 10)));
+            // Group facts and guards for the speakers (issue #94).
+            AppendCandidateGroups(json, participants);
 
             std::string cooldownKey =
                 "guild_idle_"
@@ -791,8 +969,7 @@ private:
             if (!map || !map->IsRaid())
                 continue;
 
-            if (player->IsMounted()
-                || player->IsFlying())
+            if (player->IsFlying())
                 continue;
 
             Group* group = player->GetGroup();
@@ -869,8 +1046,8 @@ private:
                 R"("zone_id":{},)"
                 R"("difficulty":"{}"}})",
                 groupId,
-                JsonEscape(player->GetName()),
-                JsonEscape(map->GetMapName()),
+                ChatterJsonEscape(player->GetName()),
+                ChatterJsonEscape(map->GetMapName()),
                 player->GetZoneId(),
                 diffStr);
 
@@ -906,12 +1083,8 @@ private:
         uint32 zoneId, TeamId teamId)
     {
         std::vector<Player*> bots;
-        PlayerBotMap allBots =
-            sRandomPlayerbotMgr.GetAllBots();
-
-        for (auto const& pair : allBots)
+        for (Player* bot : GetChatterBots())
         {
-            Player* bot = pair.second;
             if (!bot)
                 continue;
 

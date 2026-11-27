@@ -31,10 +31,15 @@ from chatter_prompts import (
     build_event_conversation_prompt,
     build_event_statement_prompt,
 )
+from chatter_identity import prepare_channel_persona
+from chatter_party_presence import with_group_presence
 from chatter_shared import (
+    get_chatter_mode,
     get_zone_name,
     get_class_name,
+    get_gender_label,
     get_race_name,
+    attach_speaker_gear,
     run_single_reaction,
     get_effective_speaker_cooldown,
     call_llm,
@@ -44,9 +49,15 @@ from chatter_shared import (
     strip_speaker_prefix,
     cleanup_message,
     calculate_dynamic_delay,
+    _reserve_zone_delivery_window,
 )
 
 logger = logging.getLogger(__name__)
+
+# Channel name used by the group-awareness block (issue #94). Only
+# transport arrivals carry bot_groups; other world events are
+# unchanged.
+_PRESENCE_CHANNEL = 'the public General channel'
 
 
 # ------------------------------------------------------------------
@@ -62,6 +73,10 @@ def _normalize_bot(bot):
     if isinstance(bot.get('bot1_race'), int):
         bot['bot1_race'] = get_race_name(
             bot['bot1_race']
+        )
+    if isinstance(bot.get('bot1_gender'), int):
+        bot['bot1_gender'] = get_gender_label(
+            bot['bot1_gender']
         )
     return bot
 
@@ -162,6 +177,18 @@ def _check_zone_fatigue(
     )
 
 
+def _event_area_id(event, extra_data) -> int:
+    """Subzone for a world event prompt. Only a transport arrival is
+    tied to a place (its harbour); weather, holidays and day/night are
+    zone-wide General chat and get the zone context only."""
+    if event.get('event_type') != 'transport_arrives':
+        return 0
+    try:
+        return int((extra_data or {}).get('dock_area_id') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _deliver_conversation(
     db, client, config, event, bots, extra_data,
     zone_id,
@@ -181,23 +208,37 @@ def _deliver_conversation(
             'class': b['bot1_class'],
             'race': b['bot1_race'],
             'level': b['bot1_level'],
+            'gender': b.get('bot1_gender') or '',
             'zone': get_zone_name(
                 b.get('zone_id', zone_id)
             ),
         })
+
+    attach_speaker_gear(db, formatted, config)
+    mode = get_chatter_mode(config)
+    for b in formatted:
+        b['persona'] = prepare_channel_persona(
+            db, client, config, b['guid'], b['name'], 'general',
+            event.setdefault('_prepared_personas', {}),
+        )
 
     bot_names = [b['name'] for b in formatted]
     bot_guids = {
         b['name']: b['guid'] for b in formatted
     }
 
-    current_weather = extra_data.get(
-        'current_weather', 'clear'
+    # A weather event describes the new weather itself; the
+    # stored value is the weather it replaced. Never assume
+    # "clear" when nothing is known.
+    current_weather = (
+        None
+        if str(event.get('event_type', '')).startswith('weather')
+        else extra_data.get('current_weather') or None
     )
     recent_msgs = get_recent_zone_messages(
         db, zone_id
     )
-    event_context = build_event_context(event)
+    event_context = build_event_context(event, db)
 
     prompt = build_event_conversation_prompt(
         formatted,
@@ -206,9 +247,12 @@ def _deliver_conversation(
         config,
         current_weather,
         recent_messages=recent_msgs,
-        area_id=int(
-            formatted[0].get('area_id', 0) or 0
-        ),
+        area_id=_event_area_id(event, extra_data),
+    )
+    prompt = with_group_presence(
+        prompt, db, config, extra_data,
+        [(b['guid'], b['name']) for b in formatted],
+        _PRESENCE_CHANNEL,
     )
 
     evt_names = ','.join(bot_names)
@@ -234,7 +278,8 @@ def _deliver_conversation(
         messages, label='event_conv',
     )
 
-    cumulative_delay = 0.0
+    prepared = []
+    relative_delay = 0.0
     for i, msg in enumerate(messages):
         bot_guid = bot_guids.get(
             msg['name'],
@@ -252,7 +297,22 @@ def _deliver_conversation(
             delay = calculate_dynamic_delay(
                 len(final_message), config,
             )
-            cumulative_delay += delay
+            relative_delay += delay
+
+        prepared.append((
+            i, msg, bot_guid, final_message,
+            relative_delay,
+        ))
+
+    base_delay = _reserve_zone_delivery_window(
+        zone_id, config,
+        duration_seconds=relative_delay,
+    )
+    for (
+        i, msg, bot_guid, final_message,
+        relative_delay,
+    ) in prepared:
+        cumulative_delay = base_delay + relative_delay
 
         insert_chat_message(
             db,
@@ -299,7 +359,12 @@ def _deliver_statement(
         get_zone_name(use_zone_id) or "the world"
     )
 
-    event_context = build_event_context(event)
+    bot['persona'] = prepare_channel_persona(
+        db, client, config, int(bot['bot1_guid']), bot['bot1_name'],
+        'general', event.setdefault('_prepared_personas', {}),
+    )
+
+    event_context = build_event_context(event, db)
     event_prompt = build_event_statement_prompt(
         bot,
         event_context,
@@ -308,8 +373,12 @@ def _deliver_statement(
         config=config,
         extra_data=extra_data,
         zone_id=use_zone_id,
-        # area_id not available from candidate query
-        area_id=0,
+        area_id=_event_area_id(event, extra_data),
+    )
+    event_prompt = with_group_presence(
+        event_prompt, db, config, extra_data,
+        [(bot['bot1_guid'], bot['bot1_name'])],
+        _PRESENCE_CHANNEL,
     )
 
     delay_min = int(config.get(
@@ -319,6 +388,14 @@ def _deliver_statement(
         'LLMChatter.MessageDelayMax', 30000
     ))
     delay_ms = random.randint(delay_min, delay_max)
+    initial_delay = delay_ms / 1000.0
+
+    def resolve_delivery_delay(_message):
+        base_delay = _reserve_zone_delivery_window(
+            use_zone_id, config,
+            duration_seconds=initial_delay,
+        )
+        return base_delay + initial_delay
 
     result = run_single_reaction(
         db,
@@ -328,7 +405,8 @@ def _deliver_statement(
         speaker_name=bot['bot1_name'],
         bot_guid=int(bot['bot1_guid']),
         channel='general',
-        delay_seconds=delay_ms // 1000,
+        delay_seconds=initial_delay,
+        delay_resolver=resolve_delivery_delay,
         event_id=event_id,
         bypass_speaker_cooldown=True,
         context=(
@@ -349,7 +427,9 @@ def _deliver_statement(
             int(event.get('map_id') or 0),
             source_event_id=event_id,
             source_sequence=0,
-            source_delay_seconds=delay_ms // 1000,
+            source_delay_seconds=result[
+                'delay_seconds'
+            ],
         )
         mark_event(db, event_id, 'completed')
         return True

@@ -123,13 +123,13 @@ def gap_for_policy(config: dict, policy: str) -> int:
         return _int_config(
             config,
             'LLMChatter.PartyGate.FillerMinGapSeconds',
-            8,
+            12,
         )
     if policy == POLICY_RESPONSIVE:
         return _int_config(
             config,
             'LLMChatter.PartyGate.ResponsiveMinGapSeconds',
-            2,
+            4,
         )
     if policy == POLICY_URGENT:
         return _int_config(
@@ -142,7 +142,7 @@ def gap_for_policy(config: dict, policy: str) -> int:
     return _int_config(
         config,
         'LLMChatter.PartyGate.ContextualMinGapSeconds',
-        6,
+        10,
     )
 
 

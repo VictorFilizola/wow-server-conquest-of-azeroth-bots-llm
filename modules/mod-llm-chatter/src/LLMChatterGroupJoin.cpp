@@ -10,6 +10,7 @@
 
 #include "LLMChatterConfig.h"
 #include "LLMChatterGroup.h"
+#include "LLMChatterGroupAwareness.h"
 #include "LLMChatterGroupInternal.h"
 #include "LLMChatterShared.h"
 
@@ -122,7 +123,7 @@ void QueueBotGreetingEvent(
             "\"bot_guid\":" +
                 std::to_string(botGuid) + ","
             "\"bot_name\":\"" +
-                JsonEscape(botName) + "\","
+                ChatterJsonEscape(botName) + "\","
             "\"bot_class\":" +
                 std::to_string(botClass) + ","
             "\"bot_race\":" +
@@ -135,7 +136,7 @@ void QueueBotGreetingEvent(
             "\"group_id\":" +
                 std::to_string(groupId) + ","
             "\"player_name\":\"" +
-                JsonEscape(playerName) + "\","
+                ChatterJsonEscape(playerName) + "\","
             "\"player_guid\":" +
                 std::to_string(playerGuid) + ","
             "\"group_size\":" +
@@ -528,7 +529,7 @@ void FlushGroupJoinBatches()
                 "\"bot_guid\":" +
                     std::to_string(e.botGuid) + ","
                 "\"bot_name\":\"" +
-                    JsonEscape(e.botName) + "\","
+                    ChatterJsonEscape(e.botName) + "\","
                 "\"bot_class\":" +
                     std::to_string(e.botClass) + ","
                 "\"bot_race\":" +
@@ -541,7 +542,7 @@ void FlushGroupJoinBatches()
                 "\"group_id\":" +
                     std::to_string(b.groupId) + ","
                 "\"player_name\":\"" +
-                    JsonEscape(b.playerName) + "\","
+                    ChatterJsonEscape(b.playerName) + "\","
                 "\"player_guid\":" +
                     std::to_string(b.playerGuid) + ","
                 "\"group_size\":0,"
@@ -582,7 +583,7 @@ void FlushGroupJoinBatches()
                         std::to_string(
                             e.botGuid) + ","
                     "\"bot_name\":\"" +
-                        JsonEscape(e.botName)
+                        ChatterJsonEscape(e.botName)
                         + "\","
                     "\"bot_class\":" +
                         std::to_string(
@@ -616,7 +617,7 @@ void FlushGroupJoinBatches()
                 "\"group_id\":" +
                     std::to_string(b.groupId) + ","
                 "\"player_name\":\"" +
-                    JsonEscape(b.playerName)
+                    ChatterJsonEscape(b.playerName)
                     + "\","
                 "\"player_guid\":" +
                     std::to_string(b.playerGuid) + ","
@@ -667,6 +668,11 @@ public:
     void OnAddMember(
         Group* group, ObjectGuid guid) override
     {
+        // Membership bookkeeping runs before every gate, so
+        // bot-only groups and disabled party chatter still
+        // invalidate queued lines.
+        NoteGroupMemberAdded(group, guid);
+
         if (!sLLMChatterConfig->IsEnabled()
             || !sLLMChatterConfig->_useGroupChatter)
             return;
@@ -701,6 +707,8 @@ public:
         RemoveMethod /*method*/, ObjectGuid /*kicker*/,
         const char* /*reason*/) override
     {
+        NoteGroupMemberRemoved(group, guid);
+
         if (!sLLMChatterConfig->IsEnabled()
             || !sLLMChatterConfig->_useGroupChatter)
             return;
@@ -901,6 +909,8 @@ public:
 
     void OnDisband(Group* group) override
     {
+        NoteGroupDisbanded(group);
+
         if (!sLLMChatterConfig->IsEnabled()
             || !sLLMChatterConfig->_useGroupChatter)
             return;

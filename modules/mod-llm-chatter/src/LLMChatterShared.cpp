@@ -5,6 +5,7 @@
 #include "LLMChatterShared.h"
 
 #include "LLMChatterConfig.h"
+#include "LLMChatterBotSource.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
 #include "Chat.h"
@@ -12,33 +13,81 @@
 #include "CreatureAI.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "GameObject.h"
 #include "Group.h"
+#include "ItemTemplate.h"
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "Playerbots.h"
+#include "QuestDef.h"
 #include "RandomPlayerbotMgr.h"
+#include "SpellInfo.h"
+#include "StringFormat.h"
 #include "Transport.h"
+#include "Unit.h"
 #include "Util.h"
 #include "World.h"
 #include "WorldSession.h"
+#include "WorldSessionMgr.h"
 
 #include <utf8.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <set>
+#include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+std::string const& GetCreatureEntryColumn()
+{
+    // Upstream AzerothCore renamed creature.id1 to
+    // creature.id. Resolve the live schema once so all
+    // module world-DB queries support both layouts.
+    static std::string const column = []() -> std::string
+    {
+        if (QueryResult result = WorldDatabase.Query(
+                "SELECT COLUMN_NAME FROM "
+                "information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'creature' "
+                "AND COLUMN_NAME IN ('id', 'id1') "
+                "ORDER BY (COLUMN_NAME = 'id') DESC "
+                "LIMIT 1"))
+        {
+            return (*result)[0].Get<std::string>();
+        }
+        return "id";
+    }();
+    return column;
+}
+
 namespace
 {
+// Core has no public membership accessor. Form a pointer to the
+// protected base member here, then read it on the actual Player.
+// No derived object, downcast, or channel-list copy is involved.
+struct PlayerChannelAccess : Player
+{
+    static auto const& JoinedChannels(Player const& player)
+    {
+        return player.*&PlayerChannelAccess::m_channels;
+    }
+};
+
 constexpr uint8 PRIORITY_FILLER =
     static_cast<uint8>(LLMChatterPriorityBand::Filler);
 constexpr uint8 PRIORITY_NORMAL =
@@ -48,6 +97,33 @@ constexpr uint8 PRIORITY_HIGH =
 constexpr uint8 PRIORITY_HIGH_LOCAL = PRIORITY_HIGH + 1;
 constexpr uint8 PRIORITY_CRITICAL =
     static_cast<uint8>(LLMChatterPriorityBand::Critical);
+std::unordered_set<uint32> _namedBossEntries;
+
+using GeneralAudienceSnapshot =
+    std::unordered_map<uint64, uint8>;
+
+std::shared_mutex _generalAudienceSnapshotMutex;
+std::shared_ptr<GeneralAudienceSnapshot const>
+    _generalAudienceSnapshot;
+
+constexpr uint8 GENERAL_AUDIENCE_ALLIANCE = 0x01;
+constexpr uint8 GENERAL_AUDIENCE_HORDE = 0x02;
+
+uint64 MakeGeneralAudienceKey(
+    uint32 mapId, uint32 zoneId)
+{
+    return (static_cast<uint64>(mapId) << 32)
+        | static_cast<uint64>(zoneId);
+}
+
+uint8 GetGeneralAudienceTeamMask(TeamId teamId)
+{
+    if (teamId == TEAM_ALLIANCE)
+        return GENERAL_AUDIENCE_ALLIANCE;
+    if (teamId == TEAM_HORDE)
+        return GENERAL_AUDIENCE_HORDE;
+    return 0;
+}
 
 std::string EscapeLogPreview(
     std::string const& text, size_t maxBytes)
@@ -231,7 +307,7 @@ uint32 RollConfiguredDelay(
         sLLMChatterConfig->*maxMember);
 }
 
-constexpr std::array<EventPriorityRule, 34>
+constexpr std::array<EventPriorityRule, 49>
     kTierPriorityRules = {{
         {"bot_group_combat",        PRIORITY_CRITICAL},
         {"bot_group_spell_cast",    PRIORITY_CRITICAL},
@@ -249,12 +325,22 @@ constexpr std::array<EventPriorityRule, 34>
         {"raid_boss_wipe",          PRIORITY_CRITICAL},
         {"bot_group_player_msg",    PRIORITY_HIGH_LOCAL},
         {"player_general_msg",      PRIORITY_HIGH},
+        {"guild_player_message",    PRIORITY_HIGH},
+        {"guild_login_greeting",    PRIORITY_HIGH},
         {"bot_group_death",         PRIORITY_HIGH},
         {"bot_group_wipe",          PRIORITY_HIGH},
+        {"bot_group_duel_start",    PRIORITY_HIGH},
+        {"bot_group_duel_end",      PRIORITY_HIGH},
         {"bot_group_join",          PRIORITY_HIGH},
         {"bot_group_join_batch",    PRIORITY_HIGH},
+        // A roll stays open for one minute; the reason
+        // must arrive while the others still decide.
+        {"bot_group_loot_roll",     PRIORITY_HIGH},
         {"bg_match_start",          PRIORITY_HIGH},
         {"bg_pvp_kill",             PRIORITY_HIGH},
+        {"guild_pvp_kill",          PRIORITY_NORMAL},
+        {"guild_pvp_death",         PRIORITY_NORMAL},
+        {"zone_pvp_death",          PRIORITY_NORMAL},
         {"player_enters_zone",      PRIORITY_HIGH},
         {"bg_idle_chatter",         PRIORITY_FILLER},
         {"raid_idle_morale",        PRIORITY_FILLER},
@@ -264,11 +350,19 @@ constexpr std::array<EventPriorityRule, 34>
         {"day_night_transition",    PRIORITY_FILLER},
         {"proximity_say",           PRIORITY_FILLER},
         {"proximity_conversation",  PRIORITY_FILLER},
-        {"proximity_reply",         PRIORITY_NORMAL},
+        {"proximity_reply",         PRIORITY_HIGH},
+        {"proximity_boss_approach", PRIORITY_NORMAL},
+        {"proximity_boss_player_say", PRIORITY_HIGH},
         {"proximity_player_say",
-            PRIORITY_NORMAL},
+            PRIORITY_HIGH},
         {"proximity_player_conversation",
-            PRIORITY_NORMAL},
+            PRIORITY_HIGH},
+        {"proximity_player_emote", PRIORITY_HIGH},
+        {"guild_meet_greeting",     PRIORITY_HIGH},
+        {"guild_join_zone_announce", PRIORITY_NORMAL},
+        {"guild_npc_encounter",     PRIORITY_FILLER},
+        // Memory only: no line waits on it.
+        {"bot_group_discovery",     PRIORITY_FILLER},
     }};
 
 constexpr std::array<PredicatePriorityRule, 1>
@@ -276,9 +370,11 @@ constexpr std::array<PredicatePriorityRule, 1>
         {IsStateCalloutEventType, PRIORITY_CRITICAL},
     }};
 
-constexpr std::array<EventPriorityRule, 22>
+constexpr std::array<EventPriorityRule, 27>
     kLegacyPriorityRules = {{
         {"player_general_msg",       8},
+        {"guild_player_message",     8},
+        {"guild_login_greeting",     8},
         {"day_night_transition",     7},
         {"transport_arrives",        6},
         {"player_enters_zone",       6},
@@ -297,9 +393,12 @@ constexpr std::array<EventPriorityRule, 22>
         {"guild_idle_chatter",       0},
         {"proximity_say",           0},
         {"proximity_conversation",  0},
-        {"proximity_reply",         1},
-        {"proximity_player_say",          1},
-        {"proximity_player_conversation", 1},
+        {"proximity_reply",         2},
+        {"proximity_boss_approach", 1},
+        {"proximity_boss_player_say", 2},
+        {"proximity_player_say",          2},
+        {"proximity_player_conversation", 2},
+        {"proximity_player_emote",        2},
     }};
 
 constexpr std::array<PredicatePriorityRule, 1>
@@ -376,7 +475,7 @@ constexpr std::array<PredicateRangeDelayRule, 2>
         },
     }};
 
-constexpr std::array<ExactFixedDelayRule, 18>
+constexpr std::array<ExactFixedDelayRule, 19>
     kLegacyExactFixedDelayRules = {{
         {"bot_group_join",             &LLMChatterConfig::_reactDelayJoin},
         {
@@ -387,6 +486,10 @@ constexpr std::array<ExactFixedDelayRule, 18>
         {"bot_group_wipe",             &LLMChatterConfig::_reactDelayWipe},
         {"bot_group_death",            &LLMChatterConfig::_reactDelayDeath},
         {"bot_group_loot",             &LLMChatterConfig::_reactDelayLoot},
+        {
+            "bot_group_loot_roll",
+            &LLMChatterConfig::_reactDelayLootRoll,
+        },
         {"bot_group_combat",           &LLMChatterConfig::_reactDelayCombat},
         {
             "bot_group_player_msg",
@@ -459,11 +562,13 @@ constexpr std::array<PredicateFixedDelayRule, 5>
         },
     }};
 
-constexpr std::array<ExactLiteralDelayRule, 3>
+constexpr std::array<ExactLiteralDelayRule, 5>
     kLegacyExactLiteralDelayRules = {{
         {"player_enters_zone", 2},
+        {"proximity_reply", 1},
         {"proximity_player_say", 1},
         {"proximity_player_conversation", 1},
+        {"proximity_player_emote", 1},
     }};
 
 std::string GetBotRoleName(Player* player)
@@ -882,6 +987,7 @@ uint32 LookupTextEmoteId(const std::string& emoteName)
         {"lost", TEXT_EMOTE_LOST},
         {"mock", TEXT_EMOTE_MOCK},
         {"ponder", TEXT_EMOTE_PONDER},
+        {"rofl", TEXT_EMOTE_ROFL},
         {"pounce", TEXT_EMOTE_POUNCE},
         {"praise", TEXT_EMOTE_PRAISE},
         {"purr", TEXT_EMOTE_PURR},
@@ -1021,6 +1127,21 @@ uint32 LookupTextEmoteId(const std::string& emoteName)
 }
 }
 
+bool IsUnitPerceivableBy(Player* viewer, Unit* unit)
+{
+    if (!viewer || !unit)
+        return false;
+    if (!viewer->IsInWorld() || !unit->IsInWorld())
+        return false;
+    if (!viewer->IsInMap(unit))
+        return false;
+    if (!viewer->IsWithinDistInMap(
+            unit, viewer->GetVisibilityRange()))
+        return false;
+    // distanceCheck=true: also apply the core sight range.
+    return viewer->CanSeeOrDetect(unit, false, true);
+}
+
 bool IsPlayerBot(Player* player)
 {
     if (!player)
@@ -1034,14 +1155,183 @@ bool IsPlayerBot(Player* player)
     if (!ai)
         return false;
 
-    // During playerbot login, the synthetic bot
+    // During playerbot login, the socketless bot
     // WorldSession exists before PlayerbotAI master
     // state is always available. Session::IsBot()
     // handles that timing window. A user-controlled
     // self-bot uses a real client session and sets
-    // master == bot, so IsRealPlayer() keeps it in
+    // master == bot, so IsSelfBot() keeps it in
     // the real-player side of chatter ownership.
-    return !IsRealPlayer(player);
+    return !IsSelfBot(player);
+}
+
+bool IsInOverworld(Player* player)
+{
+    if (!player)
+        return false;
+
+    WorldSession* session = player->GetSession();
+    if (!session || session->PlayerLoading())
+        return false;
+
+    Map* map = player->GetMap();
+    if (!map)
+        return false;
+
+    return !map->Instanceable();
+}
+
+bool IsGroupedWithRealPlayer(Player* player)
+{
+    if (!player)
+        return false;
+
+    Group* group = player->GetGroup();
+    if (!group)
+        return false;
+
+    for (GroupReference* itr = group->GetFirstMember();
+         itr != nullptr; itr = itr->next())
+    {
+        Player* member = itr->GetSource();
+        if (member && member != player
+            && !IsPlayerBot(member))
+            return true;
+    }
+
+    return false;
+}
+
+std::vector<Player*> GetChatterBots()
+{
+    std::vector<Player*> bots;
+    std::set<ObjectGuid> seen;
+    for (auto const& pair : sRandomPlayerbotMgr.GetAllBots())
+    {
+        LLMChatterBotSource::AppendUniqueBot(
+            bots, seen, pair.first, pair.second);
+    }
+
+    if (!sLLMChatterConfig || !sLLMChatterConfig->_altBotsEnable)
+        return bots;
+
+    // Alt bots live in their owner's holder; bot sessions are not
+    // registered with sWorldSessionMgr, so walk the owners.
+    for (auto const& pair : sWorldSessionMgr->GetAllSessions())
+    {
+        WorldSession* session = pair.second;
+        Player* owner = session ? session->GetPlayer() : nullptr;
+        if (!owner || !owner->IsInWorld() || IsPlayerBot(owner))
+            continue;
+
+        PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(owner);
+        if (!mgr)
+            continue;
+
+        for (auto it = mgr->GetPlayerBotsBegin();
+             it != mgr->GetPlayerBotsEnd(); ++it)
+        {
+            if (it->second && IsPlayerBot(it->second))
+            {
+                LLMChatterBotSource::AppendUniqueBot(
+                    bots, seen, it->first, it->second);
+            }
+        }
+    }
+    return bots;
+}
+
+bool IsChatterSpeakerAllowed(Player* bot, char const** dropReason)
+{
+    LLMChatterBotSource::SpeakerVerdict verdict =
+        LLMChatterBotSource::ClassifySpeaker(
+            IsPlayerBot(bot),
+            bot && sRandomPlayerbotMgr.IsRandomBot(bot),
+            sLLMChatterConfig && sLLMChatterConfig->_altBotsEnable);
+    if (dropReason)
+        *dropReason = LLMChatterBotSource::SpeakerDropReason(verdict);
+    return verdict == LLMChatterBotSource::SpeakerVerdict::Ok;
+}
+
+void RefreshGeneralAudienceSnapshot()
+{
+    auto snapshot =
+        std::make_shared<GeneralAudienceSnapshot>();
+    WorldSessionMgr::SessionMap const& sessions =
+        sWorldSessionMgr->GetAllSessions();
+
+    for (auto const& pair : sessions)
+    {
+        WorldSession* session = pair.second;
+        if (!session || session->PlayerLoading())
+            continue;
+
+        Player* player = session->GetPlayer();
+        if (!player || !player->IsInWorld()
+            || IsPlayerBot(player)
+            || !IsInOverworld(player))
+            continue;
+
+        uint32 zoneId = player->GetZoneId();
+        uint8 teamMask = GetGeneralAudienceTeamMask(
+            player->GetTeamId());
+        if (!zoneId || !teamMask)
+            continue;
+
+        (*snapshot)[MakeGeneralAudienceKey(
+            player->GetMapId(), zoneId)] |= teamMask;
+    }
+
+    std::shared_ptr<GeneralAudienceSnapshot const>
+        published = snapshot;
+    std::unique_lock<std::shared_mutex> lock(
+        _generalAudienceSnapshotMutex);
+    _generalAudienceSnapshot.swap(published);
+}
+
+bool HasCachedGeneralAudience(
+    uint32 mapId, uint32 zoneId, TeamId teamId)
+{
+    std::shared_ptr<GeneralAudienceSnapshot const> snapshot;
+    {
+        std::shared_lock<std::shared_mutex> lock(
+            _generalAudienceSnapshotMutex);
+        snapshot = _generalAudienceSnapshot;
+    }
+
+    if (!snapshot)
+        return false;
+
+    auto itr = snapshot->find(
+        MakeGeneralAudienceKey(mapId, zoneId));
+    if (itr == snapshot->end())
+        return false;
+
+    uint8 teamMask = GetGeneralAudienceTeamMask(teamId);
+    return teamMask && (itr->second & teamMask) != 0;
+}
+
+std::vector<uint32> GetCachedGeneralAudienceZones()
+{
+    std::shared_ptr<GeneralAudienceSnapshot const> snapshot;
+    {
+        std::shared_lock<std::shared_mutex> lock(
+            _generalAudienceSnapshotMutex);
+        snapshot = _generalAudienceSnapshot;
+    }
+
+    std::set<uint32> uniqueZones;
+    if (snapshot)
+    {
+        for (auto const& [key, teamMask] : *snapshot)
+        {
+            if (teamMask)
+                uniqueZones.insert(static_cast<uint32>(key));
+        }
+    }
+
+    return std::vector<uint32>(
+        uniqueZones.begin(), uniqueZones.end());
 }
 
 Creature* FindCreatureBySpawnId(
@@ -1116,6 +1406,83 @@ std::string GetCreatureRoleName(Creature* creature)
     }
 }
 
+void LoadNamedBossCache()
+{
+    _namedBossEntries.clear();
+    std::string query =
+        "SELECT creditEntry AS entry"
+        "  FROM instance_encounters"
+        "  WHERE creditType = 0"
+        "    AND creditEntry > 0"
+        " UNION"
+        " SELECT entry FROM ("
+        "  SELECT ct.entry, ct.`rank`,"
+        "    ct.CreatureImmunitiesId,"
+        "    COUNT(*) AS spawns"
+        "  FROM creature_template ct"
+        "  JOIN creature c ON c."
+        + GetCreatureEntryColumn()
+        + " = ct.entry"
+        "  WHERE ct.`rank` = 3"
+        "    OR ct.CreatureImmunitiesId > 0"
+        "  GROUP BY ct.entry, c.map"
+        "  HAVING ct.`rank` = 3 OR COUNT(*) = 1"
+        ") AS bosses";
+    QueryResult result = WorldDatabase.Query(query);
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        _namedBossEntries.insert(
+            fields[0].Get<uint32>());
+    } while (result->NextRow());
+}
+
+bool IsLLMChatterBoss(Creature const* creature)
+{
+    if (!creature)
+        return false;
+
+    CreatureTemplate const* creatureTemplate =
+        creature->GetCreatureTemplate();
+    if (!creatureTemplate)
+        return false;
+
+    return creature->isWorldBoss()
+        || creature->IsDungeonBoss()
+        || creatureTemplate->rank
+            == CREATURE_ELITE_WORLDBOSS
+        || (creatureTemplate->type_flags
+            & CREATURE_TYPE_FLAG_BOSS_MOB)
+        || _namedBossEntries.count(
+            creature->GetEntry()) > 0;
+}
+
+bool IsLLMChatterInternalCreature(Creature const* creature)
+{
+    if (!creature)
+        return false;
+    if (creature->IsTrigger())
+        return true;
+
+    std::string const& name = creature->GetName();
+    if (name.empty())
+        return true;
+
+    static constexpr std::array<char const*, 6> markers = {
+        "[DND]", "(DND)", "[PH]", "(PH)",
+        "[UNUSED]", "(UNUSED)"
+    };
+    return std::any_of(
+        markers.begin(), markers.end(),
+        [&name](char const* marker)
+        {
+            return StringContainsStringI(name, marker);
+        });
+}
+
 std::string SanitizeUtf8(const std::string& str)
 {
     // Fast path: input is already valid UTF-8.
@@ -1176,7 +1543,7 @@ std::string EscapeString(const std::string& str)
     return result;
 }
 
-std::string JsonEscape(const std::string& str)
+std::string ChatterJsonEscape(std::string const& str)
 {
     // Universal guard: invalid UTF-8 must never reach a
     // MySQL JSON column (errno 3140).
@@ -1253,6 +1620,18 @@ std::string GetChatterClassName(uint8 classId)
     }
 }
 
+std::string GetChrRacesName(uint32 raceId)
+{
+    ChrRacesEntry const* race = sChrRacesStore.LookupEntry(raceId);
+    if (!race)
+        return "";
+    uint8 locale = sLLMChatterConfig->GetModuleLocale();
+    char const* name = race->name[locale];
+    if (!name || !*name)
+        name = race->name[LOCALE_enUS];
+    return name ? name : "";
+}
+
 std::string GetRaceName(uint8 raceId)
 {
     switch (raceId)
@@ -1267,8 +1646,39 @@ std::string GetRaceName(uint8 raceId)
         case RACE_TROLL: return "Troll";
         case RACE_BLOODELF: return "Blood Elf";
         case RACE_DRAENEI: return "Draenei";
-        default: return "Unknown";
+        default:
+            break;
     }
+
+    // Races added through ChrRaces (custom servers).
+    std::string const raceName = GetChrRacesName(raceId);
+    return raceName.empty() ? "Unknown" : raceName;
+}
+
+void SaveRaceNames()
+{
+    // The bridge names a race ID it does not know from this
+    // table, so prompts built from a character row use the
+    // same name as GetRaceName() puts in event JSON.
+    CharacterDatabaseTransaction trans =
+        CharacterDatabase.BeginTransaction();
+    trans->Append("DELETE FROM llm_chatter_race_names");
+    for (uint32 raceId = 1;
+         raceId < sChrRacesStore.GetNumRows(); ++raceId)
+    {
+        if (!sChrRacesStore.LookupEntry(raceId))
+            continue;
+
+        std::string const raceName = GetRaceName(raceId);
+        if (raceName == "Unknown")
+            continue;
+
+        trans->Append(
+            "INSERT INTO llm_chatter_race_names "
+            "(race_id, name) VALUES ({}, '{}')",
+            raceId, EscapeString(raceName));
+    }
+    CharacterDatabase.CommitTransaction(trans);
 }
 
 std::string GetZoneName(uint32 zoneId)
@@ -1276,7 +1686,7 @@ std::string GetZoneName(uint32 zoneId)
     if (AreaTableEntry const* area =
             sAreaTableStore.LookupEntry(zoneId))
     {
-        uint8 locale = sWorld->GetDefaultDbcLocale();
+        uint8 locale = sLLMChatterConfig->GetModuleLocale();
         char const* n = area->area_name[locale];
         std::string zoneName = n ? n : "";
         if (zoneName.empty())
@@ -1289,6 +1699,285 @@ std::string GetZoneName(uint32 zoneId)
     }
 
     return "Unknown Zone";
+}
+
+std::string GetAreaNameForLocale(uint32 areaId)
+{
+    AreaTableEntry const* area =
+        sAreaTableStore.LookupEntry(areaId);
+    if (!area)
+        return "";
+
+    uint8 locale = sLLMChatterConfig->GetModuleLocale();
+    char const* name = area->area_name[locale];
+    if (!name || !*name)
+        name = area->area_name[LOCALE_enUS];
+    return name ? name : "";
+}
+
+// The exact name the core gives a zone's General channel. This is
+// the one deliberate exception to the module-locale rule: the core
+// builds channel names from the worldserver DBC locale, so resolving
+// them in LLMChatter.Language would point bots at a channel no player
+// is in -- or, with enUS-only DBCs, at an empty name. Returns "" when
+// no name can be resolved; callers must not join or speak then.
+std::string GetGeneralChannelName(uint32 zoneId)
+{
+    AreaTableEntry const* area =
+        sAreaTableStore.LookupEntry(zoneId);
+    ChatChannelsEntry const* chEntry =
+        sChatChannelsStore.LookupEntry(
+            ChatChannelId::GENERAL);
+    if (!area || !chEntry)
+        return "";
+
+    LocaleConstant locale = sWorld->GetDefaultDbcLocale();
+    char const* zoneName = area->area_name[locale];
+    if (!zoneName || !*zoneName)
+        zoneName = area->area_name[LOCALE_enUS];
+    char const* pattern = chEntry->pattern[locale];
+    if (!pattern || !*pattern)
+        pattern = chEntry->pattern[LOCALE_enUS];
+    if (!zoneName || !*zoneName || !pattern || !*pattern)
+        return "";
+
+    char nameBuf[100];
+    std::snprintf(nameBuf, sizeof(nameBuf), pattern, zoneName);
+    return nameBuf;
+}
+
+// ---------------------------------------------------------------------
+// Locale-aware name/text lookups.
+//
+// All of these key off the module's own locale
+// (sLLMChatterConfig->GetModuleLocale(), i.e. LLMChatter.Language)
+// rather than the server-wide DBC locale, and gracefully fall back to the English-default value (the field
+// already baked into the in-memory template/DBC row) whenever no
+// locale-specific row exists. None of them can throw or crash on a
+// missing locale entry; a missing/null lookup simply falls through to
+// the default-locale value.
+// ---------------------------------------------------------------------
+
+std::string GetLocalizedCreatureName(Creature* creature)
+{
+    if (!creature)
+        return "";
+
+    // A pet carries its own name, which may be one the player
+    // chose. GetNameForLocaleIdx() resolves
+    // creature_template_locale from the entry, so it would answer
+    // with the species instead -- "Cat" for "Fluffy".
+    if (creature->IsPet())
+        return creature->GetName();
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    return creature->GetNameForLocaleIdx(locale);
+}
+
+uint32 GetChatterNameEntry(Creature* creature)
+{
+    if (!creature)
+        return 0;
+
+    // The bridge re-resolves a name from this entry, which for a
+    // pet would replace the name above with its species. Reporting
+    // no entry keeps the name that was sent.
+    if (creature->IsPet())
+        return 0;
+
+    return creature->GetEntry();
+}
+
+std::string GetLocalizedCreatureSubName(Creature* creature)
+{
+    if (!creature)
+        return "";
+
+    CreatureTemplate const* tmpl =
+        creature->GetCreatureTemplate();
+    if (!tmpl)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    if (locale != LOCALE_enUS)
+    {
+        if (CreatureLocale const* cl =
+                sObjectMgr->GetCreatureLocale(
+                    creature->GetEntry()))
+        {
+            if (cl->Title.size() > (size_t)locale
+                && !cl->Title[locale].empty())
+                return cl->Title[locale];
+        }
+    }
+
+    return tmpl->SubName;
+}
+
+std::string GetLocalizedGameObjectName(GameObject* go)
+{
+    if (!go)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    return go->GetNameForLocaleIdx(locale);
+}
+
+std::string GetLocalizedUnitName(Unit* unit)
+{
+    if (!unit)
+        return "";
+
+    if (Creature* creature = unit->ToCreature())
+        return GetLocalizedCreatureName(creature);
+
+    return unit->GetName();
+}
+
+std::string GetLocalizedItemName(ItemTemplate const* tmpl)
+{
+    if (!tmpl)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    if (locale != LOCALE_enUS)
+    {
+        if (ItemLocale const* il =
+                sObjectMgr->GetItemLocale(tmpl->ItemId))
+        {
+            if (il->Name.size() > (size_t)locale
+                && !il->Name[locale].empty())
+                return il->Name[locale];
+        }
+    }
+
+    return tmpl->Name1;
+}
+
+std::string GetLocalizedQuestTitle(Quest const* quest)
+{
+    if (!quest)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    if (locale != LOCALE_enUS)
+    {
+        if (QuestLocale const* ql =
+                sObjectMgr->GetQuestLocale(
+                    quest->GetQuestId()))
+        {
+            if (ql->Title.size() > (size_t)locale
+                && !ql->Title[locale].empty())
+                return ql->Title[locale];
+        }
+    }
+
+    return quest->GetTitle();
+}
+
+std::string GetLocalizedQuestDetails(Quest const* quest)
+{
+    if (!quest)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    if (locale != LOCALE_enUS)
+    {
+        if (QuestLocale const* ql =
+                sObjectMgr->GetQuestLocale(
+                    quest->GetQuestId()))
+        {
+            if (ql->Details.size() > (size_t)locale
+                && !ql->Details[locale].empty())
+                return ql->Details[locale];
+        }
+    }
+
+    return quest->GetDetails();
+}
+
+std::string GetLocalizedQuestObjectives(Quest const* quest)
+{
+    if (!quest)
+        return "";
+
+    LocaleConstant locale = sLLMChatterConfig->GetModuleLocale();
+    if (locale != LOCALE_enUS)
+    {
+        if (QuestLocale const* ql =
+                sObjectMgr->GetQuestLocale(
+                    quest->GetQuestId()))
+        {
+            if (ql->Objectives.size() > (size_t)locale
+                && !ql->Objectives[locale].empty())
+                return ql->Objectives[locale];
+        }
+    }
+
+    return quest->GetObjectives();
+}
+
+std::string GetLocalizedSpellName(SpellInfo const* spellInfo)
+{
+    if (!spellInfo)
+        return "";
+
+    uint8 locale = sLLMChatterConfig->GetModuleLocale();
+    char const* name = spellInfo->SpellName[locale];
+    if (name && name[0] != '\0')
+        return name;
+
+    name = spellInfo->SpellName[LOCALE_enUS];
+    return name ? name : "";
+}
+
+std::string GetLocalizedAchievementName(AchievementEntry const* achievement)
+{
+    if (!achievement)
+        return "";
+
+    uint8 locale = sLLMChatterConfig->GetModuleLocale();
+    char const* name = achievement->name[locale];
+    if (name && name[0] != '\0')
+        return name;
+
+    name = achievement->name[LOCALE_enUS];
+    return name ? name : "";
+}
+
+std::string GetLocalizedTitleName(
+    CharTitlesEntry const* title, uint8 gender)
+{
+    if (!title)
+        return "";
+
+    uint8 locale = sLLMChatterConfig->GetModuleLocale();
+    char const* const* names =
+        (gender == GENDER_FEMALE)
+            ? title->nameFemale
+            : title->nameMale;
+
+    char const* name = names[locale];
+    if (name && name[0] != '\0')
+        return name;
+
+    name = names[LOCALE_enUS];
+    return name ? name : "";
+}
+
+std::string GetUnitGenderLabel(Unit const* unit)
+{
+    if (!unit)
+        return "";
+    switch (unit->getGender())
+    {
+        case GENDER_FEMALE:
+            return "female";
+        case GENDER_MALE:
+            return "male";
+        default:
+            return "";
+    }
 }
 
 std::string BuildBotIdentityFields(
@@ -1319,7 +2008,7 @@ std::string BuildBotIdentityFields(
             std::to_string(
                 player->GetGUID().GetCounter())
         + ",\"bot_name\":\""
-        + JsonEscape(player->GetName()) + "\","
+        + ChatterJsonEscape(player->GetName()) + "\","
         + "\"bot_class\":"
         + std::to_string(player->getClass())
         + ",\"bot_race\":"
@@ -1349,6 +2038,14 @@ bool IsEventOnCooldown(
             return true;
     }
 
+    return IsPersistedEventOnCooldown(
+        cooldownKey, cooldownSeconds);
+}
+
+bool IsPersistedEventOnCooldown(
+    std::string const& cooldownKey,
+    uint32 cooldownSeconds)
+{
     QueryResult result = CharacterDatabase.Query(
         "SELECT 1 FROM llm_chatter_events "
         "WHERE cooldown_key = '{}' AND created_at > "
@@ -1363,6 +2060,25 @@ void SetEventCooldown(
     const std::string& cooldownKey)
 {
     cooldownCache[cooldownKey] = time(nullptr);
+}
+
+uint32 SelectConversationParticipantCount(
+    uint32 available, uint32 maximum)
+{
+    if (!available)
+        return 0;
+
+    uint32 capped = std::min(
+        std::min(available, maximum), 4u);
+    if (capped < 2)
+        return 1;
+
+    uint32 roll = urand(1, 100);
+    if (roll <= 50 || capped == 2)
+        return 2;
+    if (roll <= 80 || capped == 3)
+        return 3;
+    return 4;
 }
 
 void LogIgnoredAddonChat(
@@ -1395,6 +2111,16 @@ void LogIgnoredAddonChat(
         preview);
 }
 
+bool IsPlayerInChannel(Player const* player, Channel const* channel)
+{
+    if (!player || !channel)
+        return false;
+
+    auto const& channels = PlayerChannelAccess::JoinedChannels(*player);
+    return std::find(channels.begin(), channels.end(), channel)
+        != channels.end();
+}
+
 bool CanSpeakInGeneralChannel(Player* bot)
 {
     if (!bot || !bot->IsInWorld())
@@ -1407,21 +2133,9 @@ bool CanSpeakInGeneralChannel(Player* bot)
     // they would never be in any General channel.
     EnsureBotInGeneralChannel(bot);
 
-    uint32 zoneId = bot->GetZoneId();
-    AreaTableEntry const* area =
-        sAreaTableStore.LookupEntry(zoneId);
-    if (!area)
-        return false;
-
-    char const* zn =
-        area->area_name[sWorld->GetDefaultDbcLocale()];
-    std::string zoneName = zn ? zn : "";
-    if (zoneName.empty())
-    {
-        zn = area->area_name[LOCALE_enUS];
-        zoneName = zn ? zn : "";
-    }
-    if (zoneName.empty())
+    std::string channelName =
+        GetGeneralChannelName(bot->GetZoneId());
+    if (channelName.empty())
         return false;
 
     ChannelMgr* cMgr =
@@ -1437,11 +2151,11 @@ bool CanSpeakInGeneralChannel(Player* bot)
         if (channel->GetChannelId()
             != ChatChannelId::GENERAL)
             continue;
-        if (channel->GetName().find(zoneName)
-            == std::string::npos)
+        if (channel->GetName() != channelName)
             continue;
 
-        return bot->IsInChannel(channel);
+        if (IsPlayerInChannel(bot, channel))
+            return true;
     }
 
     return false;
@@ -1541,6 +2255,7 @@ std::string GetTextEmoteName(uint32 emoteId)
         {TEXT_EMOTE_PRAY,          "pray"},
         {TEXT_EMOTE_READY,         "ready"},
         {TEXT_EMOTE_ROAR,          "roar"},
+        {TEXT_EMOTE_ROFL,          "rofl"},
         {TEXT_EMOTE_RUDE,          "rude"},
         {TEXT_EMOTE_SALUTE,        "salute"},
         {TEXT_EMOTE_SCRATCH,       "scratch"},
@@ -1726,10 +2441,13 @@ std::string BuildBotStateJson(Player* player)
 
     PlayerbotAI* ai = GET_PLAYERBOT_AI(player);
 
+    // Only name a victim the bot can actually perceive, so
+    // a stealthed or invisible target never leaks into a
+    // prompt through bot state.
     std::string targetName;
     Unit* victim = player->GetVictim();
-    if (victim)
-        targetName = victim->GetName();
+    if (victim && IsUnitPerceivableBy(player, victim))
+        targetName = GetLocalizedUnitName(victim);
 
     std::string botState = "non_combat";
     if (ai)
@@ -1753,9 +2471,36 @@ std::string BuildBotStateJson(Player* player)
                 inCombat ? "true" : "false")
             + ","
         "\"target\":\"" +
-            JsonEscape(targetName) + "\","
+            ChatterJsonEscape(targetName) + "\","
         "\"bot_ai_state\":\"" + botState + "\","
         + BuildBotTravelStateJson(player) + "}";
+}
+
+// Who in the player's group is dead or a ghost. A ghost running
+// back to its body is not travelling with the party, so travel
+// memories leave that stretch out.
+std::string BuildGroupDeathJson(Player* player)
+{
+    std::string json = std::string("\"player_dead\":")
+        + (player && !player->IsAlive() ? "true" : "false")
+        + ",\"dead_bot_guids\":[";
+    Group* group = player ? player->GetGroup() : nullptr;
+    if (group)
+    {
+        bool first = true;
+        for (auto const& slot : group->GetMemberSlots())
+        {
+            Player* member = ObjectAccessor::FindPlayer(slot.guid);
+            if (!member || member->IsAlive()
+                || !IsPlayerBot(member))
+                continue;
+            if (!first)
+                json += ",";
+            first = false;
+            json += std::to_string(member->GetGUID().GetCounter());
+        }
+    }
+    return json + "]";
 }
 
 std::string GetBotTravelMode(Player* player)
@@ -1895,15 +2640,14 @@ std::string GetBotTravelContext(Player* player)
 
 namespace
 {
-bool IsUnsafeChatterFacingMotionType(
+bool IsSafeChatterFacingMotionType(
     MovementGeneratorType type)
 {
     switch (type)
     {
-        case WAYPOINT_MOTION_TYPE:
-        case FLIGHT_MOTION_TYPE:
-        case POINT_MOTION_TYPE:
-        case ESCORT_MOTION_TYPE:
+        case IDLE_MOTION_TYPE:
+        case RANDOM_MOTION_TYPE:
+        case ANIMAL_RANDOM_MOTION_TYPE:
             return true;
         default:
             return false;
@@ -1938,14 +2682,27 @@ bool HasUnsafeChatterFacingMotion(Unit* unit)
         != NULL_MOTION_TYPE)
         return true;
 
-    if (IsUnsafeChatterFacingMotionType(
-            motion->GetCurrentMovementGeneratorType())
-        || IsUnsafeChatterFacingMotionType(
-            motion->GetMotionSlotType(MOTION_SLOT_ACTIVE)))
+    if (!IsSafeChatterFacingMotionType(
+            motion->GetCurrentMovementGeneratorType()))
+        return true;
+
+    MovementGeneratorType activeType =
+        motion->GetMotionSlotType(MOTION_SLOT_ACTIVE);
+    if (activeType != NULL_MOTION_TYPE
+        && !IsSafeChatterFacingMotionType(activeType))
         return true;
 
     if (Creature* creature = unit->ToCreature())
     {
+        // A facing spline replaces an NPC's own movement and can strand
+        // its wander or patrol script. Only turn NPCs that never move.
+        if (creature->GetDefaultMovementType() != IDLE_MOTION_TYPE
+            || motion->GetCurrentMovementGeneratorType()
+                != IDLE_MOTION_TYPE
+            || (activeType != NULL_MOTION_TYPE
+                && activeType != IDLE_MOTION_TYPE))
+            return true;
+
         if (CreatureAI* ai = creature->AI())
         {
             if (ai->IsEscorted())
@@ -1994,7 +2751,7 @@ std::string BuildBotTravelStateJson(Player* player)
         "\"travel_state\":{"
         "\"mode\":\"" + GetBotTravelMode(player) + "\","
         "\"context\":\"" +
-            JsonEscape(GetBotTravelContext(player)) + "\","
+            ChatterJsonEscape(GetBotTravelContext(player)) + "\","
         "\"mounted\":" +
             std::string(isMounted ? "true" : "false")
             + ","
@@ -2010,7 +2767,7 @@ std::string BuildBotTravelStateJson(Player* player)
         "\"mount_display_id\":" +
             std::to_string(player->GetMountID()) + ","
         "\"transport_name\":\"" +
-            JsonEscape(transportName) + "\""
+            ChatterJsonEscape(transportName) + "\""
         "}";
 }
 
@@ -2074,14 +2831,16 @@ void UpdateGroupBotTravelState(Player* player, uint32 groupId)
         player->GetGUID().GetCounter());
 }
 
-void QueueChatterEvent(
-    const std::string& eventType,
-    const std::string& eventScope,
+namespace
+{
+std::string BuildChatterEventInsert(
+    std::string const& eventType,
+    std::string const& eventScope,
     uint32 zoneId, uint32 mapId, uint8 priority,
-    const std::string& cooldownKey,
-    uint32 subjectGuid, const std::string& subjectName,
-    uint32 targetGuid, const std::string& targetName,
-    uint32 targetEntry, const std::string& extraData,
+    std::string const& cooldownKey,
+    uint32 subjectGuid, std::string const& subjectName,
+    uint32 targetGuid, std::string const& targetName,
+    uint32 targetEntry, std::string const& extraData,
     uint32 reactAfterSeconds,
     uint32 expiresAfterSeconds,
     bool nullZeroNumeric)
@@ -2095,7 +2854,7 @@ void QueueChatterEvent(
 
     // NOTE: extraData is written directly into a single-quoted SQL
     // string literal. Callers must pre-escape it for SQL.
-    CharacterDatabase.Execute(
+    return Acore::StringFormat(
         "INSERT INTO llm_chatter_events "
         "(event_type, event_scope, zone_id, map_id, "
         "priority, cooldown_key, subject_guid, "
@@ -2125,6 +2884,48 @@ void QueueChatterEvent(
         reactAfterSeconds,
         expiresAfterSeconds);
 }
+} // namespace
+
+void QueueChatterEvent(
+    const std::string& eventType,
+    const std::string& eventScope,
+    uint32 zoneId, uint32 mapId, uint8 priority,
+    const std::string& cooldownKey,
+    uint32 subjectGuid, const std::string& subjectName,
+    uint32 targetGuid, const std::string& targetName,
+    uint32 targetEntry, const std::string& extraData,
+    uint32 reactAfterSeconds,
+    uint32 expiresAfterSeconds,
+    bool nullZeroNumeric)
+{
+    CharacterDatabase.Execute(BuildChatterEventInsert(
+        eventType, eventScope, zoneId, mapId, priority,
+        cooldownKey, subjectGuid, subjectName,
+        targetGuid, targetName, targetEntry, extraData,
+        reactAfterSeconds, expiresAfterSeconds,
+        nullZeroNumeric));
+}
+
+void AppendChatterEvent(
+    CharacterDatabaseTransaction trans,
+    std::string const& eventType,
+    std::string const& eventScope,
+    uint32 zoneId, uint32 mapId, uint8 priority,
+    std::string const& cooldownKey,
+    uint32 subjectGuid, std::string const& subjectName,
+    uint32 targetGuid, std::string const& targetName,
+    uint32 targetEntry, std::string const& extraData,
+    uint32 reactAfterSeconds,
+    uint32 expiresAfterSeconds,
+    bool nullZeroNumeric)
+{
+    trans->Append(BuildChatterEventInsert(
+        eventType, eventScope, zoneId, mapId, priority,
+        cooldownKey, subjectGuid, subjectName,
+        targetGuid, targetName, targetEntry, extraData,
+        reactAfterSeconds, expiresAfterSeconds,
+        nullZeroNumeric));
+}
 
 void AppendRaidContext(
     Player* player, std::string& json)
@@ -2140,6 +2941,25 @@ void AppendRaidContext(
 
     uint8 playerSubGroup =
         group->GetMemberGroup(player->GetGUID());
+
+    // Bot-triggered events pass the bot here. Anchor
+    // the party list on the real player's subgroup so
+    // Python targets bots the player can actually hear.
+    if (IsPlayerBot(player))
+    {
+        for (GroupReference* itr =
+                 group->GetFirstMember();
+             itr; itr = itr->next())
+        {
+            Player* member = itr->GetSource();
+            if (member && !IsPlayerBot(member))
+            {
+                playerSubGroup = group->GetMemberGroup(
+                    member->GetGUID());
+                break;
+            }
+        }
+    }
 
     std::string partyGuids = "[";
     std::string raidGuids = "[";
@@ -2273,11 +3093,8 @@ Player* FindNearbyDefenderBot(
 
     std::vector<Player*> candidates;
 
-    auto allBots =
-        sRandomPlayerbotMgr.GetAllBots();
-    for (auto& pair : allBots)
+    for (Player* bot : GetChatterBots())
     {
-        Player* bot = pair.second;
         if (!bot || !bot->IsInWorld()
             || !bot->IsAlive())
             continue;
@@ -2420,9 +3237,11 @@ void SendPartyMessageInstant(
         data,
         CHAT_MSG_PARTY,
         LANG_UNIVERSAL,
-        bot,
-        nullptr,
-        message);
+        bot->GetGUID(),
+        ObjectGuid::Empty,
+        message,
+        CHAT_TAG_NONE,
+        bot->GetName());
 
     int subGroup = -1;
     if (group->isRaidGroup())

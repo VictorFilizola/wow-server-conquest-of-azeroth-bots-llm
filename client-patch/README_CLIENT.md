@@ -16,7 +16,8 @@ This directory contains the pre-configured fixes needed to run the Conquest of A
 1. Locate your Ascension client directory (e.g. `client-coa/ascension-live`).
 2. Copy `DivxTac.dll` and `play.sh` directly into the client root folder (alongside `Ascension.exe`).
 3. Copy `patch-B.MPQ` and `realmlist.wtf` into the client's `Data/` folder (overwrite when prompted).
-4. Launch the game using:
+4. *(Optional)* Copy `../client-addons/Chatter` into the client's `Interface/AddOns/Chatter/` directory (keeping the folder named `Chatter`), restart the client, and tick **Load out of date AddOns** on character select to manage bot traits and backstories in-game via `/chatter`.
+5. Launch the game using:
    ```bash
    ./play.sh
    ```

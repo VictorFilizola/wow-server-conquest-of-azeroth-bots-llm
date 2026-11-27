@@ -1,16 +1,25 @@
 #ifndef MOD_LLM_CHATTER_SHARED_H
 #define MOD_LLM_CHATTER_SHARED_H
 
+#include "DatabaseEnvFwd.h"
 #include "Define.h"
 #include "SharedDefines.h"
 #include <ctime>
 #include <map>
 #include <string>
+#include <vector>
 
+class Channel;
+struct AchievementEntry;
+struct CharTitlesEntry;
 class Creature;
+class GameObject;
 class Group;
+struct ItemTemplate;
 class Map;
 class Player;
+class Quest;
+class SpellInfo;
 class Unit;
 
 enum class LLMChatterPriorityBand : uint8
@@ -24,7 +33,31 @@ enum class LLMChatterPriorityBand : uint8
 };
 
 bool IsPlayerBot(Player* player);
+// True when `viewer` can currently perceive `unit`: both in
+// the world, same map and instance, within the viewer's
+// visibility range, and passing stealth/invisibility
+// detection. Use before naming a unit in any prompt.
+bool IsUnitPerceivableBy(Player* viewer, Unit* unit);
+bool IsInOverworld(Player* player);
+bool IsGroupedWithRealPlayer(Player* player);
+// Every bot that may speak in General or Guild: random bots,
+// plus the alt bots of every online real player while
+// LLMChatter.AltBots.Enable is on. Each bot appears once.
+std::vector<Player*> GetChatterBots();
+// The General/Guild speaker rule (LLMChatterBotSource.h):
+// true when `bot` is a bot and, for an alt bot, alt bots are
+// enabled. On false, `dropReason` names the reason.
+bool IsChatterSpeakerAllowed(
+    Player* bot, char const** dropReason = nullptr);
+void RefreshGeneralAudienceSnapshot();
+bool HasCachedGeneralAudience(
+    uint32 mapId, uint32 zoneId, TeamId teamId);
+std::vector<uint32> GetCachedGeneralAudienceZones();
+std::string const& GetCreatureEntryColumn();
 Creature* FindCreatureBySpawnId(Map* map, uint32 spawnId);
+void LoadNamedBossCache();
+bool IsLLMChatterBoss(Creature const* creature);
+bool IsLLMChatterInternalCreature(Creature const* creature);
 
 // Strip invalid UTF-8 byte sequences, preserving every
 // valid UTF-8 run. Returns input unchanged when already
@@ -39,14 +72,22 @@ std::string NormalizeChatTextForDb(
     const std::string& str, size_t maxChars = 0);
 
 std::string EscapeString(const std::string& str);
-std::string JsonEscape(const std::string& str);
+// Module-prefixed: mod-playerbots defines a global JsonEscape.
+std::string ChatterJsonEscape(std::string const& str);
 std::string GetCreatureRoleName(Creature* creature);
 std::string GetChatterClassName(uint8 classId);
+// Name of any race in ChrRaces, playable or not, in the
+// server DBC locale with enUS as fallback; empty if unknown.
+std::string GetChrRacesName(uint32 raceId);
 std::string GetRaceName(uint8 raceId);
+// Writes the name of every race in ChrRaces to
+// llm_chatter_race_names for the bridge (startup only).
+void SaveRaceNames();
 std::string BuildBotIdentityFields(
     Player* player, bool includeRoles = false);
 std::string BuildBotStateJson(Player* player);
 std::string BuildBotTravelStateJson(Player* player);
+std::string BuildGroupDeathJson(Player* player);
 std::string GetBotTravelContext(Player* player);
 std::string GetBotTravelMode(Player* player);
 bool HasUnsafeChatterFacingMotion(Unit* unit);
@@ -54,6 +95,28 @@ bool IsSafeForChatterFacing(Unit* unit);
 void UpdateGroupBotTravelState(Player* player, uint32 groupId = 0);
 std::string ConvertAllLinks(const std::string& text);
 std::string GetZoneName(uint32 zoneId);
+std::string GetAreaNameForLocale(uint32 areaId);
+std::string GetGeneralChannelName(uint32 zoneId);
+
+// Locale-aware name/text lookups (mirror the fallback semantics of
+// GetZoneName() above: prefer the module locale, fall back
+// to the English-default value baked into the template/DBC row, never
+// throw on a missing locale entry).
+std::string GetLocalizedCreatureName(Creature* creature);
+uint32 GetChatterNameEntry(Creature* creature);
+std::string GetLocalizedCreatureSubName(Creature* creature);
+std::string GetLocalizedGameObjectName(GameObject* go);
+std::string GetLocalizedUnitName(Unit* unit);
+std::string GetLocalizedItemName(ItemTemplate const* tmpl);
+std::string GetLocalizedQuestTitle(Quest const* quest);
+std::string GetLocalizedQuestDetails(Quest const* quest);
+std::string GetLocalizedQuestObjectives(Quest const* quest);
+std::string GetLocalizedSpellName(SpellInfo const* spellInfo);
+std::string GetLocalizedAchievementName(AchievementEntry const* achievement);
+std::string GetLocalizedTitleName(CharTitlesEntry const* title, uint8 gender);
+// "female" / "male" for prompt payloads; "" when the unit is null or has
+// no gender (GENDER_NONE beasts, mechanicals), so it is never guessed.
+std::string GetUnitGenderLabel(Unit const* unit);
 uint32 GetTextEmoteId(const std::string& emoteName);
 bool IsBGAllowedEmote(const std::string& emoteName);
 void PlayUnitTextEmoteAnimation(Unit* unit, uint32 textEmoteId);
@@ -73,14 +136,20 @@ void RecordPartyChatGateActivity(
     const std::string& deliveryPolicy,
     const std::string& deliveryReason);
 void EnsureBotInGeneralChannel(Player* bot);
+bool IsPlayerInChannel(Player const* player, Channel const* channel);
 bool CanSpeakInGeneralChannel(Player* bot);
 bool IsEventOnCooldown(
     std::map<std::string, time_t>& cooldownCache,
     const std::string& cooldownKey,
     uint32 cooldownSeconds);
+bool IsPersistedEventOnCooldown(
+    std::string const& cooldownKey,
+    uint32 cooldownSeconds);
 void SetEventCooldown(
     std::map<std::string, time_t>& cooldownCache,
     const std::string& cooldownKey);
+uint32 SelectConversationParticipantCount(
+    uint32 available, uint32 maximum);
 void LogIgnoredAddonChat(
     Player const* player, uint32 type,
     std::string const& msg, char const* source);
@@ -94,6 +163,20 @@ void QueueChatterEvent(
     uint32 subjectGuid, const std::string& subjectName,
     uint32 targetGuid, const std::string& targetName,
     uint32 targetEntry, const std::string& extraData,
+    uint32 reactAfterSeconds,
+    uint32 expiresAfterSeconds,
+    bool nullZeroNumeric);
+// Same row as QueueChatterEvent(), appended to `trans` so the event
+// exists only if the rest of that transaction commits.
+void AppendChatterEvent(
+    CharacterDatabaseTransaction trans,
+    std::string const& eventType,
+    std::string const& eventScope,
+    uint32 zoneId, uint32 mapId, uint8 priority,
+    std::string const& cooldownKey,
+    uint32 subjectGuid, std::string const& subjectName,
+    uint32 targetGuid, std::string const& targetName,
+    uint32 targetEntry, std::string const& extraData,
     uint32 reactAfterSeconds,
     uint32 expiresAfterSeconds,
     bool nullZeroNumeric);

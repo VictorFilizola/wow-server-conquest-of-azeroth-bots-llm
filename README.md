@@ -51,6 +51,50 @@ docker compose restart ac-authserver
 
 ---
 
+## Client Setup
+
+To connect and use all features (Transmog UI, custom CoA progression, and the Chatter Companion bot-editor UI), apply the client patches and addons below to your **Ascension Conquest of Azeroth (3.3.5a)** client folder (`<Client>`, e.g. `ascension-live/`).
+
+### 1. Apply Required Client Patches (`client-patch/`)
+Copy the files from `client-patch/` into your `<Client>` directory (see also `client-patch/README_CLIENT.md`):
+- **Client root (`<Client>/`, alongside `Ascension.exe`):**
+  - `client-patch/DivxTac.dll` — native 32-bit stub DLL that prevents the 100% loading-screen deadlock under Wine/Proton.
+  - `client-patch/play.sh` — Wine/DXVK launch script (`WINEDLLOVERRIDES="d3d9=n,b" wine Ascension.exe`).
+- **Data directory (`<Client>/Data/`, overwrite when prompted):**
+  - `client-patch/Data/patch-B.MPQ` — fixes the Transmog UI (`C_Appearance.ApplyPendingAppearances()`) and silences obsolete `localtalent` / `localspec` chat spam.
+  - `client-patch/Data/realmlist.wtf` — pre-configured with `set realmlist 127.0.0.1`. For LAN or Tailscale play, edit this file to `set realmlist <your-server-ip>`.
+
+### 2. Install Client AddOns (`client-addons/`)
+- **Chatter Companion (recommended for `mod-llm-chatter`):** Copy `client-addons/Chatter` into `<Client>/Interface/AddOns/Chatter` so `Chatter.toc` sits directly inside `Interface/AddOns/Chatter/Chatter.toc`. **Keep the folder name `Chatter` exact**, otherwise the 3.3.5a client will not list or load it.
+- **Crow's Cache (optional):** Copy `client-addons/CoACrowsCache` into `<Client>/Interface/AddOns/CoACrowsCache` if you enable the High-Risk level-60 Crow's Cache world-map marker event.
+
+Expected `<Client>` layout after setup:
+```text
+<Client>/
+├── Ascension.exe
+├── DivxTac.dll                  # from client-patch/
+├── play.sh                      # from client-patch/ (Linux/Wine)
+├── Data/
+│   ├── patch-B.MPQ              # from client-patch/Data/ (overwrite)
+│   └── realmlist.wtf            # from client-patch/Data/ (127.0.0.1 or server IP)
+└── Interface/
+    └── AddOns/
+        ├── Chatter/             # from client-addons/Chatter/
+        │   └── Chatter.toc
+        └── CoACrowsCache/       # optional, from client-addons/CoACrowsCache/
+            └── CoACrowsCache.toc
+```
+
+### 3. Launch & Activate AddOns
+1. **Launch the game:**
+   - **Linux / Wine / Proton:** run `./play.sh` (or `WINEDLLOVERRIDES="d3d9=n,b" wine Ascension.exe`).
+   - **Windows:** launch `Ascension.exe`.
+   - *(Always perform a full client restart after adding new addon folders for the first time — `/reload` alone will not detect newly added files.)*
+2. **Enable AddOns at Character Select:** Click **AddOns** in the bottom-left corner, make sure **Chatter** is checked, and tick **Load out of date AddOns**.
+3. **Open Chatter In-Game:** Type `/chatter` or `/llmc` in chat (or open **Esc → Interface → AddOns → Chatter → Bot Traits / Background Stories**) to view Known Bots, edit traits, and edit or regenerate bot backstories.
+
+---
+
 ## The 21 Custom Conquest of Azeroth Classes
 
 This server replaces the standard 10 classes with **21 completely unique, fully fleshed-out classes** (IDs 12 through 32), each with bespoke talent trees, stances, mechanics, resource systems, and spells:
@@ -92,15 +136,34 @@ This server replaces the standard 10 classes with **21 completely unique, fully 
   - **Party Chat commands:** Whisper or say `follow`, `stay`, `attack`, `nc -loot` (stop looting), `nc +loot`.
 
 ### 2. `mod-llm-chatter` (AI Roleplay Personalities)
-Bots use LLM-driven intelligence (DeepSeek / OpenAI / Ollama) to talk in say, party, and yell chats.
+Bots use LLM-driven intelligence (DeepSeek / OpenAI / Anthropic / Google / OpenRouter / Ollama) to hold in-character conversations across party/raid chat, proximity `/say`, General, Guild, battlegrounds, and raids, complete with persistent shared memories and generated background stories.
 - Configured with **bespoke roleplay speech modifiers for all 21 custom CoA classes** (e.g. Barbarians roar about battle fury, Witch Doctors speak of spirits and mojo, Chronomancers speak in temporal paradoxes).
 - See `CONFIG.md` to configure your DeepSeek / OpenRouter API key.
 
-### 3. `mod-autobalance`
+### 3. Chatter Companion Addon (`client-addons/Chatter`)
+An in-game WoW 3.3.5a companion UI ([Hokken/Chatter-Companion](https://github.com/Hokken/Chatter-Companion)) for managing `mod-llm-chatter` bot personalities directly inside the client:
+- Browse your **Known Bots** roster (bots that hold memories with your character).
+- Edit each bot's **3 persistent personality traits** (up to 64 characters each) and view its LLM-generated speaking **tone**.
+- Read, rewrite (**Save Story**, up to 1,000 characters), or **Regenerate Story** for each bot's background story.
+- **Forget selected** bots to erase their shared memories with your character while preserving their global personality.
+
+**Installation:**
+1. Copy `client-addons/Chatter` into your client's `Interface/AddOns/` folder so `Chatter.toc` sits directly at `<Client>/Interface/AddOns/Chatter/Chatter.toc` (the folder must be named exactly `Chatter`).
+2. Fully restart the WoW / Ascension client (a `/reload` alone will not discover newly added files on first install).
+3. At the character selection screen, click **AddOns** (bottom-left), verify **Chatter** is enabled, and tick **Load out of date AddOns**.
+
+**How to Use In-Game:**
+- Type `/chatter` or `/llmc` to open the floating editor window (or open **Interface → AddOns → Chatter** for the dedicated **Bot Traits** and **Background Stories** panels).
+- Group up with a bot and play briefly so it forms a memory of your character and appears in the **Known Bots** list (click **Refresh** to update the roster).
+- Select a bot, edit its 3 traits, and click **Save Traits** — the Python bridge regenerates its tone and background story asynchronously while the UI polls and displays the result automatically.
+- Edit the story box and click **Save Story** to write a custom backstory without regenerating traits/tone, or click **Regenerate Story** to generate a fresh origin story.
+- Check one or more bots in the list and click **Forget selected** to clear their memories with your character.
+
+### 4. `mod-autobalance`
 - Automatically scales creature health and damage dynamically based on your group size.
 - 5-man dungeons are tuned for 1 player; 10/25/40-man raids are tuned for your 5-man Alt-Squad party.
 
-### 4. `mod-transmog`
+### 5. `mod-transmog`
 - Full transmog system with **all restrictions removed**:
   - `IgnoreReqClass = 1` (wear any appearance across classes).
   - `IgnoreReqLevel = 1` (transmog high-level appearances at level 1).
@@ -138,7 +201,7 @@ To ensure DXVK renders custom CoA particle effects, spell overlays, and UI textu
 ```bash
 WINEDLLOVERRIDES="d3d9=n,b" wine Ascension.exe
 ```
-*(All patched files are pre-packaged for you inside the `client-patch/` directory!)*
+*(All patched files are pre-packaged inside `client-patch/` and optional addons inside `client-addons/`; see [Client Setup](#client-setup) and `client-patch/README_CLIENT.md` for full installation steps.)*
 
 ---
 
@@ -180,6 +243,12 @@ Enable GM powers in-game:
 .playerbots bot add <Name>    # Summon your offline alt into the world as an AI bot
 /invite <Name>                # Invite them to your group
 .playerbots bot remove <Name> # Dismiss your alt bot
+```
+
+### Chatter Companion Addon
+```text
+/chatter                      # Open the floating Chatter Companion bot traits & backstory editor
+/llmc                         # Alias to open Chatter Companion
 ```
 
 ### Handy GM Utilities

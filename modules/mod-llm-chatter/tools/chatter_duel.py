@@ -1,0 +1,493 @@
+"""Duel reactions for group bots.
+
+Handles bot_group_duel_start and bot_group_duel_end,
+queued by src/LLMChatterDuel.cpp. The reactor is
+either one of the duellists (a group bot) or a group
+bot watching the duel. A settled duel fought by a group
+bot or by the group's real player may also become a
+memory, always as a friendly training spar.
+"""
+
+import logging
+import random
+
+from chatter_shared import (
+    build_race_class_context,
+    build_bot_state_context,
+    append_json_instruction,
+    get_class_name,
+    get_race_name,
+    get_gender_label,
+)
+from chatter_prompts import (
+    pick_random_tone,
+    maybe_get_creative_twist,
+)
+from chatter_mode import build_player_prompt_header_from_dict
+from chatter_group_prompts import _pick_length_hint
+from chatter_handler_pipeline import run_group_handler
+from chatter_member_gender import genders_by_named_guid
+from chatter_memory import pick_event_bots, queue_memory
+
+logger = logging.getLogger(__name__)
+
+_OUTCOME_TEXT = {
+    'won': 'won the duel',
+    'fled': 'won the duel after the other fled '
+            'the duel area',
+}
+
+
+def _payload_flag(value):
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true')
+    return bool(value)
+
+
+def _describe_duellist(extra_data, prefix, bot_guid):
+    """Describe one duellist from the reactor's point
+    of view. Never labels anyone as a bot.
+
+    C++ omits the identity of a duellist the reactor
+    cannot perceive (`<prefix>_identity_known` false).
+    """
+    try:
+        guid = int(extra_data.get(f'{prefix}_guid', 0))
+    except (TypeError, ValueError):
+        guid = 0
+    if guid and guid == bot_guid:
+        return 'you'
+    if not _payload_flag(
+            extra_data.get(f'{prefix}_identity_known', True)):
+        return 'an opponent you cannot see clearly'
+
+    name = str(
+        extra_data.get(f'{prefix}_name') or ''
+    ).strip() or 'someone'
+    try:
+        level = int(extra_data.get(f'{prefix}_level', 0))
+        race = get_race_name(
+            int(extra_data.get(f'{prefix}_race', 0)))
+        cls = get_class_name(
+            int(extra_data.get(f'{prefix}_class', 0)))
+    except (TypeError, ValueError):
+        level, race, cls = 0, '', ''
+
+    gender = str(extra_data.get(f'{prefix}_gender') or '')
+    if gender not in ('female', 'male'):
+        gender = ''
+    desc = ' '.join(p for p in (
+        f"level {level}" if level else '', gender, race, cls,
+    ) if p)
+    who = f"{name} ({desc})" if desc else name
+    if _payload_flag(
+            extra_data.get(f'{prefix}_is_real_player')):
+        who += ", the real player in your party"
+    elif _payload_flag(
+            extra_data.get(f'{prefix}_in_group')):
+        who += ", from your party"
+    else:
+        who += ", from outside your party"
+    return who
+
+
+def _build_duel_prompt(
+    bot, traits, situation, guidance, mode,
+    chat_history="", extra_data=None,
+    speaker_talent_context=None, stored_tone=None,
+):
+    """Shared prompt shape for duel reactions."""
+    is_rp = (mode == 'roleplay')
+    trait_str = ', '.join(traits)
+    tone = stored_tone or pick_random_tone(mode)
+    twist = maybe_get_creative_twist(
+        chance=1.0, mode=mode
+    )
+
+    state_ctx = ""
+    actual_role = None
+    if extra_data:
+        state_ctx = build_bot_state_context(
+            extra_data, mode
+        )
+        actual_role = (
+            extra_data.get('bot_state', {})
+            .get('role')
+        )
+
+    rp_context = ""
+    if is_rp:
+        ctx = build_race_class_context(
+            bot['race'], bot['class'],
+            actual_role=actual_role
+        )
+        if ctx:
+            rp_context = f"\n{ctx}"
+    if chat_history:
+        rp_context += f"{chat_history}\n"
+
+    prompt = (
+        f"{build_player_prompt_header_from_dict(bot, mode)}\n"
+        f"Your personality: {trait_str}\n"
+    )
+    if speaker_talent_context:
+        prompt += f"{speaker_talent_context}\n"
+    prompt += f"Your tone: {tone}\n"
+    if twist:
+        prompt += f"Creative twist: {twist}\n"
+    if state_ctx:
+        prompt += f"{state_ctx}\n"
+    prompt += (
+        f"{rp_context}\n\n"
+        f"{situation}\n\n"
+        f"{guidance}\n\n"
+        f"Say a reaction in party chat.\n"
+        f"{_pick_length_hint(mode)}\n"
+        f"Rules:\n"
+        f"- No quotes, no emojis\n"
+        f"- A duel is a friendly contest; nobody "
+        f"dies\n"
+        f"- Friendly teasing is fine, but no slurs, "
+        f"abuse, or hateful language\n"
+        "- Let your personality show in how you say it, "
+        f"without naming your traits\n"
+        f"- Don't repeat jokes or themes "
+        f"already said in chat"
+    )
+    return append_json_instruction(prompt, True)
+
+
+def build_duel_start_prompt(
+    bot, traits, extra_data, mode,
+    chat_history="", speaker_talent_context=None,
+    stored_tone=None,
+):
+    """Prompt for a bot reacting as a duel begins."""
+    bot_guid = int(extra_data.get('bot_guid', 0))
+    a = _describe_duellist(
+        extra_data, 'duellist_a', bot_guid)
+    b = _describe_duellist(
+        extra_data, 'duellist_b', bot_guid)
+    role = extra_data.get('reactor_role', 'spectator')
+
+    if role == 'duellist':
+        opponent = b if a == 'you' else a
+        situation = (
+            f"You just started a duel against "
+            f"{opponent}."
+        )
+        guidance = (
+            "Say something as the duel begins: "
+            "confidence, a friendly taunt, or nerves, "
+            "as your personality suggests."
+        )
+    else:
+        situation = (
+            f"A duel just started between {a} and "
+            f"{b}. You are watching."
+        )
+        guidance = (
+            "Comment as a spectator: cheer someone "
+            "on, predict the winner, or offer a "
+            "friendly bet."
+        )
+
+    initiator = str(
+        extra_data.get('initiator_name') or ''
+    ).strip()
+    if initiator:
+        situation += f" {initiator} issued the challenge."
+
+    return _build_duel_prompt(
+        bot, traits, situation, guidance, mode,
+        chat_history=chat_history,
+        extra_data=extra_data,
+        speaker_talent_context=speaker_talent_context,
+        stored_tone=stored_tone,
+    )
+
+
+def build_duel_end_prompt(
+    bot, traits, extra_data, mode,
+    chat_history="", speaker_talent_context=None,
+    stored_tone=None,
+):
+    """Prompt for a bot reacting to a duel result."""
+    bot_guid = int(extra_data.get('bot_guid', 0))
+    winner = _describe_duellist(
+        extra_data, 'winner', bot_guid)
+    loser = _describe_duellist(
+        extra_data, 'loser', bot_guid)
+    role = extra_data.get('reactor_role', 'spectator')
+    outcome = extra_data.get('outcome', 'won')
+
+    if outcome == 'interrupted':
+        situation = (
+            f"The duel between {winner} and {loser} "
+            f"was interrupted before it was settled."
+        )
+        guidance = (
+            "React to the anticlimax: disappointment, "
+            "relief, or a call for a rematch."
+        )
+    elif role == 'winner':
+        how = (
+            " after they fled the duel area"
+            if outcome == 'fled' else ""
+        )
+        situation = f"You just won a duel against {loser}{how}."
+        guidance = (
+            "React to your win: gracious, smug, or "
+            "playful, as your personality suggests."
+        )
+    elif role == 'loser':
+        if outcome == 'fled':
+            situation = (
+                f"You left the duel area, so {winner} "
+                f"won the duel against you."
+            )
+        else:
+            situation = f"You just lost a duel to {winner}."
+        guidance = (
+            "React to losing: a good sport, a grumble, "
+            "an excuse, or a demand for a rematch."
+        )
+    else:
+        result = _OUTCOME_TEXT.get(outcome, 'won the duel')
+        situation = (
+            f"You watched a duel: {winner} {result} "
+            f"against {loser}."
+        )
+        guidance = (
+            "Comment as a spectator: congratulate, "
+            "tease the loser kindly, or settle a bet."
+        )
+
+    return _build_duel_prompt(
+        bot, traits, situation, guidance, mode,
+        chat_history=chat_history,
+        extra_data=extra_data,
+        speaker_talent_context=speaker_talent_context,
+        stored_tone=stored_tone,
+    )
+
+
+def _attach_duellist_genders(db, extra_data):
+    """Set <prefix>_gender for each duellist the reactor can see,
+    by the guid C++ always sends; unseen duellists stay unnamed."""
+    prefixes = sorted({
+        key[:-len('_guid')] for key in extra_data
+        if key.endswith('_guid') and key != 'bot_guid'
+        and f"{key[:-len('_guid')]}_identity_known" in extra_data
+    })
+    named = {
+        prefix: extra_data.get(f'{prefix}_guid') for prefix in prefixes
+        if _payload_flag(extra_data.get(f'{prefix}_identity_known'))
+    }
+    genders = genders_by_named_guid(db, named)
+    for prefix, gender in genders.items():
+        extra_data[f'{prefix}_gender'] = gender
+    return extra_data
+
+
+def _duellist_bot_guid(extra_data, prefix):
+    """The duellist's guid when it is a bot of this group,
+    else 0 (the real player, or someone outside)."""
+    if not _payload_flag(extra_data.get(f'{prefix}_in_group')):
+        return 0
+    if _payload_flag(extra_data.get(f'{prefix}_is_real_player')):
+        return 0
+    try:
+        return int(extra_data.get(f'{prefix}_guid') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _duellist_in_party(extra_data, prefix):
+    """True when the duellist is the group's real player or
+    one of its bots."""
+    return _payload_flag(extra_data.get(f'{prefix}_in_group'))
+
+
+def _duellist_name(extra_data, prefix):
+    """How a memory names a duellist: party members by name;
+    someone from outside the party by name with gender, race
+    and class; an opponent who could not be identified as a
+    stranger."""
+    if not _payload_flag(extra_data.get(f'{prefix}_identity_known')):
+        return 'a stranger'
+    name = str(extra_data.get(f'{prefix}_name') or '').strip()
+    if not name:
+        return 'a stranger'
+    if _duellist_in_party(extra_data, prefix):
+        return name
+    try:
+        race = get_race_name(int(extra_data.get(f'{prefix}_race', 0)))
+        cls = get_class_name(int(extra_data.get(f'{prefix}_class', 0)))
+    except (TypeError, ValueError):
+        race, cls = '', ''
+    gender = str(extra_data.get(f'{prefix}_gender') or '')
+    if gender not in ('female', 'male'):
+        gender = ''
+    desc = ' '.join(p for p in (gender, race, cls) if p)
+    article = 'an' if desc[:1].lower() in 'aeiou' and desc else 'a'
+    who = f"{name}, {article} {desc}" if desc else name
+    return f"{who} from outside the party"
+
+
+def duel_memory_context(extra_data, bot_guid):
+    """What a bot remembers of a settled duel: its own win or
+    loss, or one it watched; always a friendly training
+    spar. None for an unsettled (interrupted) duel."""
+    outcome = extra_data.get('outcome', 'won')
+    if outcome == 'interrupted':
+        return None
+    winner = _duellist_name(extra_data, 'winner')
+    loser = _duellist_name(extra_data, 'loser')
+    winner_guid = _duellist_bot_guid(extra_data, 'winner')
+    loser_guid = _duellist_bot_guid(extra_data, 'loser')
+    if bot_guid and bot_guid == winner_guid:
+        text = f"I won a friendly training spar against {loser}"
+        fled = f" after {loser} left the sparring ground"
+    elif bot_guid and bot_guid == loser_guid:
+        text = f"{winner} won a friendly training spar against me"
+        fled = " after I left the sparring ground"
+    else:
+        text = (
+            f"{winner} won a friendly training spar against {loser}"
+        )
+        fled = f" after {loser} left the sparring ground"
+    if outcome == 'fled':
+        text += fled
+    if bot_guid not in (winner_guid, loser_guid):
+        text += "; I watched"
+    return text
+
+
+def _witness_guids(extra_data):
+    """Bots the worldserver saw able to watch the duel
+    (witness_bot_guids); an older payload without the list
+    gives none."""
+    guids = []
+    for guid in extra_data.get('witness_bot_guids') or []:
+        try:
+            guids.append(int(guid))
+        except (TypeError, ValueError):
+            continue
+    return guids
+
+
+def _duel_end_memory(db, ctx, message):
+    """Memory: a settled duel fought by a bot of this group or
+    by its real player, whoever the opponent was. The
+    duelling bots remember it, and up to MaxBotsPerEvent
+    bots the worldserver saw watching. Memory.Enable and the
+    chance rolls come before any DB work."""
+    config = ctx['config']
+    extra_data = ctx['extra_data']
+    if not int(config.get('LLMChatter.Memory.Enable', 1)):
+        return
+    if extra_data.get('outcome', 'won') == 'interrupted':
+        return
+    if not (_duellist_in_party(extra_data, 'winner')
+            or _duellist_in_party(extra_data, 'loser')):
+        return
+    duellists = [
+        g for g in (
+            _duellist_bot_guid(extra_data, 'winner'),
+            _duellist_bot_guid(extra_data, 'loser'),
+        ) if g
+    ]
+    watchers = pick_event_bots(config, [
+        g for g in _witness_guids(extra_data) if g not in duellists
+    ])
+    chance = int(config.get(
+        'LLMChatter.Memory.DuelGenerationChance', 60
+    ))
+    chosen = [
+        g for g in duellists + watchers
+        if random.random() * 100 < chance
+    ]
+    if not chosen:
+        return
+    # Genders of identifiable duellists, outsiders included.
+    _attach_duellist_genders(db, extra_data)
+    group_id = ctx['group_id']
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT t.bot_guid, t.bot_name,"
+        " c.class, c.race, c.gender"
+        " FROM llm_group_bot_traits t"
+        " JOIN characters c ON c.guid = t.bot_guid"
+        " WHERE t.group_id = %s AND t.bot_guid IN ("
+        + ','.join(['%s'] * len(chosen)) + ")",
+        (group_id, *chosen),
+    )
+    rows = {int(r['bot_guid']): r for r in cursor.fetchall()}
+    cursor.close()
+    for guid in chosen:
+        bot = rows.get(guid)
+        if not bot:
+            continue
+        context = duel_memory_context(extra_data, guid)
+        if not context:
+            continue
+        try:
+            queue_memory(
+                config, group_id, bot['bot_guid'], 0,
+                memory_type='duel',
+                event_context=context,
+                bot_name=bot['bot_name'],
+                bot_class=get_class_name(bot['class']),
+                bot_race=get_race_name(bot['race']),
+                bot_gender=get_gender_label(bot.get('gender') or 0),
+            )
+        except Exception:
+            logger.error("duel memory queue failed", exc_info=True)
+
+
+def process_duel_start_event(db, client, config, event):
+    """Handle a bot_group_duel_start event."""
+    return run_group_handler(
+        db, client, config, event,
+        event_type_label='bot_group_duel_start',
+        extract_fields=lambda ed: {},
+        build_prompt=lambda ctx: (
+            build_duel_start_prompt(
+                ctx['bot'], ctx['traits'],
+                _attach_duellist_genders(
+                    ctx['db'], ctx['extra_data']),
+                ctx['mode'],
+                chat_history=ctx['chat_hist'],
+                speaker_talent_context=(
+                    ctx['speaker_talent']),
+                stored_tone=ctx['stored_tone'],
+            )
+        ),
+        delay_seconds=2,
+        label='reaction_duel_start',
+    )
+
+
+def process_duel_end_event(db, client, config, event):
+    """Handle a bot_group_duel_end event."""
+    return run_group_handler(
+        db, client, config, event,
+        event_type_label='bot_group_duel_end',
+        extract_fields=lambda ed: {},
+        build_prompt=lambda ctx: (
+            build_duel_end_prompt(
+                ctx['bot'], ctx['traits'],
+                _attach_duellist_genders(
+                    ctx['db'], ctx['extra_data']),
+                ctx['mode'],
+                chat_history=ctx['chat_hist'],
+                speaker_talent_context=(
+                    ctx['speaker_talent']),
+                stored_tone=ctx['stored_tone'],
+            )
+        ),
+        delay_seconds=2,
+        post_success=_duel_end_memory,
+        label='reaction_duel_end',
+    )

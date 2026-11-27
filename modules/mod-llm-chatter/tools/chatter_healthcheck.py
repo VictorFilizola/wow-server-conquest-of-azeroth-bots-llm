@@ -61,10 +61,13 @@ _REQUIRED_TABLES = [
     'llm_chatter_messages',
     'llm_group_bot_traits',
     'llm_bot_memories',
+    'llm_guild_chat_sessions',
+    'llm_guild_session_history',
 ]
 
 _VALID_PROVIDERS = (
-    'anthropic', 'openai', 'google', 'openrouter', 'ollama'
+    'anthropic', 'openai', 'google', 'openrouter', 'ollama',
+    'openai_compatible',
 )
 
 # provider -> (api_key_config_key, example_placeholder)
@@ -107,8 +110,11 @@ def format_db_target(config):
     return f"{user}@{host}:{port}/{name}"
 
 
-def format_llm_target(config):
-    """Human string of the LLM endpoint/provider/model."""
+def format_llm_target(config, model=None):
+    """Human string of the LLM endpoint/provider/model.
+
+    model overrides LLMChatter.Model (the LabelModel probe).
+    """
     provider = config.get(
         'LLMChatter.Provider', 'anthropic'
     ).strip().lower()
@@ -119,7 +125,10 @@ def format_llm_target(config):
         default_model = DEFAULT_GOOGLE_MODEL
     elif provider == 'openrouter':
         default_model = DEFAULT_OPENROUTER_MODEL
-    model = config.get('LLMChatter.Model', default_model)
+    elif provider == 'openai_compatible':
+        default_model = ''
+    if model is None:
+        model = config.get('LLMChatter.Model', default_model)
 
     if provider == 'ollama':
         base_url = config.get(
@@ -137,11 +146,19 @@ def format_llm_target(config):
             'LLMChatter.OpenRouter.BaseUrl', OPENROUTER_BASE_URL
         )
         return f"openrouter {model} @ {base_url}"
+    if provider == 'openai_compatible':
+        base_url = config.get(
+            'LLMChatter.OpenAICompatible.BaseUrl', ''
+        ).strip()
+        return f"openai_compatible {model} @ {base_url}"
     return f"{provider} {model}"
 
 
-def _resolved_model(config, provider):
-    """Resolve the model id for a provider as main() does."""
+def _resolved_model(config, provider, model=None):
+    """Resolve the model id for a provider as main() does.
+
+    model overrides LLMChatter.Model (the LabelModel probe).
+    """
     default_model = DEFAULT_ANTHROPIC_MODEL
     if provider == 'openai':
         default_model = DEFAULT_OPENAI_MODEL
@@ -149,10 +166,13 @@ def _resolved_model(config, provider):
         default_model = DEFAULT_GOOGLE_MODEL
     elif provider == 'openrouter':
         default_model = DEFAULT_OPENROUTER_MODEL
-    model = config.get('LLMChatter.Model', default_model)
+    elif provider == 'openai_compatible':
+        default_model = ''
+    if model is None:
+        model = config.get('LLMChatter.Model', default_model)
     try:
         from chatter_llm import resolve_model
-        return resolve_model(model)
+        return resolve_model(model, provider)
     except Exception:
         return model
 
@@ -224,6 +244,30 @@ def _check_provider_config(config):
             + ", ".join(_VALID_PROVIDERS) + ".",
         )
 
+    if provider == 'openai_compatible':
+        from chatter_llm import openai_compatible_target_error
+        error = openai_compatible_target_error(config)
+        if error:
+            return _result(
+                'provider_config', 'LLM provider config', 'fail',
+                f"Provider 'openai_compatible': {error}.",
+                "Set LLMChatter.OpenAICompatible.BaseUrl to your "
+                "server's OpenAI base URL (usually ending in /v1) "
+                "and LLMChatter.Model to a model ID it serves.",
+            )
+        base_url = config.get(
+            'LLMChatter.OpenAICompatible.BaseUrl', ''
+        ).strip()
+        key_set = bool((config.get(
+            'LLMChatter.OpenAICompatible.ApiKey', ''
+        ) or '').strip())
+        return _result(
+            'provider_config', 'LLM provider config', 'pass',
+            f"Provider 'openai_compatible'. URL: {base_url}, "
+            + ("API key set." if key_set
+               else "no API key (fine for local servers)."),
+        )
+
     if provider == 'ollama':
         base_url = config.get(
             'LLMChatter.Ollama.BaseUrl',
@@ -261,6 +305,42 @@ def _check_provider_config(config):
     return _result(
         'provider_config', 'LLM provider config', 'pass',
         f"Provider '{provider}', API key set in {key_name}.",
+    )
+
+
+def _check_quick_analyze_target(config):
+    """Validate an independent openai_compatible QuickAnalyze target.
+
+    Returns None unless LLMChatter.QuickAnalyze.Provider selects
+    openai_compatible while the main provider is something else.
+    Such a target has no defaults and never falls back.
+    """
+    qa_provider = (config.get(
+        'LLMChatter.QuickAnalyze.Provider', ''
+    ) or '').strip().lower()
+    provider = config.get(
+        'LLMChatter.Provider', 'anthropic'
+    ).strip().lower()
+    if qa_provider != 'openai_compatible' or qa_provider == provider:
+        return None
+    from chatter_llm import openai_compatible_target_error
+    error = openai_compatible_target_error(
+        config, 'LLMChatter.QuickAnalyze.Model'
+    )
+    if error:
+        return _result(
+            'quick_analyze_config', 'QuickAnalyze provider config',
+            'fail',
+            f"QuickAnalyze.Provider 'openai_compatible': {error}.",
+            "Set LLMChatter.OpenAICompatible.BaseUrl and "
+            "LLMChatter.QuickAnalyze.Model, or clear "
+            "LLMChatter.QuickAnalyze.Provider.",
+        )
+    return _result(
+        'quick_analyze_config', 'QuickAnalyze provider config', 'pass',
+        "QuickAnalyze uses openai_compatible "
+        f"{config.get('LLMChatter.QuickAnalyze.Model', '').strip()} @ "
+        f"{config.get('LLMChatter.OpenAICompatible.BaseUrl', '').strip()}.",
     )
 
 
@@ -476,32 +556,70 @@ def _is_model_error(exc):
     )
 
 
-def _probe_anthropic(config, model):
-    """Make a minimal Anthropic call; returns text or raises."""
-    import anthropic
-    client = anthropic.Anthropic(
-        api_key=config.get('LLMChatter.Anthropic.ApiKey', ''),
-    )
-    resp = client.messages.create(
-        model=model,
-        max_tokens=5,
-        messages=[{
-            'role': 'user',
-            'content': 'Reply with the single word: OK',
-        }],
-    )
-    return resp.content[0].text.strip()
+def _probe_token_budget(config):
+    """Bounded probe budget that leaves room for model overhead."""
+    try:
+        return max(128, min(int(config.get(
+            'LLMChatter.MaxTokens', 350
+        )), 512))
+    except (TypeError, ValueError):
+        return 256
 
 
-def _probe_openai_compatible(client, model):
+def _probe_anthropic(config, model, client=None):
+    """Make a minimal Anthropic call; returns text or raises.
+
+    Uses the production request settings (thinking mode, output
+    multiplier, temperature recovery) so the probe cannot fail on a
+    model whose default thinking would consume a tiny budget.
+    """
+    from chatter_llm import build_anthropic_request, extract_anthropic_text
+    from llm_compat import create_anthropic_message
+
+    if client is None:
+        import anthropic
+        client = anthropic.Anthropic(
+            api_key=config.get('LLMChatter.Anthropic.ApiKey', ''),
+        )
+    kwargs = build_anthropic_request(
+        model, config, _probe_token_budget(config),
+        'Reply with the single word: OK',
+        temperature=float(config.get('LLMChatter.Temperature', 0.8)),
+    )
+    resp = create_anthropic_message(client.messages.create, kwargs, model)
+    return extract_anthropic_text(resp)
+
+
+def _probe_openai_compatible(client, model, provider, config):
     """Make a minimal OpenAI-compatible call; text or raises."""
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=5,
-        messages=[{
+    from chatter_llm import (
+        build_compatible_chat_request,
+        compatible_reasoning_token_multiplier,
+    )
+    from llm_compat import create_chat_completion
+
+    messages = [{
             'role': 'user',
             'content': 'Reply with the single word: OK',
-        }],
+        }]
+    kwargs = build_compatible_chat_request(
+        provider,
+        model,
+        messages,
+        config,
+        _probe_token_budget(config),
+        temperature=float(config.get(
+            'LLMChatter.Temperature', 0.8
+        )),
+    )
+    resp = create_chat_completion(
+        client.chat.completions.create,
+        kwargs,
+        provider,
+        model,
+        reasoning_token_multiplier=(
+            compatible_reasoning_token_multiplier(provider, config)
+        ),
     )
     content = resp.choices[0].message.content
     if isinstance(content, str):
@@ -532,6 +650,11 @@ def _build_openai_compatible_client(config, provider):
                 'LLMChatter.Google.BaseUrl', GOOGLE_OPENAI_BASE_URL
             ),
         )
+    if provider == 'openai_compatible':
+        from chatter_llm import openai_compatible_client_kwargs
+        return openai.OpenAI(
+            **openai_compatible_client_kwargs(config)
+        )
     # openrouter
     kwargs = {
         'api_key': config.get('LLMChatter.OpenRouter.ApiKey', ''),
@@ -542,13 +665,24 @@ def _build_openai_compatible_client(config, provider):
     return openai.OpenAI(**kwargs)
 
 
-def _check_llm_probe(config):
-    """Make a minimal real LLM call and classify failures."""
+def _check_llm_probe(
+    config,
+    model=None,
+    *,
+    check_id='llm_probe',
+    title='LLM connectivity (live test)',
+    model_key='LLMChatter.Model',
+):
+    """Make a minimal real LLM call and classify failures.
+
+    model, check_id, title and model_key are set by the LabelModel
+    probe; by default this tests LLMChatter.Model.
+    """
     provider = config.get(
         'LLMChatter.Provider', 'anthropic'
     ).strip().lower()
-    target = format_llm_target(config)
-    model = _resolved_model(config, provider)
+    target = format_llm_target(config, model)
+    model = _resolved_model(config, provider, model)
 
     # Endpoint URL for connection-error hints.
     if provider == 'ollama':
@@ -564,6 +698,10 @@ def _check_llm_probe(config):
         endpoint = config.get(
             'LLMChatter.OpenRouter.BaseUrl', OPENROUTER_BASE_URL
         )
+    elif provider == 'openai_compatible':
+        endpoint = config.get(
+            'LLMChatter.OpenAICompatible.BaseUrl', ''
+        ).strip()
     else:
         endpoint = "the provider API"
 
@@ -574,16 +712,17 @@ def _check_llm_probe(config):
             client = _build_openai_compatible_client(
                 config, provider
             )
-            text = _probe_openai_compatible(client, model)
+            text = _probe_openai_compatible(
+                client, model, provider, config
+            )
 
         if text:
             return _result(
-                'llm_probe',
-                'LLM connectivity (live test)', 'pass',
+                check_id, title, 'pass',
                 f"Live call succeeded ({target}).",
             )
         return _result(
-            'llm_probe', 'LLM connectivity (live test)', 'fail',
+            check_id, title, 'fail',
             f"The LLM returned an empty response ({target}).",
             "The endpoint is reachable but produced no text — "
             "check the model / max_tokens for this provider.",
@@ -591,8 +730,7 @@ def _check_llm_probe(config):
     except Exception as exc:
         if _is_auth_error(exc):
             return _result(
-                'llm_probe',
-                'LLM connectivity (live test)', 'fail',
+                check_id, title, 'fail',
                 "API key was rejected (authentication failed) "
                 "— the key is present but invalid.",
                 "Double-check the key value for typos / that "
@@ -600,8 +738,7 @@ def _check_llm_probe(config):
             )
         if _is_connection_error(exc):
             return _result(
-                'llm_probe',
-                'LLM connectivity (live test)', 'fail',
+                check_id, title, 'fail',
                 f"Cannot reach the LLM endpoint at {endpoint}.",
                 "Is the LLM server running and is the URL "
                 "correct? Docker users pointing at a local "
@@ -610,17 +747,39 @@ def _check_llm_probe(config):
             )
         if _is_model_error(exc):
             return _result(
-                'llm_probe',
-                'LLM connectivity (live test)', 'fail',
+                check_id, title, 'fail',
                 f"Model '{model}' was rejected or not found.",
-                "Check LLMChatter.Model is a valid model for "
+                f"Check {model_key} is a valid model for "
                 "this provider.",
             )
         return _result(
-            'llm_probe', 'LLM connectivity (live test)', 'fail',
+            check_id, title, 'fail',
             f"LLM probe failed: {exc}",
             "Check the provider, API key, and endpoint URL.",
         )
+
+
+def _check_label_model_probe(config):
+    """Live-test LLMChatter.LabelModel when label routing is on.
+
+    Returns None when routing is off (label_routing() finds no
+    model or no label pattern): every call then uses
+    LLMChatter.Model, already probed.
+    """
+    try:
+        from chatter_llm import label_routing
+        model, _patterns = label_routing(config)
+    except Exception:
+        return None
+    if not model:
+        return None
+    return _check_llm_probe(
+        config,
+        model,
+        check_id='label_model_probe',
+        title='LabelModel connectivity (live test)',
+        model_key='LLMChatter.LabelModel',
+    )
 
 
 # =====================================================================
@@ -633,6 +792,9 @@ def run_all_checks(config, *, do_llm_probe=True):
     results.append(_check_config_file(config, config_path))
     results.append(_check_module_enabled(config))
     results.append(_check_provider_config(config))
+    qa_result = _check_quick_analyze_target(config)
+    if qa_result is not None:
+        results.append(qa_result)
 
     db_result = _check_database(config)
     results.append(db_result)
@@ -642,6 +804,9 @@ def run_all_checks(config, *, do_llm_probe=True):
 
     if do_llm_probe:
         results.append(_check_llm_probe(config))
+        label_result = _check_label_model_probe(config)
+        if label_result is not None:
+            results.append(label_result)
     else:
         results.append(_result(
             'llm_probe', 'LLM connectivity (live test)', 'skip',
